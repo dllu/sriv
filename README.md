@@ -1,8 +1,8 @@
 # simple rust image viewer (sriv)
 
-![https://i.dllu.net/2025-04-18-23-55-48_b097e58701685a85.png](train)
+![train](https://i.dllu.net/2025-04-18-23-55-48_b097e58701685a85.png)
 
-![https://i.dllu.net/2025-04-18-23-53-34_91b104fa4cc7bc4a.png](trams)
+![trams](https://i.dllu.net/2025-04-18-23-53-34_91b104fa4cc7bc4a.png)
 
 Similar to [nsxiv](https://github.com/nsxiv/nsxiv) but:
 
