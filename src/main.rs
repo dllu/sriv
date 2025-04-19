@@ -1,12 +1,14 @@
 use anyhow::Result;
-use nannou::image::{self, DynamicImage, GenericImageView, GenericImage, RgbaImage};
+use nannou::image::{self, DynamicImage, GenericImageView, RgbaImage};
 use image::imageops::FilterType;
 use rayon::prelude::*;
 use nannou::prelude::*;
-use nannou::event::{MouseScrollDelta, TouchPhase};
+use nannou::event::{MouseScrollDelta, TouchPhase, Update};
 use nannou::image::imageops::crop_imm;
 use std::fs;
 use std::path::{PathBuf, Component};
+use std::sync::mpsc::{channel, Receiver};
+use std::thread;
 
 /// The display mode of the viewer.
 #[derive(Debug)]
@@ -111,7 +113,8 @@ impl TiledTexture {
 #[derive(Debug)]
 struct Model {
     image_paths: Vec<PathBuf>,
-    thumb_textures: Vec<wgpu::Texture>,
+    thumb_textures: Vec<Option<wgpu::Texture>>,
+    thumb_rx: Receiver<(usize, DynamicImage)>,
     // Full-resolution images as tiled textures, loaded lazily on demand.
     full_textures: Vec<Option<TiledTexture>>,
     mode: Mode,
@@ -145,7 +148,7 @@ fn model(app: &App) -> Model {
                 if path.is_file() {
                     if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
                         match ext.to_lowercase().as_str() {
-                            "jpg" | "jpeg" | "png" | "bmp" | "tiff" | "gif" => {
+                            "jpg" | "jpeg" | "png" | "bmp" | "tiff" | "gif" | "webp" | "tif" => {
                                 image_paths.push(path.canonicalize().unwrap());
                             }
                             _ => {}
@@ -175,87 +178,6 @@ fn model(app: &App) -> Model {
         })
         .unwrap_or_else(|| PathBuf::from("."));
     let cache_base = cache_home.join("sriv");
-    // Generate or load thumbnails in parallel with disk caching.
-    let thumb_data: Vec<(PathBuf, DynamicImage)> = image_paths
-        .par_iter()
-        .filter_map(|p| {
-            // Compute cache thumbnail path (mirroring full path under cache_base, with .png extension).
-            let rel = p.components()
-                .filter_map(|c| match c {
-                    Component::Normal(os) => Some(os),
-                    _ => None,
-                })
-                .collect::<PathBuf>();
-            let mut cache_path = cache_base.join(&rel);
-            cache_path.set_extension("png");
-            // Attempt to load a valid cached thumbnail (and pad if too small).
-            if let (Ok(meta_orig), Ok(meta_cache)) = (fs::metadata(p), fs::metadata(&cache_path)) {
-                if let (Ok(orig_mtime), Ok(cache_mtime)) = (meta_orig.modified(), meta_cache.modified()) {
-                    if cache_mtime >= orig_mtime {
-                        if let Ok(img) = image::open(&cache_path) {
-                            let (w0, h0) = img.dimensions();
-                            if w0 > 0 && h0 > 0 {
-                                // Ensure both dimensions >= 2 to avoid 1D textures
-                                if w0 < 2 || h0 < 2 {
-                                    let w = w0.max(2);
-                                    let h = h0.max(2);
-                                    let mut thumb = img;
-                                    thumb = thumb.resize_exact(w, h, FilterType::Nearest);
-                                    // Update cache with padded thumbnail
-                                    if let Err(e) = thumb.save(&cache_path) {
-                                        eprintln!("Warning: failed to save padded thumbnail to {:?}: {}", cache_path, e);
-                                    }
-                                    return Some((p.clone(), thumb));
-                                }
-                                return Some((p.clone(), img));
-                            }
-                        }
-                    }
-                }
-            }
-            // Generate a new thumbnail.
-            match image::open(p) {
-                Ok(img) => {
-                    // Create thumbnail preserving aspect ratio
-                    let mut thumb = img.thumbnail(thumb_size, thumb_size);
-                    let (w0, h0) = thumb.dimensions();
-                    // Skip empty
-                    if w0 == 0 || h0 == 0 {
-                        eprintln!("Warning: thumbnail for {:?} has zero dimension {}x{}, skipping", p, w0, h0);
-                        None
-                    } else {
-                        // Ensure minimum dimensions to avoid 1D textures
-                        let w = if w0 < 2 { 2 } else { w0 };
-                        let h = if h0 < 2 { 2 } else { h0 };
-                        if w != w0 || h != h0 {
-                            thumb = thumb.resize_exact(w, h, FilterType::Nearest);
-                        }
-                        // Save to cache
-                        if let Some(parent) = cache_path.parent() {
-                            if let Err(e) = fs::create_dir_all(parent) {
-                                eprintln!("Warning: failed to create cache dir {:?}: {}", parent, e);
-                            }
-                        }
-                        if let Err(e) = thumb.save(&cache_path) {
-                            eprintln!("Warning: failed to save thumbnail to {:?}: {}", cache_path, e);
-                        }
-                        Some((p.clone(), thumb))
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Warning: failed to open image {:?}: {}", p, e);
-                    None
-                }
-            }
-        })
-        .collect();
-    // Separate filtered paths and thumbnail images.
-    let (image_paths, thumb_images): (Vec<PathBuf>, Vec<DynamicImage>) = thumb_data.into_iter().unzip();
-    // Exit if no valid images could be opened.
-    if image_paths.is_empty() {
-        eprintln!("No valid image files found after decoding.");
-        std::process::exit(1);
-    }
     // Create the window first, so textures can reference a focused window.
     let _window = app.new_window()
         .size(800, 600)
@@ -264,10 +186,73 @@ fn model(app: &App) -> Model {
         .mouse_wheel(mouse_wheel)
         .build()
         .unwrap();
-    // Create textures for thumbnails.
-    let thumb_textures: Vec<wgpu::Texture> = thumb_images
-        .iter()
-        .map(|img| wgpu::Texture::from_image(app, img))
+    // Channel for receiving thumbnails from background thread.
+    let (tx, rx) = channel::<(usize, DynamicImage)>();
+    // Spawn background thread to generate thumbnails in parallel.
+    {
+        let paths = image_paths.clone();
+        let thumb_size = thumb_size;
+        let cache_base = cache_base.clone();
+        thread::spawn(move || {
+            paths.par_iter().enumerate().for_each(|(i, p)| {
+                // Compute cache thumbnail path (mirroring full path under cache_base, with .png extension).
+                let rel = p.components()
+                    .filter_map(|c| match c {
+                        Component::Normal(os) => Some(os),
+                        _ => None,
+                    })
+                    .collect::<PathBuf>();
+                let mut cache_path = cache_base.join(&rel);
+                cache_path.set_extension("png");
+                // Attempt to load a valid cached thumbnail.
+                let thumb_opt = if let (Ok(meta_orig), Ok(meta_cache)) = (fs::metadata(p), fs::metadata(&cache_path)) {
+                    if let (Ok(orig_mtime), Ok(cache_mtime)) = (meta_orig.modified(), meta_cache.modified()) {
+                        if cache_mtime >= orig_mtime {
+                            if let Ok(img) = image::open(&cache_path) {
+                                Some(img)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }.or_else(|| {
+                    // Generate a new thumbnail.
+                    if let Ok(img) = image::open(p) {
+                        let mut thumb = img.thumbnail(thumb_size, thumb_size);
+                        let (w0, h0) = thumb.dimensions();
+                        if w0 == 0 || h0 == 0 {
+                            None
+                        } else {
+                            let w = if w0 < 2 { 2 } else { w0 };
+                            let h = if h0 < 2 { 2 } else { h0 };
+                            if w != w0 || h != h0 {
+                                thumb = thumb.resize_exact(w, h, FilterType::Nearest);
+                            }
+                            if let Some(parent) = cache_path.parent() {
+                                let _ = fs::create_dir_all(parent);
+                            }
+                            let _ = thumb.save(&cache_path);
+                            Some(thumb)
+                        }
+                    } else {
+                        None
+                    }
+                });
+                if let Some(thumb) = thumb_opt {
+                    let _ = tx.send((i, thumb));
+                }
+            });
+        });
+    }
+    // Initialize thumbnail texture placeholders.
+    let thumb_textures: Vec<Option<wgpu::Texture>> = (0..image_paths.len())
+        .map(|_| None)
         .collect();
     // Initialize placeholders for full-resolution tiled textures (lazy loading).
     let full_textures: Vec<Option<TiledTexture>> = (0..image_paths.len())
@@ -276,6 +261,7 @@ fn model(app: &App) -> Model {
     Model {
         image_paths,
         thumb_textures,
+        thumb_rx: rx,
         full_textures,
         mode: Mode::Thumbnails,
         current: 0,
@@ -288,8 +274,9 @@ fn model(app: &App) -> Model {
 }
 
 fn main() -> Result<()> {
-    // Launch the nannou application with our model initializer.
+    // Launch the nannou application with our model initializer and update callback.
     nannou::app(model)
+        .update(update)
         .run();
     Ok(())
 }
@@ -301,6 +288,20 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
     let cols = ((rect.w() + model.gap) / cell).floor() as usize;
     let cols = cols.max(1);
     match key {
+        // g/G: jump to first/last in thumbnail mode
+        Key::G => {
+            if let Mode::Thumbnails = model.mode {
+                let len = model.image_paths.len();
+                // if Shift+G, go to last thumbnail; otherwise go to first
+                if app.keys.mods.shift() {
+                    if len > 0 {
+                        model.current = len - 1;
+                    }
+                } else {
+                    model.current = 0;
+                }
+            }
+        }
         Key::H | Key::Left => match model.mode {
             Mode::Thumbnails => {
                 let row = model.current / cols;
@@ -475,6 +476,14 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
         }
     }
 }
+/// Update function to process incoming thumbnail images.
+fn update(app: &App, model: &mut Model, _update: Update) {
+    // Receive thumbnails from background thread and create textures
+    while let Ok((i, img)) = model.thumb_rx.try_recv() {
+        let tex = wgpu::Texture::from_image(app, &img);
+        model.thumb_textures[i] = Some(tex);
+    }
+}
 
 fn view(app: &App, model: &Model, frame: Frame) {
     let draw = app.draw();
@@ -486,7 +495,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
             let cell = model.thumb_size as f32 + model.gap;
             let cols = ((rect.w() + model.gap) / cell).floor() as usize;
             let cols = cols.max(1);
-            for (i, tex) in model.thumb_textures.iter().enumerate() {
+            for (i, tex_opt) in model.thumb_textures.iter().enumerate() {
                 let row = i / cols;
                 let col = i % cols;
                 let x = -rect.w() / 2.0 + (model.thumb_size as f32) / 2.0 + model.gap / 2.0
@@ -495,18 +504,36 @@ fn view(app: &App, model: &Model, frame: Frame) {
                     - row as f32 * cell;
                 // Apply vertical scroll offset
                 let y = y + model.scroll_offset;
-                let [tw, th] = tex.size();
-                let w = tw as f32;
-                let h = th as f32;
-                draw.texture(tex).x_y(x, y).w_h(w, h);
-                // (Thumbnail debug prints removed.)
-                if i == model.current {
-                    draw.rect()
-                        .x_y(x, y)
-                        .w_h(w + 4.0, h + 4.0)
-                        .no_fill()
-                        .stroke(WHITE)
-                        .stroke_weight(2.0);
+                match tex_opt {
+                    Some(tex) => {
+                        let [tw, th] = tex.size();
+                        let w = tw as f32;
+                        let h = th as f32;
+                        draw.texture(tex).x_y(x, y).w_h(w, h);
+                        if i == model.current {
+                            draw.rect()
+                                .x_y(x, y)
+                                .w_h(w + 4.0, h + 4.0)
+                                .no_fill()
+                                .stroke(WHITE)
+                                .stroke_weight(2.0);
+                        }
+                    }
+                    None => {
+                        // Placeholder grey square while loading
+                        draw.rect()
+                            .x_y(x, y)
+                            .w_h(model.thumb_size as f32, model.thumb_size as f32)
+                            .color(srgba(0.5, 0.5, 0.5, 1.0));
+                        if i == model.current {
+                            draw.rect()
+                                .x_y(x, y)
+                                .w_h(model.thumb_size as f32 + 4.0, model.thumb_size as f32 + 4.0)
+                                .no_fill()
+                                .stroke(WHITE)
+                                .stroke_weight(2.0);
+                        }
+                    }
                 }
             }
         }
