@@ -1,15 +1,15 @@
 use anyhow::Result;
-use nannou::image::{self, DynamicImage, GenericImageView, RgbaImage};
 use image::imageops::FilterType;
-use rayon::prelude::*;
-use nannou::prelude::*;
 use nannou::event::{MouseScrollDelta, TouchPhase, Update};
 use nannou::image::imageops::crop_imm;
+use nannou::image::{self, DynamicImage, GenericImageView, RgbaImage};
+use nannou::prelude::*;
+use rayon::prelude::*;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::path::{PathBuf, Component};
+use std::path::{Component, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 use std::thread;
-use std::collections::{HashMap, VecDeque};
 /// Maximum number of full-resolution images to cache in memory.
 const FULL_CACHE_CAPACITY: usize = 64;
 
@@ -104,7 +104,11 @@ impl TiledTexture {
                 });
             }
         }
-        TiledTexture { full_w, full_h, tiles }
+        TiledTexture {
+            full_w,
+            full_h,
+            tiles,
+        }
     }
 
     /// Return the full image dimensions [width, height].
@@ -118,7 +122,12 @@ struct Model {
     image_paths: Vec<PathBuf>,
     thumb_textures: Vec<Option<wgpu::Texture>>,
     thumb_rx: Receiver<(usize, DynamicImage)>,
-    // LRU cache of full-resolution tiled textures: index -> texture
+    // Channels for full-resolution image loading
+    full_req_tx: std::sync::mpsc::Sender<usize>,
+    full_resp_rx: Receiver<(usize, DynamicImage)>,
+    // Track indices currently requested but not yet loaded
+    full_pending: HashSet<usize>,
+    // LRU cache of full-resolution tiled textures
     full_textures: HashMap<usize, TiledTexture>,
     // Usage order for LRU eviction: front = most recently used
     full_usage: VecDeque<usize>,
@@ -132,6 +141,10 @@ struct Model {
     zoom: f32,
     // Pan offset for single image view (in window coords)
     pan: Vec2,
+    // Window rect at last update, for resize detection
+    prev_window_rect: Rect,
+    // Whether to auto-fit the current image when loaded or resized
+    fit_mode: bool,
 }
 
 /// The model function for initializing the application state.
@@ -184,7 +197,8 @@ fn model(app: &App) -> Model {
         .unwrap_or_else(|| PathBuf::from("."));
     let cache_base = cache_home.join("sriv");
     // Create the window first, so textures can reference a focused window.
-    let _window = app.new_window()
+    let _window = app
+        .new_window()
         .size(800, 600)
         .view(view)
         .key_pressed(key_pressed)
@@ -201,7 +215,8 @@ fn model(app: &App) -> Model {
         thread::spawn(move || {
             paths.par_iter().enumerate().for_each(|(i, p)| {
                 // Compute cache thumbnail path (mirroring full path under cache_base, with .png extension).
-                let rel = p.components()
+                let rel = p
+                    .components()
                     .filter_map(|c| match c {
                         Component::Normal(os) => Some(os),
                         _ => None,
@@ -210,8 +225,12 @@ fn model(app: &App) -> Model {
                 let mut cache_path = cache_base.join(&rel);
                 cache_path.set_extension("png");
                 // Attempt to load a valid cached thumbnail.
-                let thumb_opt = if let (Ok(meta_orig), Ok(meta_cache)) = (fs::metadata(p), fs::metadata(&cache_path)) {
-                    if let (Ok(orig_mtime), Ok(cache_mtime)) = (meta_orig.modified(), meta_cache.modified()) {
+                let thumb_opt = if let (Ok(meta_orig), Ok(meta_cache)) =
+                    (fs::metadata(p), fs::metadata(&cache_path))
+                {
+                    if let (Ok(orig_mtime), Ok(cache_mtime)) =
+                        (meta_orig.modified(), meta_cache.modified())
+                    {
                         if cache_mtime >= orig_mtime {
                             if let Ok(img) = image::open(&cache_path) {
                                 Some(img)
@@ -226,7 +245,8 @@ fn model(app: &App) -> Model {
                     }
                 } else {
                     None
-                }.or_else(|| {
+                }
+                .or_else(|| {
                     // Generate a new thumbnail.
                     if let Ok(img) = image::open(p) {
                         let mut thumb = img.thumbnail(thumb_size, thumb_size);
@@ -257,13 +277,36 @@ fn model(app: &App) -> Model {
     }
     // Initialize thumbnail texture placeholders.
     let thumb_textures: Vec<Option<wgpu::Texture>> = (0..image_paths.len()).map(|_| None).collect();
-    // Initialize LRU cache for full-resolution textures.
+    // Initialize channels and state for full-resolution LRU cache.
+    // Channel for requesting full-resolution images (by index)
+    let (full_req_tx, full_req_rx) = channel::<usize>();
+    // Channel for receiving loaded full-resolution DynamicImage
+    let (full_resp_tx, full_resp_rx) = channel::<(usize, DynamicImage)>();
+    // Spawn loader thread for full images
+    {
+        let paths = image_paths.clone();
+        thread::spawn(move || {
+            for idx in full_req_rx {
+                if let Some(path) = paths.get(idx) {
+                    if let Ok(img) = image::open(path) {
+                        let _ = full_resp_tx.send((idx, img));
+                    }
+                }
+            }
+        });
+    }
+    let full_pending: HashSet<usize> = HashSet::new();
     let full_textures: HashMap<usize, TiledTexture> = HashMap::new();
     let full_usage: VecDeque<usize> = VecDeque::new();
+    // Get initial window rect for resize tracking
+    let initial_rect = app.window_rect();
     Model {
         image_paths,
         thumb_textures,
         thumb_rx: rx,
+        full_req_tx,
+        full_resp_rx,
+        full_pending,
         full_textures,
         full_usage,
         mode: Mode::Thumbnails,
@@ -273,14 +316,14 @@ fn model(app: &App) -> Model {
         scroll_offset: 0.0,
         zoom: 1.0,
         pan: vec2(0.0, 0.0),
+        prev_window_rect: initial_rect,
+        fit_mode: false,
     }
 }
 
 fn main() -> Result<()> {
     // Launch the nannou application with our model initializer and update callback.
-    nannou::app(model)
-        .update(update)
-        .run();
+    nannou::app(model).update(update).run();
     Ok(())
 }
 
@@ -310,35 +353,82 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             if let Mode::Single = model.mode {
                 if model.current < len - 1 {
                     model.current += 1;
-                    // Load current and pre-load neighbors
-                    ensure_full_texture(app, model, model.current);
+                    // Pre-load current and adjacent images
                     let idx = model.current;
+                    request_full_texture(model, idx);
                     if idx > 0 {
-                        ensure_full_texture(app, model, idx - 1);
+                        request_full_texture(model, idx - 1);
                     }
                     if idx + 1 < len {
-                        ensure_full_texture(app, model, idx + 1);
+                        request_full_texture(model, idx + 1);
+                    }
+                    // If already loaded, fit the image to window
+                    if model.full_textures.contains_key(&idx) {
+                        apply_fit(app, model);
                     }
                 }
             }
-        },
+        }
         Key::P => {
             // navigate to previous image in single-image mode
             if let Mode::Single = model.mode {
                 if model.current > 0 {
                     model.current -= 1;
                     // Load current and pre-load neighbors
-                    ensure_full_texture(app, model, model.current);
+                    request_full_texture(model, model.current);
                     let idx = model.current;
                     if idx > 0 {
-                        ensure_full_texture(app, model, idx - 1);
+                        request_full_texture(model, idx - 1);
                     }
                     if idx + 1 < len {
-                        ensure_full_texture(app, model, idx + 1);
+                        request_full_texture(model, idx + 1);
+                    }
+                    // If already loaded, fit the image to window
+                    if model.full_textures.contains_key(&idx) {
+                        apply_fit(app, model);
                     }
                 }
             }
-        },
+        }
+        // Skip 10 images forward
+        Key::RBracket => {
+            if let Mode::Single = model.mode {
+                let len = model.image_paths.len();
+                let new_idx = (model.current + 10).min(len.saturating_sub(1));
+                model.current = new_idx;
+                // Request current and neighbors
+                request_full_texture(model, new_idx);
+                if new_idx > 0 {
+                    request_full_texture(model, new_idx - 1);
+                }
+                if new_idx + 1 < len {
+                    request_full_texture(model, new_idx + 1);
+                }
+                // If already loaded, fit the image to window
+                if model.full_textures.contains_key(&new_idx) {
+                    apply_fit(app, model);
+                }
+            }
+        }
+        // Skip 10 images backward
+        Key::LBracket => {
+            if let Mode::Single = model.mode {
+                let new_idx = model.current.saturating_sub(10);
+                model.current = new_idx;
+                // Request current and neighbors
+                request_full_texture(model, new_idx);
+                if new_idx > 0 {
+                    request_full_texture(model, new_idx - 1);
+                }
+                if new_idx + 1 < model.image_paths.len() {
+                    request_full_texture(model, new_idx + 1);
+                }
+                // If already loaded, fit the image to window
+                if model.full_textures.contains_key(&new_idx) {
+                    apply_fit(app, model);
+                }
+            }
+        }
         Key::H | Key::Left => match model.mode {
             Mode::Thumbnails => {
                 let row = model.current / cols;
@@ -417,7 +507,7 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                 }
             }
             _ => {}
-        }
+        },
         Key::J | Key::Down => match model.mode {
             Mode::Thumbnails => {
                 let row = model.current / cols + 1;
@@ -441,23 +531,24 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                 }
             }
             _ => {}
-        }
+        },
         Key::Return => {
             // Toggle between thumbnail and single-image modes.
             match model.mode {
                 Mode::Thumbnails => {
-                    // Ensure current image is loaded into the full-resolution cache
-                    ensure_full_texture(app, model, model.current);
-                    // Pre-load adjacent images for smoother navigation
+                    // Pre-load current and adjacent images, then fit
                     let len = model.image_paths.len();
                     let idx = model.current;
+                    request_full_texture(model, idx);
                     if idx > 0 {
-                        ensure_full_texture(app, model, idx - 1);
+                        request_full_texture(model, idx - 1);
                     }
                     if idx + 1 < len {
-                        ensure_full_texture(app, model, idx + 1);
+                        request_full_texture(model, idx + 1);
                     }
+                    // Enter single mode and fit image to window
                     model.mode = Mode::Single;
+                    apply_fit(app, model);
                 }
                 Mode::Single => {
                     model.mode = Mode::Thumbnails;
@@ -477,6 +568,13 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                 }
                 model.pan = vec2(0.0, 0.0);
             }
+        }
+        // Toggle full screen
+        Key::F => {
+            let window = app.main_window();
+            // Query current state, then toggle
+            let is_fs = window.is_fullscreen();
+            window.set_fullscreen(!is_fs);
         }
         // Show at 100% scale
         Key::Equals => {
@@ -504,35 +602,64 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
 /// Update function to process incoming thumbnail images.
 fn update(app: &App, model: &mut Model, _update: Update) {
     // Receive thumbnails from background thread and create textures
+    // Process incoming thumbnails
     while let Ok((i, img)) = model.thumb_rx.try_recv() {
         let tex = wgpu::Texture::from_image(app, &img);
         model.thumb_textures[i] = Some(tex);
     }
-}
-/// Ensure the full-resolution texture for `idx` is loaded and update LRU cache.
-fn ensure_full_texture(app: &App, model: &mut Model, idx: usize) {
-    // If already cached, bump to most recent.
-    if model.full_textures.contains_key(&idx) {
+    // Process loaded full-resolution images
+    while let Ok((idx, img)) = model.full_resp_rx.try_recv() {
+        // Build tiled GPU textures for the full image
+        let tiled = TiledTexture::new(app, &img);
+        // Insert into cache and update LRU
+        model.full_textures.insert(idx, tiled);
+        // Mark use and remove pending
         if let Some(pos) = model.full_usage.iter().position(|&i| i == idx) {
             model.full_usage.remove(pos);
         }
         model.full_usage.push_front(idx);
-    } else {
-        // Load image and create tiled texture.
-        if let Ok(img) = image::open(&model.image_paths[idx]) {
-            let tiled = TiledTexture::new(app, &img);
-            model.full_textures.insert(idx, tiled);
-            model.full_usage.push_front(idx);
-            // Evict least recently used if over capacity.
-            if model.full_usage.len() > FULL_CACHE_CAPACITY {
-                if let Some(old_idx) = model.full_usage.pop_back() {
-                    model.full_textures.remove(&old_idx);
-                }
+        model.full_pending.remove(&idx);
+        // Evict least recently used if over capacity
+        if model.full_usage.len() > FULL_CACHE_CAPACITY {
+            if let Some(old_idx) = model.full_usage.pop_back() {
+                model.full_textures.remove(&old_idx);
             }
-        } else {
-            eprintln!("Warning: failed to open full image {:?}", model.image_paths[idx]);
+        }
+        // If this is the current image and in fit mode, resize to fit
+        if idx == model.current && model.fit_mode {
+            apply_fit(app, model);
         }
     }
+    // Handle window resize: re-apply fit if in fit mode
+    let rect = app.window_rect();
+    if rect != model.prev_window_rect {
+        model.prev_window_rect = rect;
+        if let Mode::Single = model.mode {
+            if model.fit_mode {
+                apply_fit(app, model);
+            }
+        }
+    }
+}
+/// Ensure the full-resolution texture for `idx` is loaded and update LRU cache.
+/// Request loading of full-resolution image at `idx` in background.  Adds to pending set.
+fn request_full_texture(model: &mut Model, idx: usize) {
+    if !model.full_textures.contains_key(&idx) && !model.full_pending.contains(&idx) {
+        model.full_pending.insert(idx);
+        let _ = model.full_req_tx.send(idx);
+    }
+}
+/// Apply fit-to-window for current single-image view
+fn apply_fit(app: &App, model: &mut Model) {
+    model.fit_mode = true;
+    let rect = app.window_rect();
+    if let Some(tex) = model.full_textures.get(&model.current) {
+        let [w, h] = tex.size();
+        model.zoom = (rect.w() / w as f32).min(rect.h() / h as f32);
+    } else {
+        model.zoom = 1.0;
+    }
+    model.pan = vec2(0.0, 0.0);
 }
 
 fn view(app: &App, model: &Model, frame: Frame) {
@@ -548,9 +675,13 @@ fn view(app: &App, model: &Model, frame: Frame) {
             for (i, tex_opt) in model.thumb_textures.iter().enumerate() {
                 let row = i / cols;
                 let col = i % cols;
-                let x = -rect.w() / 2.0 + (model.thumb_size as f32) / 2.0 + model.gap / 2.0
+                let x = -rect.w() / 2.0
+                    + (model.thumb_size as f32) / 2.0
+                    + model.gap / 2.0
                     + col as f32 * cell;
-                let y = rect.h() / 2.0 - (model.thumb_size as f32) / 2.0 - model.gap / 2.0
+                let y = rect.h() / 2.0
+                    - (model.thumb_size as f32) / 2.0
+                    - model.gap / 2.0
                     - row as f32 * cell;
                 // Apply vertical scroll offset
                 let y = y + model.scroll_offset;
@@ -595,8 +726,10 @@ fn view(app: &App, model: &Model, frame: Frame) {
                 let [full_w, full_h] = tex.size();
                 for tile in &tex.tiles {
                     // Compute tile center relative to full image center
-                    let x_center = tile.x_offset as f32 - full_w as f32 / 2.0 + tile.width as f32 / 2.0;
-                    let y_center = full_h as f32 / 2.0 - tile.y_offset as f32 - tile.height as f32 / 2.0;
+                    let x_center =
+                        tile.x_offset as f32 - full_w as f32 / 2.0 + tile.width as f32 / 2.0;
+                    let y_center =
+                        full_h as f32 / 2.0 - tile.y_offset as f32 - tile.height as f32 / 2.0;
                     draw.texture(&tile.texture)
                         .x_y(
                             model.pan.x + x_center * model.zoom,
@@ -607,15 +740,32 @@ fn view(app: &App, model: &Model, frame: Frame) {
                             tile.height as f32 * model.zoom,
                         );
                 }
-                // Draw filename below image
-                let filename = model.image_paths[model.current]
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy();
-                draw.text(&filename)
-                    .font_size(24)
+                // Draw bottom info bar with full path, dimensions, and zoom
+                let bar_h = 20.0;
+                let bar_y = -rect.h() / 2.0 + bar_h / 2.0 + 4.0;
+                // Background
+                draw.rect()
+                    .x_y(0.0, bar_y)
+                    .w_h(rect.w(), bar_h)
+                    .color(srgba(0.0, 0.0, 0.0, 0.5));
+                // Full path, left-aligned
+                let full_path = model.image_paths[model.current].to_string_lossy();
+                draw.text(&full_path)
+                    .font_size(14)
                     .color(WHITE)
-                    .x_y(0.0, -rect.h() / 2.0 + 16.0);
+                    .w_h(rect.w(), bar_h)
+                    .x_y(0.0, bar_y)
+                    .left_justify()
+                    .align_text_bottom();
+                // Dimensions and zoom, right-aligned
+                let info = format!("{}×{}  {:.2}×", full_w, full_h, model.zoom);
+                draw.text(&info)
+                    .font_size(14)
+                    .color(WHITE)
+                    .w_h(rect.w(), bar_h)
+                    .x_y(0.0, bar_y)
+                    .right_justify()
+                    .align_text_bottom();
             } else {
                 draw.text("Loading...")
                     .font_size(24)
