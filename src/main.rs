@@ -40,7 +40,7 @@ fn mouse_wheel(app: &App, model: &mut Model, delta: MouseScrollDelta, _phase: To
                 MouseScrollDelta::LineDelta(_x, y) => 1.0 + y * 0.2,
                 MouseScrollDelta::PixelDelta(pos) => 1.0 + pos.y as f32 * 0.002,
             };
-            let new_zoom = (old_zoom * zoom_factor).max(0.1).min(10.0);
+            let new_zoom = (old_zoom * zoom_factor).clamp(0.1, 10.0);
             // Adjust pan so the point under cursor stays fixed
             model.pan = mouse_pos + (model.pan - mouse_pos) * (new_zoom / old_zoom);
             model.zoom = new_zoom;
@@ -209,7 +209,6 @@ fn model(app: &App) -> Model {
     // Spawn background thread to generate thumbnails in parallel.
     {
         let paths = image_paths.clone();
-        let thumb_size = thumb_size;
         let cache_base = cache_base.clone();
         thread::spawn(move || {
             paths.par_iter().enumerate().for_each(|(i, p)| {
@@ -441,7 +440,7 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             Mode::Single => {
                 // Pan left if zoomed wider than view
                 if let Some(tex) = model.full_textures.get(&model.current) {
-                    let [tw, th] = tex.size();
+                    let [tw, _] = tex.size();
                     let disp_w = tw as f32 * model.zoom;
                     if disp_w > rect.w() {
                         let pan_step = 20.0;
@@ -466,7 +465,7 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             Mode::Single => {
                 // Pan right if zoomed wider than view
                 if let Some(tex) = model.full_textures.get(&model.current) {
-                    let [tw, th] = tex.size();
+                    let [tw, _] = tex.size();
                     let disp_w = tw as f32 * model.zoom;
                     if disp_w > rect.w() {
                         let pan_step = 20.0;
@@ -494,7 +493,7 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             Mode::Single => {
                 // Pan up if zoomed taller than view
                 if let Some(tex) = model.full_textures.get(&model.current) {
-                    let [tw, th] = tex.size();
+                    let [_, th] = tex.size();
                     let disp_h = th as f32 * model.zoom;
                     if disp_h > rect.h() {
                         let pan_step = 20.0;
@@ -505,7 +504,6 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                     }
                 }
             }
-            _ => {}
         },
         Key::J | Key::Down => match model.mode {
             Mode::Thumbnails => {
@@ -518,7 +516,7 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             Mode::Single => {
                 // Pan down if zoomed taller than view
                 if let Some(tex) = model.full_textures.get(&model.current) {
-                    let [tw, th] = tex.size();
+                    let [_, th] = tex.size();
                     let disp_h = th as f32 * model.zoom;
                     if disp_h > rect.h() {
                         let pan_step = 20.0;
@@ -529,7 +527,6 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                     }
                 }
             }
-            _ => {}
         },
         Key::Return => {
             // Toggle between thumbnail and single-image modes.
