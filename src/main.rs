@@ -9,6 +9,9 @@ use std::fs;
 use std::path::{PathBuf, Component};
 use std::sync::mpsc::{channel, Receiver};
 use std::thread;
+use std::collections::{HashMap, VecDeque};
+/// Maximum number of full-resolution images to cache in memory.
+const FULL_CACHE_CAPACITY: usize = 64;
 
 /// The display mode of the viewer.
 #[derive(Debug)]
@@ -115,8 +118,10 @@ struct Model {
     image_paths: Vec<PathBuf>,
     thumb_textures: Vec<Option<wgpu::Texture>>,
     thumb_rx: Receiver<(usize, DynamicImage)>,
-    // Full-resolution images as tiled textures, loaded lazily on demand.
-    full_textures: Vec<Option<TiledTexture>>,
+    // LRU cache of full-resolution tiled textures: index -> texture
+    full_textures: HashMap<usize, TiledTexture>,
+    // Usage order for LRU eviction: front = most recently used
+    full_usage: VecDeque<usize>,
     mode: Mode,
     current: usize,
     thumb_size: u32,
@@ -251,18 +256,16 @@ fn model(app: &App) -> Model {
         });
     }
     // Initialize thumbnail texture placeholders.
-    let thumb_textures: Vec<Option<wgpu::Texture>> = (0..image_paths.len())
-        .map(|_| None)
-        .collect();
-    // Initialize placeholders for full-resolution tiled textures (lazy loading).
-    let full_textures: Vec<Option<TiledTexture>> = (0..image_paths.len())
-        .map(|_| None)
-        .collect();
+    let thumb_textures: Vec<Option<wgpu::Texture>> = (0..image_paths.len()).map(|_| None).collect();
+    // Initialize LRU cache for full-resolution textures.
+    let full_textures: HashMap<usize, TiledTexture> = HashMap::new();
+    let full_usage: VecDeque<usize> = VecDeque::new();
     Model {
         image_paths,
         thumb_textures,
         thumb_rx: rx,
         full_textures,
+        full_usage,
         mode: Mode::Thumbnails,
         current: 0,
         thumb_size,
@@ -302,6 +305,40 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                 }
             }
         }
+        Key::N => {
+            // navigate to next image in single-image mode
+            if let Mode::Single = model.mode {
+                if model.current < len - 1 {
+                    model.current += 1;
+                    // Load current and pre-load neighbors
+                    ensure_full_texture(app, model, model.current);
+                    let idx = model.current;
+                    if idx > 0 {
+                        ensure_full_texture(app, model, idx - 1);
+                    }
+                    if idx + 1 < len {
+                        ensure_full_texture(app, model, idx + 1);
+                    }
+                }
+            }
+        },
+        Key::P => {
+            // navigate to previous image in single-image mode
+            if let Mode::Single = model.mode {
+                if model.current > 0 {
+                    model.current -= 1;
+                    // Load current and pre-load neighbors
+                    ensure_full_texture(app, model, model.current);
+                    let idx = model.current;
+                    if idx > 0 {
+                        ensure_full_texture(app, model, idx - 1);
+                    }
+                    if idx + 1 < len {
+                        ensure_full_texture(app, model, idx + 1);
+                    }
+                }
+            }
+        },
         Key::H | Key::Left => match model.mode {
             Mode::Thumbnails => {
                 let row = model.current / cols;
@@ -314,7 +351,7 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             }
             Mode::Single => {
                 // Pan left if zoomed wider than view
-                if let Some(tex) = &model.full_textures[model.current] {
+                if let Some(tex) = model.full_textures.get(&model.current) {
                     let [tw, th] = tex.size();
                     let disp_w = tw as f32 * model.zoom;
                     if disp_w > rect.w() {
@@ -325,8 +362,6 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                         return;
                     }
                 }
-                // Navigate to previous image
-                model.current = if model.current == 0 { len - 1 } else { model.current - 1 };
             }
         },
         Key::L | Key::Right => match model.mode {
@@ -341,7 +376,7 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             }
             Mode::Single => {
                 // Pan right if zoomed wider than view
-                if let Some(tex) = &model.full_textures[model.current] {
+                if let Some(tex) = model.full_textures.get(&model.current) {
                     let [tw, th] = tex.size();
                     let disp_w = tw as f32 * model.zoom;
                     if disp_w > rect.w() {
@@ -352,8 +387,6 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                         return;
                     }
                 }
-                // Navigate to next image
-                model.current = (model.current + 1) % len;
             }
         },
         Key::K | Key::Up => match model.mode {
@@ -371,7 +404,7 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             }
             Mode::Single => {
                 // Pan up if zoomed taller than view
-                if let Some(tex) = &model.full_textures[model.current] {
+                if let Some(tex) = model.full_textures.get(&model.current) {
                     let [tw, th] = tex.size();
                     let disp_h = th as f32 * model.zoom;
                     if disp_h > rect.h() {
@@ -395,7 +428,7 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             }
             Mode::Single => {
                 // Pan down if zoomed taller than view
-                if let Some(tex) = &model.full_textures[model.current] {
+                if let Some(tex) = model.full_textures.get(&model.current) {
                     let [tw, th] = tex.size();
                     let disp_h = th as f32 * model.zoom;
                     if disp_h > rect.h() {
@@ -410,27 +443,19 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             _ => {}
         }
         Key::Return => {
-            // Toggle between thumbnail view and single-image view.
+            // Toggle between thumbnail and single-image modes.
             match model.mode {
                 Mode::Thumbnails => {
-                    // On entering single mode, load and pad the full-resolution image to ensure 2D texture.
-                    if model.full_textures[model.current].is_none() {
-                        let path = &model.image_paths[model.current];
-                        match image::open(path) {
-                            Ok(mut img) => {
-                                // Ensure minimum dimensions to avoid 1D textures
-                                let (w0, h0) = img.dimensions();
-                                let w = w0.max(2);
-                                let h = h0.max(2);
-                                if w != w0 || h != h0 {
-                                    img = img.resize_exact(w, h, FilterType::Nearest);
-                                }
-                                // Create a tiled texture to handle large images
-                                let tiled = TiledTexture::new(app, &img);
-                                model.full_textures[model.current] = Some(tiled);
-                            }
-                            Err(e) => eprintln!("Warning: failed to open full image {:?}: {}", path, e),
-                        }
+                    // Ensure current image is loaded into the full-resolution cache
+                    ensure_full_texture(app, model, model.current);
+                    // Pre-load adjacent images for smoother navigation
+                    let len = model.image_paths.len();
+                    let idx = model.current;
+                    if idx > 0 {
+                        ensure_full_texture(app, model, idx - 1);
+                    }
+                    if idx + 1 < len {
+                        ensure_full_texture(app, model, idx + 1);
                     }
                     model.mode = Mode::Single;
                 }
@@ -443,7 +468,7 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
         Key::W => {
             if let Mode::Single = model.mode {
                 let rect = app.window_rect();
-                if let Some(tex) = &model.full_textures[model.current] {
+                if let Some(tex) = model.full_textures.get(&model.current) {
                     let [w, h] = tex.size();
                     let fit = (rect.w() / w as f32).min(rect.h() / h as f32);
                     model.zoom = fit;
@@ -482,6 +507,31 @@ fn update(app: &App, model: &mut Model, _update: Update) {
     while let Ok((i, img)) = model.thumb_rx.try_recv() {
         let tex = wgpu::Texture::from_image(app, &img);
         model.thumb_textures[i] = Some(tex);
+    }
+}
+/// Ensure the full-resolution texture for `idx` is loaded and update LRU cache.
+fn ensure_full_texture(app: &App, model: &mut Model, idx: usize) {
+    // If already cached, bump to most recent.
+    if model.full_textures.contains_key(&idx) {
+        if let Some(pos) = model.full_usage.iter().position(|&i| i == idx) {
+            model.full_usage.remove(pos);
+        }
+        model.full_usage.push_front(idx);
+    } else {
+        // Load image and create tiled texture.
+        if let Ok(img) = image::open(&model.image_paths[idx]) {
+            let tiled = TiledTexture::new(app, &img);
+            model.full_textures.insert(idx, tiled);
+            model.full_usage.push_front(idx);
+            // Evict least recently used if over capacity.
+            if model.full_usage.len() > FULL_CACHE_CAPACITY {
+                if let Some(old_idx) = model.full_usage.pop_back() {
+                    model.full_textures.remove(&old_idx);
+                }
+            }
+        } else {
+            eprintln!("Warning: failed to open full image {:?}", model.image_paths[idx]);
+        }
     }
 }
 
@@ -540,7 +590,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
         Mode::Single => {
             // Attempt to draw the full-resolution tiled texture if loaded;
             // otherwise display a loading message.
-            if let Some(tex) = &model.full_textures[model.current] {
+            if let Some(tex) = model.full_textures.get(&model.current) {
                 // Draw each tile at the correct position, applying zoom and pan
                 let [full_w, full_h] = tex.size();
                 for tile in &tex.tiles {
