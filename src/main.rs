@@ -45,7 +45,6 @@ fn mouse_wheel(app: &App, model: &mut Model, delta: MouseScrollDelta, _phase: To
             model.pan = mouse_pos + (model.pan - mouse_pos) * (new_zoom / old_zoom);
             model.zoom = new_zoom;
         }
-        _ => {}
     }
 }
 
