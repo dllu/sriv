@@ -4,12 +4,12 @@ use nannou::event::{MouseScrollDelta, TouchPhase, Update};
 use nannou::image::imageops::crop_imm;
 use nannou::image::{self, DynamicImage, GenericImageView, RgbaImage};
 use nannou::prelude::*;
-use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Component, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 use std::thread;
+use std::sync::{Arc, Mutex};
 /// Maximum number of full-resolution images to cache in memory.
 const FULL_CACHE_CAPACITY: usize = 64;
 
@@ -30,6 +30,10 @@ fn mouse_wheel(app: &App, model: &mut Model, delta: MouseScrollDelta, _phase: To
                 MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
             };
             model.scroll_offset += scroll_amount;
+            // Update view parameters for thumbnail prioritization
+            if let Ok(mut vp) = model.view_params.lock() {
+                vp.2 = model.scroll_offset;
+            }
         }
         Mode::Single => {
             // Zoom in/out around mouse cursor
@@ -121,6 +125,10 @@ struct Model {
     image_paths: Vec<PathBuf>,
     thumb_textures: Vec<Option<wgpu::Texture>>,
     thumb_rx: Receiver<(usize, DynamicImage)>,
+    // Shared queue of missing thumbnails for prioritized loading
+    thumb_queue: Arc<Mutex<VecDeque<usize>>>,
+    // View parameters (window width, height, scroll offset) for prioritization
+    view_params: Arc<Mutex<(f32, f32, f32)>>,
     // Channels for full-resolution image loading
     full_req_tx: std::sync::mpsc::Sender<usize>,
     full_resp_rx: Receiver<(usize, DynamicImage)>,
@@ -182,8 +190,10 @@ fn model(app: &App) -> Model {
         std::process::exit(1);
     }
     image_paths.sort();
-    // Prepare thumbnail size and cache base directory.
-    let thumb_size = 256;
+    // Prepare thumbnail size, gap, and cache base directory.
+    let thumb_size: u32 = 256;
+    // Gap between thumbnails
+    let gap: f32 = 10.0;
     let cache_home = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| {
@@ -206,52 +216,84 @@ fn model(app: &App) -> Model {
         .unwrap();
     // Channel for receiving thumbnails from background thread.
     let (tx, rx) = channel::<(usize, DynamicImage)>();
-    // Spawn background thread to generate thumbnails in parallel.
+    // Prioritized thumbnail generation: shared queue and view parameters
+    let rect0 = app.window_rect();
+    let thumb_queue = Arc::new(Mutex::new(VecDeque::new()));
+    let view_params = Arc::new(Mutex::new((rect0.w(), rect0.h(), 0.0_f32)));
+    // First pass: load up-to-date cached thumbnails; queue missing indices
     {
+        let mut queue = thumb_queue.lock().unwrap();
+        for (i, p) in image_paths.iter().enumerate() {
+            let rel = p
+                .components()
+                .filter_map(|c| match c {
+                    Component::Normal(os) => Some(os),
+                    _ => None,
+                })
+                .collect::<PathBuf>();
+            let mut cache_path = cache_base.join(&rel);
+            cache_path.set_extension("png");
+            let mut loaded = false;
+            if let (Ok(meta_orig), Ok(meta_cache)) = (fs::metadata(p), fs::metadata(&cache_path)) {
+                if let (Ok(orig_mtime), Ok(cache_mtime)) = (meta_orig.modified(), meta_cache.modified()) {
+                    if cache_mtime >= orig_mtime {
+                        if let Ok(img) = image::open(&cache_path) {
+                            let _ = tx.send((i, img));
+                            loaded = true;
+                        }
+                    }
+                }
+            }
+            if !loaded {
+                queue.push_back(i);
+            }
+        }
+    }
+    // Spawn worker threads to generate missing thumbnails by priority
+    let num_workers = rayon::current_num_threads().max(1);
+    for _ in 0..num_workers {
         let paths = image_paths.clone();
         let cache_base = cache_base.clone();
+        let thumb_queue = Arc::clone(&thumb_queue);
+        let view_params = Arc::clone(&view_params);
+        let tx = tx.clone();
+        let thumb_size = thumb_size;
+        let gap = gap;
         thread::spawn(move || {
-            paths.par_iter().enumerate().for_each(|(i, p)| {
-                // Compute cache thumbnail path (mirroring full path under cache_base, with .png extension).
-                let rel = p
-                    .components()
-                    .filter_map(|c| match c {
-                        Component::Normal(os) => Some(os),
-                        _ => None,
-                    })
-                    .collect::<PathBuf>();
-                let mut cache_path = cache_base.join(&rel);
-                cache_path.set_extension("png");
-                // Attempt to load a valid cached thumbnail.
-                let thumb_opt = if let (Ok(meta_orig), Ok(meta_cache)) =
-                    (fs::metadata(p), fs::metadata(&cache_path))
-                {
-                    if let (Ok(orig_mtime), Ok(cache_mtime)) =
-                        (meta_orig.modified(), meta_cache.modified())
-                    {
-                        if cache_mtime >= orig_mtime {
-                            if let Ok(img) = image::open(&cache_path) {
-                                Some(img)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-                .or_else(|| {
-                    // Generate a new thumbnail.
+            loop {
+                let idx_opt = {
+                    let mut q = thumb_queue.lock().unwrap();
+                    if q.is_empty() { break; }
+                    // Sort by proximity to viewport vertical center
+                    let (rect_w, rect_h, scroll_offset) = *view_params.lock().unwrap();
+                    let cell = thumb_size as f32 + gap;
+                    let cols = ((rect_w + gap) / cell).floor() as usize;
+                    let y0 = rect_h / 2.0 - thumb_size as f32 / 2.0 - gap / 2.0;
+                    let slice = q.make_contiguous();
+                    slice.sort_by(|&i1, &i2| {
+                        let row1 = (i1 / cols) as f32;
+                        let y1 = y0 - row1 * cell + scroll_offset;
+                        let row2 = (i2 / cols) as f32;
+                        let y2 = y0 - row2 * cell + scroll_offset;
+                        y1.abs().partial_cmp(&y2.abs()).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    q.pop_front()
+                };
+                if let Some(i) = idx_opt {
+                    let p = &paths[i];
+                    let rel = p
+                        .components()
+                        .filter_map(|c| match c {
+                            Component::Normal(os) => Some(os),
+                            _ => None,
+                        })
+                        .collect::<PathBuf>();
+                    let mut cache_path = cache_base.join(&rel);
+                    cache_path.set_extension("png");
                     if let Ok(img) = image::open(p) {
                         let mut thumb = img.thumbnail(thumb_size, thumb_size);
                         let (w0, h0) = thumb.dimensions();
-                        if w0 == 0 || h0 == 0 {
-                            None
-                        } else {
+                        if w0 != 0 && h0 != 0 {
                             let w = if w0 < 2 { 2 } else { w0 };
                             let h = if h0 < 2 { 2 } else { h0 };
                             if w != w0 || h != h0 {
@@ -261,16 +303,11 @@ fn model(app: &App) -> Model {
                                 let _ = fs::create_dir_all(parent);
                             }
                             let _ = thumb.save(&cache_path);
-                            Some(thumb)
+                            let _ = tx.send((i, thumb));
                         }
-                    } else {
-                        None
                     }
-                });
-                if let Some(thumb) = thumb_opt {
-                    let _ = tx.send((i, thumb));
                 }
-            });
+            }
         });
     }
     // Initialize thumbnail texture placeholders.
@@ -302,6 +339,9 @@ fn model(app: &App) -> Model {
         image_paths,
         thumb_textures,
         thumb_rx: rx,
+        // Shared queue and view parameters for prioritized thumbnail loading
+        thumb_queue,
+        view_params,
         full_req_tx,
         full_resp_rx,
         full_pending,
@@ -594,6 +634,10 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             model.scroll_offset += bottom_bound - target_y;
         }
     }
+    // Update view parameters after auto-scroll
+    if let Ok(mut vp) = model.view_params.lock() {
+        vp.2 = model.scroll_offset;
+    }
 }
 /// Update function to process incoming thumbnail images.
 fn update(app: &App, model: &mut Model, _update: Update) {
@@ -626,10 +670,16 @@ fn update(app: &App, model: &mut Model, _update: Update) {
             apply_fit(app, model);
         }
     }
-    // Handle window resize: re-apply fit if in fit mode
+    // Handle window resize: update view parameters and re-apply fit if in fit mode
     let rect = app.window_rect();
     if rect != model.prev_window_rect {
         model.prev_window_rect = rect;
+        // Update view parameters for thumbnail prioritization
+        if let Ok(mut vp) = model.view_params.lock() {
+            vp.0 = rect.w();
+            vp.1 = rect.h();
+            vp.2 = model.scroll_offset;
+        }
         if let Mode::Single = model.mode {
             if model.fit_mode {
                 apply_fit(app, model);
