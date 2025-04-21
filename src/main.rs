@@ -1,6 +1,6 @@
 use anyhow::Result;
 use image::imageops::FilterType;
-use nannou::event::{MouseScrollDelta, MouseButton, TouchPhase, Update};
+use nannou::event::{MouseButton, MouseScrollDelta, TouchPhase, Update};
 use nannou::image::imageops::crop_imm;
 use nannou::image::{self, DynamicImage, GenericImageView, RgbaImage};
 use nannou::prelude::*;
@@ -9,8 +9,9 @@ use std::fs;
 use std::path::{Component, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Instant, Duration};
+use std::time::{Duration, Instant};
 /// Maximum number of full-resolution images to cache in memory.
 const FULL_CACHE_CAPACITY: usize = 64;
 
@@ -33,10 +34,23 @@ fn mouse_pressed(app: &App, model: &mut Model, button: MouseButton) {
             for (i, tex_opt) in model.thumb_textures.iter().enumerate() {
                 let row = i / cols;
                 let col = i % cols;
-                let x = -rect.w() / 2.0 + (model.thumb_size as f32) / 2.0 + model.gap / 2.0 + (col as f32) * cell;
-                let y = rect.h() / 2.0 - (model.thumb_size as f32) / 2.0 - model.gap / 2.0 - (row as f32) * cell + model.scroll_offset;
-                let width = tex_opt.as_ref().map(|t| t.size()[0] as f32).unwrap_or(model.thumb_size as f32);
-                let height = tex_opt.as_ref().map(|t| t.size()[1] as f32).unwrap_or(model.thumb_size as f32);
+                let x = -rect.w() / 2.0
+                    + (model.thumb_size as f32) / 2.0
+                    + model.gap / 2.0
+                    + (col as f32) * cell;
+                let y = rect.h() / 2.0
+                    - (model.thumb_size as f32) / 2.0
+                    - model.gap / 2.0
+                    - (row as f32) * cell
+                    + model.scroll_offset;
+                let width = tex_opt
+                    .as_ref()
+                    .map(|t| t.size()[0] as f32)
+                    .unwrap_or(model.thumb_size as f32);
+                let height = tex_opt
+                    .as_ref()
+                    .map(|t| t.size()[1] as f32)
+                    .unwrap_or(model.thumb_size as f32);
                 let x_min = x - width / 2.0;
                 let x_max = x + width / 2.0;
                 let y_min = y - height / 2.0;
@@ -256,12 +270,15 @@ fn model(app: &App) -> Model {
     let rect0 = app.window_rect();
     let thumb_queue = Arc::new(Mutex::new(VecDeque::new()));
     let view_params = Arc::new(Mutex::new((rect0.w(), rect0.h(), 0.0_f32)));
+    // Flag to signal completion of initial thumbnail enqueue scan
+    let scanning_done: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     // Kick off first-pass scanning on a background thread: load cached thumbnails & queue misses
     {
         let paths = image_paths.clone();
         let cache_base = cache_base.clone();
         let thumb_queue = Arc::clone(&thumb_queue);
         let tx = tx.clone();
+        let scanning_done = Arc::clone(&scanning_done);
         thread::spawn(move || {
             for (i, p) in paths.iter().enumerate() {
                 let rel = p
@@ -274,8 +291,12 @@ fn model(app: &App) -> Model {
                 let mut cache_path = cache_base.join(&rel);
                 cache_path.set_extension("png");
                 let mut loaded = false;
-                if let (Ok(meta_orig), Ok(meta_cache)) = (fs::metadata(p), fs::metadata(&cache_path)) {
-                    if let (Ok(orig_mtime), Ok(cache_mtime)) = (meta_orig.modified(), meta_cache.modified()) {
+                if let (Ok(meta_orig), Ok(meta_cache)) =
+                    (fs::metadata(p), fs::metadata(&cache_path))
+                {
+                    if let (Ok(orig_mtime), Ok(cache_mtime)) =
+                        (meta_orig.modified(), meta_cache.modified())
+                    {
                         if cache_mtime >= orig_mtime {
                             if let Ok(img) = image::open(&cache_path) {
                                 let _ = tx.send((i, img));
@@ -288,6 +309,8 @@ fn model(app: &App) -> Model {
                     thumb_queue.lock().unwrap().push_back(i);
                 }
             }
+            // Signal that initial scanning and queuing is complete
+            scanning_done.store(true, Ordering::SeqCst);
         });
     }
     // Spawn worker threads to generate missing thumbnails by priority
@@ -296,32 +319,41 @@ fn model(app: &App) -> Model {
         let paths = image_paths.clone();
         let cache_base = cache_base.clone();
         let thumb_queue = Arc::clone(&thumb_queue);
-        let view_params = Arc::clone(&view_params);
         let tx = tx.clone();
         let thumb_size = thumb_size;
+        let scanning_done = Arc::clone(&scanning_done);
+        // Clone view parameters and gap for prioritization
+        let view_params = Arc::clone(&view_params);
         let gap = gap;
         thread::spawn(move || {
             loop {
                 let idx_opt = {
                     let mut q = thumb_queue.lock().unwrap();
                     if q.is_empty() {
-                        break;
+                        // If scanning is complete and no more tasks, exit
+                        if scanning_done.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        // Wait briefly for tasks
+                        drop(q);
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
                     }
-                    // Sort by proximity to viewport vertical center
-                    let (rect_w, rect_h, scroll_offset) = *view_params.lock().unwrap();
-                    let cell = thumb_size as f32 + gap;
-                    let cols = ((rect_w + gap) / cell).floor() as usize;
-                    let y0 = rect_h / 2.0 - thumb_size as f32 / 2.0 - gap / 2.0;
-                    let slice = q.make_contiguous();
-                    slice.sort_by(|&i1, &i2| {
-                        let row1 = (i1 / cols) as f32;
-                        let y1 = y0 - row1 * cell + scroll_offset;
-                        let row2 = (i2 / cols) as f32;
-                        let y2 = y0 - row2 * cell + scroll_offset;
-                        y1.abs()
-                            .partial_cmp(&y2.abs())
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    // Prioritize thumbnails near viewport center
+                    if q.len() > 1 {
+                        let (rect_w, rect_h, scroll_offset) = *view_params.lock().unwrap();
+                        let cell = thumb_size as f32 + gap;
+                        let cols = ((rect_w + gap) / cell).floor() as usize;
+                        let y0 = rect_h / 2.0 - thumb_size as f32 / 2.0 - gap / 2.0;
+                        let slice = q.make_contiguous();
+                        slice.sort_by(|&i1, &i2| {
+                            let row1 = (i1 / cols) as f32;
+                            let y1 = y0 - row1 * cell + scroll_offset;
+                            let row2 = (i2 / cols) as f32;
+                            let y2 = y0 - row2 * cell + scroll_offset;
+                            y1.abs().partial_cmp(&y2.abs()).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    }
                     q.pop_front()
                 };
                 if let Some(i) = idx_opt {
@@ -743,7 +775,9 @@ fn update(app: &App, model: &mut Model, _update: Update) {
     }
     // Schedule preload of selected thumbnail if stable for >200ms
     if let Mode::Thumbnails = model.mode {
-        if !model.selection_pending && model.selection_changed_at.elapsed() >= Duration::from_millis(200) {
+        if !model.selection_pending
+            && model.selection_changed_at.elapsed() >= Duration::from_millis(200)
+        {
             request_full_texture(model, model.current);
             model.selection_pending = true;
         }
@@ -780,54 +814,62 @@ fn view(app: &App, model: &Model, frame: Frame) {
             let cell = model.thumb_size as f32 + model.gap;
             let cols = ((rect.w() + model.gap) / cell).floor() as usize;
             let cols = cols.max(1);
-            for (i, tex_opt) in model.thumb_textures.iter().enumerate() {
-                let row = i / cols;
-                let col = i % cols;
-                let x = -rect.w() / 2.0
-                    + (model.thumb_size as f32) / 2.0
-                    + model.gap / 2.0
-                    + col as f32 * cell;
-                let y = rect.h() / 2.0
-                    - (model.thumb_size as f32) / 2.0
-                    - model.gap / 2.0
-                    - row as f32 * cell;
-                // Apply vertical scroll offset
-                let y = y + model.scroll_offset;
-                match tex_opt {
-                    Some(tex) => {
-                        let [tw, th] = tex.size();
-                        let w = tw as f32;
-                        let h = th as f32;
-                        draw.texture(tex).x_y(x, y).w_h(w, h);
-                        if i == model.current {
-                            draw.rect()
-                                .x_y(x, y)
-                                .w_h(w + 4.0, h + 4.0)
-                                .no_fill()
-                                .stroke(WHITE)
-                                .stroke_weight(2.0);
+            // Only draw thumbnails within the visible viewport rows
+            let total = model.thumb_textures.len();
+            let rows = (total + cols - 1) / cols;
+            let half_gap = model.gap / 2.0;
+            let scroll = model.scroll_offset;
+            // Compute visible row range
+            let row_min_f = (scroll - model.thumb_size as f32 - half_gap) / cell;
+            let row_min = row_min_f.ceil().max(0.0) as usize;
+            let row_max_f = (rect.h() + scroll - half_gap) / cell;
+            let row_max = row_max_f.floor().min(rows.saturating_sub(1) as f32) as usize;
+            for row in row_min..=row_max {
+                let base_y = rect.h() / 2.0 - (model.thumb_size as f32) / 2.0 - half_gap - (row as f32) * cell;
+                for col in 0..cols {
+                    let i = row * cols + col;
+                    if i >= total { break; }
+                    let x = -rect.w() / 2.0
+                        + (model.thumb_size as f32) / 2.0
+                        + half_gap
+                        + (col as f32) * cell;
+                    let y = base_y + scroll;
+                    let tex_opt = &model.thumb_textures[i];
+                    match tex_opt {
+                        Some(tex) => {
+                            let [tw, th] = tex.size();
+                            let w = tw as f32;
+                            let h = th as f32;
+                            draw.texture(tex).x_y(x, y).w_h(w, h);
+                            if i == model.current {
+                                draw.rect()
+                                    .x_y(x, y)
+                                    .w_h(w + 4.0, h + 4.0)
+                                    .no_fill()
+                                    .stroke(WHITE)
+                                    .stroke_weight(2.0);
+                            }
                         }
-                    }
-                    None => {
-                        // Placeholder grey square while loading
-                        draw.rect()
-                            .x_y(x, y)
-                            .w_h(model.thumb_size as f32, model.thumb_size as f32)
-                            .color(srgba(0.5, 0.5, 0.5, 1.0));
-                        if i == model.current {
+                        None => {
                             draw.rect()
                                 .x_y(x, y)
-                                .w_h(model.thumb_size as f32 + 4.0, model.thumb_size as f32 + 4.0)
-                                .no_fill()
-                                .stroke(WHITE)
-                                .stroke_weight(2.0);
+                                .w_h(model.thumb_size as f32, model.thumb_size as f32)
+                                .color(srgba(0.5, 0.5, 0.5, 1.0));
+                            if i == model.current {
+                                draw.rect()
+                                    .x_y(x, y)
+                                    .w_h(model.thumb_size as f32 + 4.0, model.thumb_size as f32 + 4.0)
+                                    .no_fill()
+                                    .stroke(WHITE)
+                                    .stroke_weight(2.0);
+                            }
                         }
                     }
                 }
             }
             // Bottom info bar in thumbnail mode: filename and index/total
             let bar_h = 20.0;
-            let bar_y = -rect.h() / 2.0 + bar_h / 2.0 + 4.0;
+            let bar_y = -rect.h() / 2.0 + bar_h / 2.0;
             // Background
             draw.rect()
                 .x_y(0.0, bar_y)
@@ -840,14 +882,16 @@ fn view(app: &App, model: &Model, frame: Frame) {
                 .unwrap_or("");
             draw.text(fname)
                 .font_size(14)
-                .x_y(-rect.w() / 2.0 + 4.0, bar_y)
+                .w_h(rect.w(), bar_h)
+                .x_y(0.0, bar_y)
                 .left_justify()
                 .color(WHITE);
             // Index of selected image
             let count = format!("{}/{}", model.current + 1, model.image_paths.len());
             draw.text(&count)
                 .font_size(14)
-                .x_y(rect.w() / 2.0 - 4.0, bar_y)
+                .w_h(rect.w(), bar_h)
+                .x_y(0.0, bar_y)
                 .right_justify()
                 .color(WHITE);
         }
@@ -875,7 +919,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
                 }
                 // Draw bottom info bar with full path, dimensions, and zoom
                 let bar_h = 20.0;
-                let bar_y = -rect.h() / 2.0 + bar_h / 2.0 + 4.0;
+                let bar_y = -rect.h() / 2.0 + bar_h / 2.0;
                 // Background
                 draw.rect()
                     .x_y(0.0, bar_y)
@@ -888,8 +932,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
                     .color(WHITE)
                     .w_h(rect.w(), bar_h)
                     .x_y(0.0, bar_y)
-                    .left_justify()
-                    .align_text_bottom();
+                    .left_justify();
                 // Dimensions and zoom, right-aligned
                 let info = format!("{}×{}  {:.2}×", full_w, full_h, model.zoom);
                 draw.text(&info)
@@ -897,13 +940,28 @@ fn view(app: &App, model: &Model, frame: Frame) {
                     .color(WHITE)
                     .w_h(rect.w(), bar_h)
                     .x_y(0.0, bar_y)
-                    .right_justify()
-                    .align_text_bottom();
+                    .right_justify();
             } else {
                 draw.text("Loading...")
                     .font_size(24)
                     .color(WHITE)
                     .x_y(0.0, 0.0);
+                // Draw bottom info bar with full path, dimensions, and zoom
+                let bar_h = 20.0;
+                let bar_y = -rect.h() / 2.0 + bar_h / 2.0;
+                // Background
+                draw.rect()
+                    .x_y(0.0, bar_y)
+                    .w_h(rect.w(), bar_h)
+                    .color(srgba(0.0, 0.0, 0.0, 0.5));
+                // Full path, left-aligned
+                let full_path = model.image_paths[model.current].to_string_lossy();
+                draw.text(&full_path)
+                    .font_size(14)
+                    .color(WHITE)
+                    .w_h(rect.w(), bar_h)
+                    .x_y(0.0, bar_y)
+                    .left_justify();
             }
         }
     }
