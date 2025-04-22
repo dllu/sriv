@@ -7,11 +7,12 @@ use nannou::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Component, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+use toml::Value as TomlValue;
 /// Maximum number of full-resolution images to cache in memory.
 const FULL_CACHE_CAPACITY: usize = 64;
 
@@ -20,6 +21,121 @@ const FULL_CACHE_CAPACITY: usize = 64;
 enum Mode {
     Thumbnails,
     Single,
+}
+
+/// A user-defined key binding specification.
+#[derive(Debug)]
+struct KeyBinding {
+    key: Key,
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    super_key: bool,
+    command: String,
+}
+
+/// Parse a single binding spec (e.g. "ctrl+u") and command into a KeyBinding.
+fn parse_binding_spec(spec: &str, command: &str) -> Option<KeyBinding> {
+    let mut ctrl = false;
+    let mut shift = false;
+    let mut alt = false;
+    let mut super_key = false;
+    let mut key_opt: Option<Key> = None;
+    for part in spec.split('+').map(|s| s.trim()) {
+        match part.to_lowercase().as_str() {
+            "ctrl" | "control" => ctrl = true,
+            "shift" => shift = true,
+            "alt" => alt = true,
+            "super" | "cmd" | "meta" => super_key = true,
+            tok => {
+                // Parse as main key
+                if key_opt.is_some() {
+                    return None;
+                }
+                let key = match tok.to_ascii_uppercase().as_str() {
+                    // Letters
+                    c if c.len() == 1 && c.chars().all(|ch| ch.is_ascii_alphabetic()) => {
+                        let ch = c.chars().next().unwrap();
+                        // Match variant by character
+                        match ch {
+                            'A' => Key::A,
+                            'B' => Key::B,
+                            'C' => Key::C,
+                            'D' => Key::D,
+                            'E' => Key::E,
+                            'F' => Key::F,
+                            'G' => Key::G,
+                            'H' => Key::H,
+                            'I' => Key::I,
+                            'J' => Key::J,
+                            'K' => Key::K,
+                            'L' => Key::L,
+                            'M' => Key::M,
+                            'N' => Key::N,
+                            'O' => Key::O,
+                            'P' => Key::P,
+                            'Q' => Key::Q,
+                            'R' => Key::R,
+                            'S' => Key::S,
+                            'T' => Key::T,
+                            'U' => Key::U,
+                            'V' => Key::V,
+                            'W' => Key::W,
+                            'X' => Key::X,
+                            'Y' => Key::Y,
+                            'Z' => Key::Z,
+                            _ => return None,
+                        }
+                    }
+                    // Digits
+                    d if d.len() == 1 && d.chars().all(|ch| ch.is_ascii_digit()) => match d {
+                        "0" => Key::Key0,
+                        "1" => Key::Key1,
+                        "2" => Key::Key2,
+                        "3" => Key::Key3,
+                        "4" => Key::Key4,
+                        "5" => Key::Key5,
+                        "6" => Key::Key6,
+                        "7" => Key::Key7,
+                        "8" => Key::Key8,
+                        "9" => Key::Key9,
+                        _ => return None,
+                    },
+                    _ => return None,
+                };
+                key_opt = Some(key);
+            }
+        }
+    }
+    if let Some(key) = key_opt {
+        Some(KeyBinding {
+            key,
+            ctrl,
+            shift,
+            alt,
+            super_key,
+            command: command.to_string(),
+        })
+    } else {
+        None
+    }
+}
+
+/// Parse TOML-formatted bindings into a list of KeyBindings.
+fn parse_bindings(s: &str) -> Vec<KeyBinding> {
+    let mut bindings = Vec::new();
+    if let Ok(value) = toml::from_str::<TomlValue>(s) {
+        if let TomlValue::Table(table) = value {
+            for (spec, val) in table.into_iter() {
+                if let TomlValue::String(cmd) = val {
+                    if let Some(binding) = parse_binding_spec(&spec, &cmd) {
+                        bindings.push(binding);
+                    }
+                }
+            }
+        }
+    }
+    bindings
 }
 
 /// Mouse click handler: select thumbnail on left-click in thumbnail mode.
@@ -201,6 +317,8 @@ struct Model {
     selection_changed_at: Instant,
     // Whether preload has been requested after selection
     selection_pending: bool,
+    // User-defined key bindings
+    key_bindings: Vec<KeyBinding>,
 }
 
 /// The model function for initializing the application state.
@@ -258,6 +376,7 @@ fn model(app: &App) -> Model {
     let _window = app
         .new_window()
         .size(800, 600)
+        .title("sriv")
         .view(view)
         .key_pressed(key_pressed)
         .mouse_wheel(mouse_wheel)
@@ -351,7 +470,9 @@ fn model(app: &App) -> Model {
                             let y1 = y0 - row1 * cell + scroll_offset;
                             let row2 = (i2 / cols) as f32;
                             let y2 = y0 - row2 * cell + scroll_offset;
-                            y1.abs().partial_cmp(&y2.abs()).unwrap_or(std::cmp::Ordering::Equal)
+                            y1.abs()
+                                .partial_cmp(&y2.abs())
+                                .unwrap_or(std::cmp::Ordering::Equal)
                         });
                     }
                     q.pop_front()
@@ -412,6 +533,17 @@ fn model(app: &App) -> Model {
     let full_usage: VecDeque<usize> = VecDeque::new();
     // Get initial window rect for resize tracking
     let initial_rect = app.window_rect();
+    // Load user key bindings from config file
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let config_path = config_home.join("sriv").join("bindings.toml");
+    let key_bindings = if let Ok(contents) = fs::read_to_string(&config_path) {
+        parse_bindings(&contents)
+    } else {
+        Vec::new()
+    };
     Model {
         image_paths,
         thumb_textures,
@@ -433,6 +565,8 @@ fn model(app: &App) -> Model {
         fit_mode: false,
         selection_changed_at: Instant::now(),
         selection_pending: false,
+        // Custom key bindings
+        key_bindings,
     }
 }
 
@@ -703,6 +837,24 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
         }
         _ => {}
     }
+    // Custom key bindings execution
+    let current_file = model.image_paths[model.current]
+        .to_string_lossy()
+        .to_string();
+    for binding in &model.key_bindings {
+        if key == binding.key
+            && app.keys.mods.ctrl() == binding.ctrl
+            && app.keys.mods.shift() == binding.shift
+            && app.keys.mods.alt() == binding.alt
+            && app.keys.mods.logo() == binding.super_key
+        {
+            let cmd = binding.command.replace("{file}", &current_file);
+            thread::spawn(move || {
+                let _ = std::process::Command::new("sh").arg("-c").arg(cmd).spawn();
+            });
+        }
+    }
+
     // Auto-scroll to keep current thumbnail in view
     if let Mode::Thumbnails = model.mode {
         let row = model.current / cols;
@@ -726,6 +878,7 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
         model.selection_pending = false;
     }
 }
+
 /// Update function to process incoming thumbnail images.
 fn update(app: &App, model: &mut Model, _update: Update) {
     // Receive thumbnails from background thread and create textures
@@ -825,10 +978,15 @@ fn view(app: &App, model: &Model, frame: Frame) {
             let row_max_f = (rect.h() + scroll - half_gap) / cell;
             let row_max = row_max_f.floor().min(rows.saturating_sub(1) as f32) as usize;
             for row in row_min..=row_max {
-                let base_y = rect.h() / 2.0 - (model.thumb_size as f32) / 2.0 - half_gap - (row as f32) * cell;
+                let base_y = rect.h() / 2.0
+                    - (model.thumb_size as f32) / 2.0
+                    - half_gap
+                    - (row as f32) * cell;
                 for col in 0..cols {
                     let i = row * cols + col;
-                    if i >= total { break; }
+                    if i >= total {
+                        break;
+                    }
                     let x = -rect.w() / 2.0
                         + (model.thumb_size as f32) / 2.0
                         + half_gap
@@ -858,7 +1016,10 @@ fn view(app: &App, model: &Model, frame: Frame) {
                             if i == model.current {
                                 draw.rect()
                                     .x_y(x, y)
-                                    .w_h(model.thumb_size as f32 + 4.0, model.thumb_size as f32 + 4.0)
+                                    .w_h(
+                                        model.thumb_size as f32 + 4.0,
+                                        model.thumb_size as f32 + 4.0,
+                                    )
                                     .no_fill()
                                     .stroke(WHITE)
                                     .stroke_weight(2.0);
@@ -875,12 +1036,8 @@ fn view(app: &App, model: &Model, frame: Frame) {
                 .x_y(0.0, bar_y)
                 .w_h(rect.w(), bar_h)
                 .color(srgba(0.0, 0.0, 0.0, 0.5));
-            // Filename of selected image
-            let fname = model.image_paths[model.current]
-                .file_name()
-                .and_then(|os| os.to_str())
-                .unwrap_or("");
-            draw.text(fname)
+            let full_path = model.image_paths[model.current].to_string_lossy();
+            draw.text(&full_path)
                 .font_size(14)
                 .w_h(rect.w(), bar_h)
                 .x_y(0.0, bar_y)

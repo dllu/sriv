@@ -13,3 +13,12 @@ Similar to [nsxiv](https://github.com/nsxiv/nsxiv) but:
 Still work in progress.
 
 Mostly vibe coded with AI tbh.
+
+# Configuration
+
+You can put custom keybindings in `~/.config/sriv/bindings.toml`
+
+```
+ # Open the current image in the default viewer
+"ctrl+o" = "xdg-open {file}"
+```
