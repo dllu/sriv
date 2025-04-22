@@ -186,7 +186,18 @@ fn mouse_wheel(app: &App, model: &mut Model, delta: MouseScrollDelta, _phase: To
                 MouseScrollDelta::LineDelta(_x, y) => y * -100.0,
                 MouseScrollDelta::PixelDelta(pos) => -pos.y as f32,
             };
+            // Update scroll offset and clamp to content bounds
             model.scroll_offset += scroll_amount;
+            let rect = app.window_rect();
+            let cell = model.thumb_size as f32 + model.gap;
+            // Number of columns and rows in the thumbnail grid
+            let cols = ((rect.w() + model.gap) / cell).floor() as usize;
+            let cols = cols.max(1);
+            let total = model.thumb_textures.len();
+            let rows = ((total + cols - 1) / cols) as f32;
+            // Maximum scroll to show last row at bottom
+            let max_scroll = (rows * cell - rect.h()).max(0.0);
+            model.scroll_offset = model.scroll_offset.clamp(0.0, max_scroll);
             // Update view parameters for thumbnail prioritization
             if let Ok(mut vp) = model.view_params.lock() {
                 vp.2 = model.scroll_offset;
@@ -963,6 +974,16 @@ fn update(app: &App, model: &mut Model, _update: Update) {
             request_full_texture(model, model.current);
             model.selection_pending = true;
         }
+    }
+    // Clamp thumbnail scrolling to content bounds
+    if let Mode::Thumbnails = model.mode {
+        let cell = model.thumb_size as f32 + model.gap;
+        let cols = ((rect.w() + model.gap) / cell).floor() as usize;
+        let cols = cols.max(1);
+        let total = model.thumb_textures.len();
+        let rows = ((total + cols - 1) / cols) as f32;
+        let max_scroll = (rows * cell - rect.h()).max(0.0);
+        model.scroll_offset = model.scroll_offset.clamp(0.0, max_scroll);
     }
 }
 /// Ensure the full-resolution texture for `idx` is loaded and update LRU cache.
