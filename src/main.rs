@@ -107,30 +107,24 @@ fn parse_binding_spec(spec: &str, command: &str) -> Option<KeyBinding> {
             }
         }
     }
-    if let Some(key) = key_opt {
-        Some(KeyBinding {
-            key,
-            ctrl,
-            shift,
-            alt,
-            super_key,
-            command: command.to_string(),
-        })
-    } else {
-        None
-    }
+    key_opt.map(|key| KeyBinding {
+        key,
+        ctrl,
+        shift,
+        alt,
+        super_key,
+        command: command.to_string(),
+    })
 }
 
 /// Parse TOML-formatted bindings into a list of KeyBindings.
 fn parse_bindings(s: &str) -> Vec<KeyBinding> {
     let mut bindings = Vec::new();
-    if let Ok(value) = toml::from_str::<TomlValue>(s) {
-        if let TomlValue::Table(table) = value {
-            for (spec, val) in table.into_iter() {
-                if let TomlValue::String(cmd) = val {
-                    if let Some(binding) = parse_binding_spec(&spec, &cmd) {
-                        bindings.push(binding);
-                    }
+    if let Ok(TomlValue::Table(table)) = toml::from_str::<TomlValue>(s) {
+        for (spec, val) in table {
+            if let TomlValue::String(cmd) = val {
+                if let Some(binding) = parse_binding_spec(&spec, &cmd) {
+                    bindings.push(binding);
                 }
             }
         }
@@ -445,11 +439,9 @@ fn model(app: &App) -> Model {
         let cache_base = cache_base.clone();
         let thumb_queue = Arc::clone(&thumb_queue);
         let tx = tx.clone();
-        let thumb_size = thumb_size;
         let scanning_done = Arc::clone(&scanning_done);
         // Clone view parameters and gap for prioritization
         let view_params = Arc::clone(&view_params);
-        let gap = gap;
         thread::spawn(move || {
             loop {
                 let idx_opt = {
@@ -1006,7 +998,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
             let cols = cols.max(1);
             // Only draw thumbnails within the visible viewport rows
             let total = model.thumb_textures.len();
-            let rows = (total + cols - 1) / cols;
+            let rows = total.div_ceil(cols);
             let half_gap = model.gap / 2.0;
             let scroll = model.scroll_offset;
             // Compute visible row range
