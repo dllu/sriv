@@ -319,6 +319,12 @@ struct Model {
     selection_pending: bool,
     // User-defined key bindings
     key_bindings: Vec<KeyBinding>,
+    // Channel for sending command output messages
+    command_tx: std::sync::mpsc::Sender<String>,
+    // Channel for receiving command output messages
+    command_rx: Receiver<String>,
+    // Captured command output for display
+    command_output: Option<String>,
 }
 
 /// The model function for initializing the application state.
@@ -544,6 +550,8 @@ fn model(app: &App) -> Model {
     } else {
         Vec::new()
     };
+    // Channel for receiving command output from custom commands
+    let (command_tx, command_rx) = channel::<String>();
     Model {
         image_paths,
         thumb_textures,
@@ -567,6 +575,10 @@ fn model(app: &App) -> Model {
         selection_pending: false,
         // Custom key bindings
         key_bindings,
+        // Command output handling
+        command_tx,
+        command_rx,
+        command_output: None,
     }
 }
 
@@ -835,6 +847,10 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                 model.pan = vec2(0.0, 0.0);
             }
         }
+        // Clear command output display
+        Key::X => {
+            model.command_output = None;
+        }
         _ => {}
     }
     // Custom key bindings execution
@@ -849,8 +865,25 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             && app.keys.mods.logo() == binding.super_key
         {
             let cmd = binding.command.replace("{file}", &current_file);
+            let tx = model.command_tx.clone();
             thread::spawn(move || {
-                let _ = std::process::Command::new("sh").arg("-c").arg(cmd).spawn();
+                match std::process::Command::new("sh").arg("-c").arg(cmd).output() {
+                    Ok(output) => {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let mut s = stdout.to_string();
+                        if !stderr.is_empty() {
+                            if !s.is_empty() {
+                                s.push('\n');
+                            }
+                            s.push_str(&stderr);
+                        }
+                        let _ = tx.send(s);
+                    }
+                    Err(e) => {
+                        let _ = tx.send(format!("Failed to execute command: {}", e));
+                    }
+                }
             });
         }
     }
@@ -881,6 +914,10 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
 
 /// Update function to process incoming thumbnail images.
 fn update(app: &App, model: &mut Model, _update: Update) {
+    // Receive command output messages for display
+    while let Ok(msg) = model.command_rx.try_recv() {
+        model.command_output = Some(msg);
+    }
     // Receive thumbnails from background thread and create textures
     // Process incoming thumbnails
     while let Ok((i, img)) = model.thumb_rx.try_recv() {
@@ -1123,5 +1160,33 @@ fn view(app: &App, model: &Model, frame: Frame) {
         }
     }
 
+    // Draw command output overlay if present
+    if let Some(ref out) = model.command_output {
+        let box_height = rect.h() / 2.0;
+        let box_center_y = rect.h() / 4.0;
+        // Semi-transparent background
+        draw.rect()
+            .x_y(0.0, box_center_y)
+            .w_h(rect.w(), box_height)
+            .color(srgba(0.0, 0.0, 0.0, 0.8));
+        let lines: Vec<&str> = out.lines().collect();
+        let font_size = 16;
+        let margin = 10.0;
+        let line_spacing = 2.0;
+        let mut y = rect.h() / 2.0 - margin - (font_size as f32) / 2.0;
+        let text_width = rect.w() - 2.0 * margin;
+        for line in lines {
+            if y < 0.0 {
+                break;
+            }
+            draw.text(line)
+                .font_size(font_size)
+                .w_h(text_width, font_size as f32)
+                .x_y(0.0, y)
+                .left_justify()
+                .color(WHITE);
+            y -= font_size as f32 + line_spacing;
+        }
+    }
     draw.to_frame(app, &frame).unwrap();
 }

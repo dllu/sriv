@@ -9,6 +9,7 @@ Similar to [nsxiv](https://github.com/nsxiv/nsxiv) but:
 * gpu-accelerated image viewing
 * parallel thumbnail generation
 * supports images more than 32768 or 65536 px wide or whatever arcane limit that imlib2 has
+* works in wayland natively thanks to nannou using wgpu/winit
 
 Still work in progress.
 
