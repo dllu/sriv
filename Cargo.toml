@@ -1,5 +1,5 @@
 [package]
-name = "sriv-rs"
+name = "sriv"
 version = "0.1.0"
 edition = "2021"
 
@@ -12,3 +12,5 @@ rayon = "1.7.0"
 toml = "0.5"
 nannou = "0.19"
 sha1 = "0.6"
+crossbeam = "0.8.4"
+crossbeam-channel = "0.5"

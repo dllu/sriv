@@ -11,6 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
+use crossbeam_channel::{unbounded, Sender as CbSender, Receiver as CbReceiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -263,8 +264,8 @@ struct Model {
     // View parameters (window width, height, scroll offset) for prioritization
     view_params: Arc<Mutex<(f32, f32, f32)>>,
     // Channels for full-resolution image loading
-    full_req_tx: std::sync::mpsc::Sender<usize>,
-    full_resp_rx: Receiver<(usize, u32, u32, Vec<(u32, u32, u32, u32, Vec<u8>)>)>,
+    full_req_tx: CbSender<usize>,
+    full_resp_rx: CbReceiver<(usize, u32, u32, Vec<(u32, u32, u32, u32, Vec<u8>)>)>,
     // Track indices currently requested but not yet loaded
     full_pending: HashSet<usize>,
     // LRU cache of full-resolution tiled textures
@@ -485,39 +486,43 @@ fn model(app: &App) -> Model {
     let thumb_textures: Vec<Option<wgpu::Texture>> = (0..image_paths.len()).map(|_| None).collect();
     // Initialize channels and state for full-resolution LRU cache.
     // Channel for requesting full-resolution images (by index)
-    let (full_req_tx, full_req_rx) = channel::<usize>();
+    let (full_req_tx, full_req_rx) = unbounded::<usize>();
     // Channel for receiving loaded full-resolution image tile data
     let (full_resp_tx, full_resp_rx) =
-        channel::<(usize, u32, u32, Vec<(u32, u32, u32, u32, Vec<u8>)>)>();
-    // Spawn loader thread for full images: load, crop, and convert to raw tile data off the main thread
+        unbounded::<(usize, u32, u32, Vec<(u32, u32, u32, u32, Vec<u8>)>)>();
+    // Spawn a pool of loader threads for full images: load, crop, and convert to raw tile data off the main thread
     {
-        let paths = image_paths.clone();
-        thread::spawn(move || {
-            for idx in full_req_rx {
-                if let Some(path) = paths.get(idx) {
-                    if let Ok(img) = image::open(path) {
-                        let rgba = img.to_rgba8();
-                        let full_w = rgba.width();
-                        let full_h = rgba.height();
-                        const MAX_TILE_SIZE: u32 = 8192;
-                        let mut tiles_data: Vec<(u32, u32, u32, u32, Vec<u8>)> = Vec::new();
-                        for y in (0..full_h).step_by(MAX_TILE_SIZE as usize) {
-                            for x in (0..full_w).step_by(MAX_TILE_SIZE as usize) {
-                                let tile_w = (full_w - x).min(MAX_TILE_SIZE);
-                                let tile_h = (full_h - y).min(MAX_TILE_SIZE);
-                                // Crop sub-image and collect raw RGBA pixel data
-                                let sub_image: RgbaImage =
-                                    crop_imm(&rgba, x, y, tile_w, tile_h).to_image();
-                                let raw_pixels = sub_image.into_raw();
-                                tiles_data.push((x, y, tile_w, tile_h, raw_pixels));
+        // Shared image paths for all workers
+        let paths = Arc::new(image_paths.clone());
+        // Spawn worker threads matching thumbnail thread count
+        for _ in 0..num_workers {
+            let req_rx = full_req_rx.clone();
+            let resp_tx = full_resp_tx.clone();
+            let paths = Arc::clone(&paths);
+            thread::spawn(move || {
+                while let Ok(idx) = req_rx.recv() {
+                    if let Some(path) = paths.get(idx) {
+                        if let Ok(img) = image::open(path) {
+                            let rgba = img.to_rgba8();
+                            let full_w = rgba.width();
+                            let full_h = rgba.height();
+                            const MAX_TILE_SIZE: u32 = 8192;
+                            let mut tiles_data = Vec::new();
+                            for y in (0..full_h).step_by(MAX_TILE_SIZE as usize) {
+                                for x in (0..full_w).step_by(MAX_TILE_SIZE as usize) {
+                                    let tile_w = (full_w - x).min(MAX_TILE_SIZE);
+                                    let tile_h = (full_h - y).min(MAX_TILE_SIZE);
+                                    let sub_image: RgbaImage = crop_imm(&rgba, x, y, tile_w, tile_h).to_image();
+                                    let raw_pixels = sub_image.into_raw();
+                                    tiles_data.push((x, y, tile_w, tile_h, raw_pixels));
+                                }
                             }
+                            let _ = resp_tx.send((idx, full_w, full_h, tiles_data));
                         }
-                        // Send the processed tile data back to the main thread
-                        let _ = full_resp_tx.send((idx, full_w, full_h, tiles_data));
                     }
                 }
-            }
-        });
+            });
+        }
     }
     let full_pending: HashSet<usize> = HashSet::new();
     let full_textures: HashMap<usize, TiledTexture> = HashMap::new();
