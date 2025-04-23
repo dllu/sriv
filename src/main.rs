@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use crossbeam_channel::{unbounded, Sender as CbSender, Receiver as CbReceiver};
 use std::sync::{Arc, Mutex};
+use std::cell::RefCell;
 use std::thread;
 use std::time::{Duration, Instant};
 use toml::Value as TomlValue;
@@ -226,8 +227,6 @@ fn mouse_wheel(app: &App, model: &mut Model, delta: MouseScrollDelta, _phase: To
 /// A single tile of a full-resolution image used to bypass GPU texture size limits.
 #[derive(Debug)]
 struct Tile {
-    /// The GPU texture for this tile.
-    texture: wgpu::Texture,
     /// Pixel offset from the left edge of the full image.
     x_offset: u32,
     /// Pixel offset from the top edge of the full image.
@@ -236,6 +235,10 @@ struct Tile {
     width: u32,
     /// Height of this tile in pixels.
     height: u32,
+    /// Raw pixel data stored on the CPU.
+    pixel_data: Vec<u8>,
+    /// Lazily-created GPU texture.
+    texture: RefCell<Option<wgpu::Texture>>,
 }
 /// A full-resolution image represented as a set of tiles.
 #[derive(Debug)]
@@ -916,58 +919,19 @@ fn update(app: &App, model: &mut Model, _update: Update) {
     }
     // Process loaded full-resolution tile data
     while let Ok((idx, full_w, full_h, tiles_data)) = model.full_resp_rx.try_recv() {
-        // Build GPU textures manually from raw tile pixel data
+        // Store raw pixel data for lazy texture creation
         let mut tiles = Vec::new();
 
-        let mut write_texture = Duration::from_millis(0);
         for (x_offset, y_offset, width, height, pixel_data) in tiles_data {
-            // Create raw GPU texture handle and upload pixel data
-            let size = wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            };
-            let descriptor = wgpu::TextureDescriptor {
-                label: None,
-                size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            };
-            // Create the raw texture handle
-            let handle = app.main_window().device().create_texture(&descriptor);
-            // Upload pixel data into the texture
-            let tic = Instant::now();
-            app.main_window().queue().write_texture(
-                wgpu::ImageCopyTexture {
-                    texture: &handle,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &pixel_data,
-                wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4 * width),
-                    rows_per_image: Some(height),
-                },
-                size,
-            );
-            write_texture += tic.elapsed();
-            // Wrap the raw handle and descriptor into a nannou Texture
-            let texture = wgpu::Texture::from_handle_and_descriptor(Arc::new(handle), descriptor);
             tiles.push(Tile {
-                texture,
                 x_offset,
                 y_offset,
                 width,
                 height,
+                pixel_data,
+                texture: RefCell::new(None),
             });
         }
-        println!("Timing: {:?}", write_texture);
         let tiled = TiledTexture {
             full_w,
             full_h,
@@ -1156,7 +1120,44 @@ fn view(app: &App, model: &Model, frame: Frame) {
                         tile.x_offset as f32 - full_w as f32 / 2.0 + tile.width as f32 / 2.0;
                     let y_center =
                         full_h as f32 / 2.0 - tile.y_offset as f32 - tile.height as f32 / 2.0;
-                    draw.texture(&tile.texture)
+                    // Lazy-create GPU texture if needed
+                    if tile.texture.borrow().is_none() {
+                        let size = wgpu::Extent3d {
+                            width: tile.width,
+                            height: tile.height,
+                            depth_or_array_layers: 1,
+                        };
+                        let descriptor = wgpu::TextureDescriptor {
+                            label: None,
+                            size,
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        };
+                        let handle = app.main_window().device().create_texture(&descriptor);
+                        app.main_window().queue().write_texture(
+                            wgpu::ImageCopyTexture {
+                                texture: &handle,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            &tile.pixel_data,
+                            wgpu::ImageDataLayout {
+                                offset: 0,
+                                bytes_per_row: Some(4 * tile.width),
+                                rows_per_image: Some(tile.height),
+                            },
+                            size,
+                        );
+                        let n_texture = wgpu::Texture::from_handle_and_descriptor(Arc::new(handle), descriptor);
+                        *tile.texture.borrow_mut() = Some(n_texture);
+                    }
+                    let n_texture = tile.texture.borrow().as_ref().unwrap().clone();
+                    draw.texture(&n_texture)
                         .x_y(
                             model.pan.x + x_center * model.zoom,
                             model.pan.y + y_center * model.zoom,
