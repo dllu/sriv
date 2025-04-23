@@ -216,7 +216,7 @@ fn mouse_wheel(app: &App, model: &mut Model, delta: MouseScrollDelta, _phase: To
                 MouseScrollDelta::LineDelta(_x, y) => 1.0 + y * 0.2,
                 MouseScrollDelta::PixelDelta(pos) => 1.0 + pos.y as f32 * 0.002,
             };
-            let new_zoom = (old_zoom * zoom_factor).clamp(0.1, 10.0);
+            let new_zoom = (old_zoom * zoom_factor).clamp(0.01, 10.0);
             // Adjust pan so the point under cursor stays fixed
             model.pan = mouse_pos + (model.pan - mouse_pos) * (new_zoom / old_zoom);
             model.zoom = new_zoom;
@@ -581,6 +581,112 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Navigate to a given index in single-image mode: update current, preload neighbors, and fit if loaded.
+fn navigate_to(app: &App, model: &mut Model, new_idx: usize) {
+    let len = model.image_paths.len();
+    model.current = new_idx;
+    // Preload the target and its neighbors
+    request_full_texture(model, new_idx);
+    if new_idx > 0 {
+        request_full_texture(model, new_idx - 1);
+    }
+    if new_idx + 1 < len {
+        request_full_texture(model, new_idx + 1);
+    }
+    // Apply fit if already loaded
+    if model.full_textures.contains_key(&new_idx) {
+        apply_fit(app, model);
+    }
+}
+/// Directions for arrow key navigation.
+enum ArrowDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Handle arrow navigation in both thumbnail and single modes.
+/// Returns true if event was fully consumed (e.g., panned in single mode).
+fn handle_arrow(app: &App, model: &mut Model, dir: ArrowDirection) -> bool {
+    let len = model.image_paths.len();
+    let rect = app.window_rect();
+    // Thumbnail grid parameters for thumbnail navigation
+    let cell = model.thumb_size as f32 + model.gap;
+    let cols = ((rect.w() + model.gap) / cell).floor() as usize;
+    let cols = cols.max(1);
+    match model.mode {
+        Mode::Thumbnails => {
+            // Compute target row and column
+            let row = match dir {
+                ArrowDirection::Up => {
+                    if model.current < cols {
+                        (len - 1) / cols
+                    } else {
+                        model.current / cols - 1
+                    }
+                }
+                ArrowDirection::Down => model.current / cols + 1,
+                _ => model.current / cols,
+            };
+            let col = match dir {
+                ArrowDirection::Left => {
+                    let c = model.current % cols;
+                    if c == 0 { cols - 1 } else { c - 1 }
+                }
+                ArrowDirection::Right => {
+                    let c = model.current % cols;
+                    if c + 1 >= cols { 0 } else { c + 1 }
+                }
+                _ => model.current % cols,
+            };
+            let idx = row * cols + col;
+            if idx < len {
+                model.current = idx;
+            }
+            false
+        }
+        Mode::Single => {
+            let pan_step = 200.0;
+            match dir {
+                ArrowDirection::Left | ArrowDirection::Right => {
+                    if let Some(tex) = model.full_textures.get(&model.current) {
+                        let [tw, _] = tex.size();
+                        let disp_w = tw as f32 * model.zoom;
+                        if disp_w > rect.w() {
+                            if let ArrowDirection::Left = dir {
+                                model.pan.x += pan_step;
+                            } else {
+                                model.pan.x -= pan_step;
+                            }
+                            let max_pan = (disp_w - rect.w()) / 2.0;
+                            model.pan.x = model.pan.x.min(max_pan).max(-max_pan);
+                            return true;
+                        }
+                    }
+                }
+                ArrowDirection::Up | ArrowDirection::Down => {
+                    if let Some(tex) = model.full_textures.get(&model.current) {
+                        let [_, th] = tex.size();
+                        let disp_h = th as f32 * model.zoom;
+                        if disp_h > rect.h() {
+                            if let ArrowDirection::Up = dir {
+                                model.pan.y -= pan_step;
+                            } else {
+                                model.pan.y += pan_step;
+                            }
+                            let max_pan = (disp_h - rect.h()) / 2.0;
+                            model.pan.y = model.pan.y.min(max_pan).max(-max_pan);
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+    }
+}
+
 fn key_pressed(app: &App, model: &mut Model, key: Key) {
     let len = model.image_paths.len();
     let rect = app.window_rect();
@@ -608,185 +714,53 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             }
         }
         Key::N => {
-            // navigate to next image in single-image mode
+            // Next image in single-image mode
             if let Mode::Single = model.mode {
-                if model.current < len - 1 {
-                    model.current += 1;
-                    // Pre-load current and adjacent images
-                    let idx = model.current;
-                    request_full_texture(model, idx);
-                    if idx > 0 {
-                        request_full_texture(model, idx - 1);
-                    }
-                    if idx + 1 < len {
-                        request_full_texture(model, idx + 1);
-                    }
-                    // If already loaded, fit the image to window
-                    if model.full_textures.contains_key(&idx) {
-                        apply_fit(app, model);
-                    }
+                if model.current + 1 < len {
+                    navigate_to(app, model, model.current + 1);
                 }
             }
         }
         Key::P => {
-            // navigate to previous image in single-image mode
+            // Previous image in single-image mode
             if let Mode::Single = model.mode {
                 if model.current > 0 {
-                    model.current -= 1;
-                    // Load current and pre-load neighbors
-                    request_full_texture(model, model.current);
-                    let idx = model.current;
-                    if idx > 0 {
-                        request_full_texture(model, idx - 1);
-                    }
-                    if idx + 1 < len {
-                        request_full_texture(model, idx + 1);
-                    }
-                    // If already loaded, fit the image to window
-                    if model.full_textures.contains_key(&idx) {
-                        apply_fit(app, model);
-                    }
+                    navigate_to(app, model, model.current - 1);
                 }
             }
         }
         // Skip 10 images forward
         Key::RBracket => {
             if let Mode::Single = model.mode {
-                let len = model.image_paths.len();
                 let new_idx = (model.current + 10).min(len.saturating_sub(1));
-                model.current = new_idx;
-                // Request current and neighbors
-                request_full_texture(model, new_idx);
-                if new_idx > 0 {
-                    request_full_texture(model, new_idx - 1);
-                }
-                if new_idx + 1 < len {
-                    request_full_texture(model, new_idx + 1);
-                }
-                // If already loaded, fit the image to window
-                if model.full_textures.contains_key(&new_idx) {
-                    apply_fit(app, model);
-                }
+                navigate_to(app, model, new_idx);
             }
         }
         // Skip 10 images backward
         Key::LBracket => {
             if let Mode::Single = model.mode {
                 let new_idx = model.current.saturating_sub(10);
-                model.current = new_idx;
-                // Request current and neighbors
-                request_full_texture(model, new_idx);
-                if new_idx > 0 {
-                    request_full_texture(model, new_idx - 1);
-                }
-                if new_idx + 1 < model.image_paths.len() {
-                    request_full_texture(model, new_idx + 1);
-                }
-                // If already loaded, fit the image to window
-                if model.full_textures.contains_key(&new_idx) {
-                    apply_fit(app, model);
-                }
+                navigate_to(app, model, new_idx);
             }
         }
-        Key::H | Key::Left => match model.mode {
-            Mode::Thumbnails => {
-                let row = model.current / cols;
-                let col = model.current % cols;
-                let new_col = if col == 0 { cols - 1 } else { col - 1 };
-                let idx = row * cols + new_col;
-                if idx < len {
-                    model.current = idx;
-                }
-            }
-            Mode::Single => {
-                // Pan left if zoomed wider than view
-                if let Some(tex) = model.full_textures.get(&model.current) {
-                    let [tw, _] = tex.size();
-                    let disp_w = tw as f32 * model.zoom;
-                    if disp_w > rect.w() {
-                        let pan_step = 20.0;
-                        model.pan.x += pan_step;
-                        let max_pan = (disp_w - rect.w()) / 2.0;
-                        model.pan.x = model.pan.x.min(max_pan).max(-max_pan);
-                        return;
-                    }
-                }
+        Key::H | Key::Left => {
+            if handle_arrow(app, model, ArrowDirection::Left) {
+                return;
             }
         },
-        Key::L | Key::Right => match model.mode {
-            Mode::Thumbnails => {
-                let row = model.current / cols;
-                let col = model.current % cols;
-                let new_col = if col + 1 >= cols { 0 } else { col + 1 };
-                let idx = row * cols + new_col;
-                if idx < len {
-                    model.current = idx;
-                }
-            }
-            Mode::Single => {
-                // Pan right if zoomed wider than view
-                if let Some(tex) = model.full_textures.get(&model.current) {
-                    let [tw, _] = tex.size();
-                    let disp_w = tw as f32 * model.zoom;
-                    if disp_w > rect.w() {
-                        let pan_step = 20.0;
-                        model.pan.x -= pan_step;
-                        let max_pan = (disp_w - rect.w()) / 2.0;
-                        model.pan.x = model.pan.x.min(max_pan).max(-max_pan);
-                        return;
-                    }
-                }
+        Key::L | Key::Right => {
+            if handle_arrow(app, model, ArrowDirection::Right) {
+                return;
             }
         },
-        Key::K | Key::Up => match model.mode {
-            Mode::Thumbnails => {
-                let row = if model.current < cols {
-                    (len - 1) / cols
-                } else {
-                    model.current / cols - 1
-                };
-                let col = model.current % cols;
-                let idx = row * cols + col;
-                if idx < len {
-                    model.current = idx;
-                }
-            }
-            Mode::Single => {
-                // Pan up if zoomed taller than view
-                if let Some(tex) = model.full_textures.get(&model.current) {
-                    let [_, th] = tex.size();
-                    let disp_h = th as f32 * model.zoom;
-                    if disp_h > rect.h() {
-                        let pan_step = 20.0;
-                        model.pan.y -= pan_step;
-                        let max_pan = (disp_h - rect.h()) / 2.0;
-                        model.pan.y = model.pan.y.min(max_pan).max(-max_pan);
-                        return;
-                    }
-                }
+        Key::K | Key::Up => {
+            if handle_arrow(app, model, ArrowDirection::Up) {
+                return;
             }
         },
-        Key::J | Key::Down => match model.mode {
-            Mode::Thumbnails => {
-                let row = model.current / cols + 1;
-                let idx = row * cols + (model.current % cols);
-                if idx < len {
-                    model.current = idx;
-                }
-            }
-            Mode::Single => {
-                // Pan down if zoomed taller than view
-                if let Some(tex) = model.full_textures.get(&model.current) {
-                    let [_, th] = tex.size();
-                    let disp_h = th as f32 * model.zoom;
-                    if disp_h > rect.h() {
-                        let pan_step = 20.0;
-                        model.pan.y += pan_step;
-                        let max_pan = (disp_h - rect.h()) / 2.0;
-                        model.pan.y = model.pan.y.min(max_pan).max(-max_pan);
-                        return;
-                    }
-                }
+        Key::J | Key::Down => {
+            if handle_arrow(app, model, ArrowDirection::Down) {
+                return;
             }
         },
         Key::Return => {
