@@ -4,9 +4,11 @@ use nannou::event::{MouseButton, MouseScrollDelta, TouchPhase, Update};
 use nannou::image::imageops::crop_imm;
 use nannou::image::{self, DynamicImage, GenericImageView, RgbaImage};
 use nannou::prelude::*;
+use nannou::wgpu;
+use sha1::Sha1;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::path::{Component, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
@@ -246,47 +248,12 @@ struct TiledTexture {
 }
 // Implement creation and sizing of tiled full-resolution textures.
 impl TiledTexture {
-    /// Create a tiled texture from a full-resolution image.
-    fn new(app: &App, img: &DynamicImage) -> Self {
-        // Convert image to RGBA8 for consistent pixel format.
-        let rgba = img.to_rgba8();
-        let full_w = rgba.width();
-        let full_h = rgba.height();
-        // Maximum texture dimension per tile (adjust as needed for GPU limits).
-        const MAX_TILE_SIZE: u32 = 8192;
-        let mut tiles = Vec::new();
-        // Split image into tiles of size at most MAX_TILE_SIZE.
-        for y in (0..full_h).step_by(MAX_TILE_SIZE as usize) {
-            for x in (0..full_w).step_by(MAX_TILE_SIZE as usize) {
-                let tile_w = (full_w - x).min(MAX_TILE_SIZE);
-                let tile_h = (full_h - y).min(MAX_TILE_SIZE);
-                // Crop the sub-image.
-                let sub_image: RgbaImage = crop_imm(&rgba, x, y, tile_w, tile_h).to_image();
-                // Wrap in DynamicImage for texture creation.
-                let dyn_img = DynamicImage::ImageRgba8(sub_image);
-                // Create GPU texture from sub-image.
-                let texture = wgpu::Texture::from_image(app, &dyn_img);
-                tiles.push(Tile {
-                    texture,
-                    x_offset: x,
-                    y_offset: y,
-                    width: tile_w,
-                    height: tile_h,
-                });
-            }
-        }
-        TiledTexture {
-            full_w,
-            full_h,
-            tiles,
-        }
-    }
-
     /// Return the full image dimensions [width, height].
     fn size(&self) -> [u32; 2] {
         [self.full_w, self.full_h]
     }
 }
+
 /// The application state.
 #[derive(Debug)]
 struct Model {
@@ -297,7 +264,7 @@ struct Model {
     view_params: Arc<Mutex<(f32, f32, f32)>>,
     // Channels for full-resolution image loading
     full_req_tx: std::sync::mpsc::Sender<usize>,
-    full_resp_rx: Receiver<(usize, DynamicImage)>,
+    full_resp_rx: Receiver<(usize, u32, u32, Vec<(u32, u32, u32, u32, Vec<u8>)>)>,
     // Track indices currently requested but not yet loaded
     full_pending: HashSet<usize>,
     // LRU cache of full-resolution tiled textures
@@ -330,6 +297,19 @@ struct Model {
     command_rx: Receiver<String>,
     // Captured command output for display
     command_output: Option<String>,
+}
+/// Compute the cache path for an image based on a SHA1 of its path.
+/// The cache layout is: cache_base/<first 3 hex chars>/<remaining hex chars>.png
+fn thumbnail_cache_path(cache_base: &Path, image_path: &Path) -> PathBuf {
+    let hex = {
+        let path_str = image_path.to_string_lossy();
+        let mut hasher = Sha1::new();
+        hasher.update(path_str.as_bytes());
+        hasher.digest().to_string()
+    };
+    let shard = &hex[..3];
+    let name = &hex[3..];
+    cache_base.join(shard).join(format!("{}.png", name))
 }
 
 /// The model function for initializing the application state.
@@ -411,15 +391,7 @@ fn model(app: &App) -> Model {
         let scanning_done = Arc::clone(&scanning_done);
         thread::spawn(move || {
             for (i, p) in paths.iter().enumerate() {
-                let rel = p
-                    .components()
-                    .filter_map(|c| match c {
-                        Component::Normal(os) => Some(os),
-                        _ => None,
-                    })
-                    .collect::<PathBuf>();
-                let mut cache_path = cache_base.join(&rel);
-                cache_path.set_extension("png");
+                let cache_path = thumbnail_cache_path(&cache_base, p);
                 let mut loaded = false;
                 if let (Ok(meta_orig), Ok(meta_cache)) =
                     (fs::metadata(p), fs::metadata(&cache_path))
@@ -488,15 +460,7 @@ fn model(app: &App) -> Model {
                 };
                 if let Some(i) = idx_opt {
                     let p = &paths[i];
-                    let rel = p
-                        .components()
-                        .filter_map(|c| match c {
-                            Component::Normal(os) => Some(os),
-                            _ => None,
-                        })
-                        .collect::<PathBuf>();
-                    let mut cache_path = cache_base.join(&rel);
-                    cache_path.set_extension("png");
+                    let cache_path = thumbnail_cache_path(&cache_base, p);
                     if let Ok(img) = image::open(p) {
                         let mut thumb = img.thumbnail(thumb_size, thumb_size);
                         let (w0, h0) = thumb.dimensions();
@@ -522,16 +486,34 @@ fn model(app: &App) -> Model {
     // Initialize channels and state for full-resolution LRU cache.
     // Channel for requesting full-resolution images (by index)
     let (full_req_tx, full_req_rx) = channel::<usize>();
-    // Channel for receiving loaded full-resolution DynamicImage
-    let (full_resp_tx, full_resp_rx) = channel::<(usize, DynamicImage)>();
-    // Spawn loader thread for full images
+    // Channel for receiving loaded full-resolution image tile data
+    let (full_resp_tx, full_resp_rx) =
+        channel::<(usize, u32, u32, Vec<(u32, u32, u32, u32, Vec<u8>)>)>();
+    // Spawn loader thread for full images: load, crop, and convert to raw tile data off the main thread
     {
         let paths = image_paths.clone();
         thread::spawn(move || {
             for idx in full_req_rx {
                 if let Some(path) = paths.get(idx) {
                     if let Ok(img) = image::open(path) {
-                        let _ = full_resp_tx.send((idx, img));
+                        let rgba = img.to_rgba8();
+                        let full_w = rgba.width();
+                        let full_h = rgba.height();
+                        const MAX_TILE_SIZE: u32 = 8192;
+                        let mut tiles_data: Vec<(u32, u32, u32, u32, Vec<u8>)> = Vec::new();
+                        for y in (0..full_h).step_by(MAX_TILE_SIZE as usize) {
+                            for x in (0..full_w).step_by(MAX_TILE_SIZE as usize) {
+                                let tile_w = (full_w - x).min(MAX_TILE_SIZE);
+                                let tile_h = (full_h - y).min(MAX_TILE_SIZE);
+                                // Crop sub-image and collect raw RGBA pixel data
+                                let sub_image: RgbaImage =
+                                    crop_imm(&rgba, x, y, tile_w, tile_h).to_image();
+                                let raw_pixels = sub_image.into_raw();
+                                tiles_data.push((x, y, tile_w, tile_h, raw_pixels));
+                            }
+                        }
+                        // Send the processed tile data back to the main thread
+                        let _ = full_resp_tx.send((idx, full_w, full_h, tiles_data));
                     }
                 }
             }
@@ -927,10 +909,65 @@ fn update(app: &App, model: &mut Model, _update: Update) {
         let tex = wgpu::Texture::from_image(app, &img);
         model.thumb_textures[i] = Some(tex);
     }
-    // Process loaded full-resolution images
-    while let Ok((idx, img)) = model.full_resp_rx.try_recv() {
-        // Build tiled GPU textures for the full image
-        let tiled = TiledTexture::new(app, &img);
+    // Process loaded full-resolution tile data
+    while let Ok((idx, full_w, full_h, tiles_data)) = model.full_resp_rx.try_recv() {
+        // Build GPU textures manually from raw tile pixel data
+        let mut tiles = Vec::new();
+
+        let mut write_texture = Duration::from_millis(0);
+        for (x_offset, y_offset, width, height, pixel_data) in tiles_data {
+            // Create raw GPU texture handle and upload pixel data
+            let size = wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            };
+            let descriptor = wgpu::TextureDescriptor {
+                label: None,
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            };
+            // Create the raw texture handle
+            let handle = app.main_window().device().create_texture(&descriptor);
+            // Upload pixel data into the texture
+            let tic = Instant::now();
+            app.main_window().queue().write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &handle,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &pixel_data,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * width),
+                    rows_per_image: Some(height),
+                },
+                size,
+            );
+            write_texture += tic.elapsed();
+            // Wrap the raw handle and descriptor into a nannou Texture
+            let texture = wgpu::Texture::from_handle_and_descriptor(Arc::new(handle), descriptor);
+            tiles.push(Tile {
+                texture,
+                x_offset,
+                y_offset,
+                width,
+                height,
+            });
+        }
+        println!("Timing: {:?}", write_texture);
+        let tiled = TiledTexture {
+            full_w,
+            full_h,
+            tiles,
+        };
         // Insert into cache and update LRU
         model.full_textures.insert(idx, tiled);
         // Mark use and remove pending
