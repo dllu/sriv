@@ -1,19 +1,19 @@
 use anyhow::Result;
+use crossbeam_channel::{unbounded, Receiver as CbReceiver, Sender as CbSender};
 use image::imageops::FilterType;
-use nannou::event::{MouseButton, MouseScrollDelta, TouchPhase, Update};
+use nannou::event::{ModifiersState, MouseButton, MouseScrollDelta, TouchPhase, Update};
 use nannou::image::imageops::crop_imm;
 use nannou::image::{self, DynamicImage, GenericImageView, RgbaImage};
 use nannou::prelude::*;
 use nannou::wgpu;
 use sha1::Sha1;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
-use crossbeam_channel::{unbounded, Sender as CbSender, Receiver as CbReceiver};
 use std::sync::{Arc, Mutex};
-use std::cell::RefCell;
 use std::thread;
 use std::time::{Duration, Instant};
 use toml::Value as TomlValue;
@@ -515,7 +515,8 @@ fn model(app: &App) -> Model {
                                 for x in (0..full_w).step_by(MAX_TILE_SIZE as usize) {
                                     let tile_w = (full_w - x).min(MAX_TILE_SIZE);
                                     let tile_h = (full_h - y).min(MAX_TILE_SIZE);
-                                    let sub_image: RgbaImage = crop_imm(&rgba, x, y, tile_w, tile_h).to_image();
+                                    let sub_image: RgbaImage =
+                                        crop_imm(&rgba, x, y, tile_w, tile_h).to_image();
                                     let raw_pixels = sub_image.into_raw();
                                     tiles_data.push((x, y, tile_w, tile_h, raw_pixels));
                                 }
@@ -632,11 +633,19 @@ fn handle_arrow(app: &App, model: &mut Model, dir: ArrowDirection) -> bool {
             let col = match dir {
                 ArrowDirection::Left => {
                     let c = model.current % cols;
-                    if c == 0 { cols - 1 } else { c - 1 }
+                    if c == 0 {
+                        cols - 1
+                    } else {
+                        c - 1
+                    }
                 }
                 ArrowDirection::Right => {
                     let c = model.current % cols;
-                    if c + 1 >= cols { 0 } else { c + 1 }
+                    if c + 1 >= cols {
+                        0
+                    } else {
+                        c + 1
+                    }
                 }
                 _ => model.current % cols,
             };
@@ -693,132 +702,146 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
     let cell = model.thumb_size as f32 + model.gap;
     let cols = ((rect.w() + model.gap) / cell).floor() as usize;
     let cols = cols.max(1);
-    match key {
-        // Quit on 'q'
-        Key::Q => {
-            // Exit the application
-            app.quit();
+    if app.keys.mods == ModifiersState::empty() {
+        match key {
+            // Quit on 'q'
+            Key::Q => {
+                // Exit the application
+                app.quit();
+            }
+            // g/G: jump to first/last in thumbnail mode
+            Key::G => {
+                if let Mode::Thumbnails = model.mode {
+                    let len = model.image_paths.len();
+                    // if Shift+G, go to last thumbnail; otherwise go to first
+                    if app.keys.mods.shift() {
+                        if len > 0 {
+                            model.current = len - 1;
+                        }
+                    } else {
+                        model.current = 0;
+                    }
+                }
+            }
+            Key::N => {
+                // Next image in single-image mode
+                if let Mode::Single = model.mode {
+                    if model.current + 1 < len {
+                        navigate_to(app, model, model.current + 1);
+                    }
+                }
+            }
+            Key::P => {
+                // Previous image in single-image mode
+                if let Mode::Single = model.mode {
+                    if model.current > 0 {
+                        navigate_to(app, model, model.current - 1);
+                    }
+                }
+            }
+            // Skip 10 images forward
+            Key::RBracket => {
+                if let Mode::Single = model.mode {
+                    let new_idx = (model.current + 10).min(len.saturating_sub(1));
+                    navigate_to(app, model, new_idx);
+                }
+            }
+            // Skip 10 images backward
+            Key::LBracket => {
+                if let Mode::Single = model.mode {
+                    let new_idx = model.current.saturating_sub(10);
+                    navigate_to(app, model, new_idx);
+                }
+            }
+            Key::H | Key::Left => {
+                if handle_arrow(app, model, ArrowDirection::Left) {
+                    return;
+                }
+            }
+            Key::L | Key::Right => {
+                if handle_arrow(app, model, ArrowDirection::Right) {
+                    return;
+                }
+            }
+            Key::K | Key::Up => {
+                if handle_arrow(app, model, ArrowDirection::Up) {
+                    return;
+                }
+            }
+            Key::J | Key::Down => {
+                if handle_arrow(app, model, ArrowDirection::Down) {
+                    return;
+                }
+            }
+            Key::Return => {
+                // Toggle between thumbnail and single-image modes.
+                match model.mode {
+                    Mode::Thumbnails => {
+                        // Pre-load current and adjacent images, then fit
+                        let len = model.image_paths.len();
+                        let idx = model.current;
+                        request_full_texture(model, idx);
+                        if idx > 0 {
+                            request_full_texture(model, idx - 1);
+                        }
+                        if idx + 1 < len {
+                            request_full_texture(model, idx + 1);
+                        }
+                        // Enter single mode and fit image to window
+                        model.mode = Mode::Single;
+                        apply_fit(app, model);
+                    }
+                    Mode::Single => {
+                        model.mode = Mode::Thumbnails;
+                    }
+                }
+            }
+            // Fit single image to window
+            Key::W => {
+                if let Mode::Single = model.mode {
+                    let rect = app.window_rect();
+                    if let Some(tex) = model.full_textures.get(&model.current) {
+                        let [w, h] = tex.size();
+                        let fit = (rect.w() / w as f32).min(rect.h() / h as f32);
+                        model.zoom = fit;
+                    } else {
+                        model.zoom = 1.0;
+                    }
+                    model.pan = vec2(0.0, 0.0);
+                }
+            }
+            // Toggle full screen
+            Key::F => {
+                let window = app.main_window();
+                // Query current state, then toggle
+                let is_fs = window.is_fullscreen();
+                window.set_fullscreen(!is_fs);
+            }
+            // Show at 100% scale
+            Key::Equals => {
+                if let Mode::Single = model.mode {
+                    model.zoom = 1.0;
+                    model.pan = vec2(0.0, 0.0);
+                }
+            }
+            // Clear command output display
+            Key::X => {
+                model.command_output = None;
+            }
+            _ => {}
         }
-        // g/G: jump to first/last in thumbnail mode
-        Key::G => {
-            if let Mode::Thumbnails = model.mode {
-                let len = model.image_paths.len();
-                // if Shift+G, go to last thumbnail; otherwise go to first
-                if app.keys.mods.shift() {
+    } else if app.keys.mods == ModifiersState::SHIFT {
+        match key {
+            Key::G => {
+                if let Mode::Thumbnails = model.mode {
+                    let len = model.image_paths.len();
                     if len > 0 {
                         model.current = len - 1;
                     }
-                } else {
-                    model.current = 0;
                 }
             }
+            _ => {}
         }
-        Key::N => {
-            // Next image in single-image mode
-            if let Mode::Single = model.mode {
-                if model.current + 1 < len {
-                    navigate_to(app, model, model.current + 1);
-                }
-            }
-        }
-        Key::P => {
-            // Previous image in single-image mode
-            if let Mode::Single = model.mode {
-                if model.current > 0 {
-                    navigate_to(app, model, model.current - 1);
-                }
-            }
-        }
-        // Skip 10 images forward
-        Key::RBracket => {
-            if let Mode::Single = model.mode {
-                let new_idx = (model.current + 10).min(len.saturating_sub(1));
-                navigate_to(app, model, new_idx);
-            }
-        }
-        // Skip 10 images backward
-        Key::LBracket => {
-            if let Mode::Single = model.mode {
-                let new_idx = model.current.saturating_sub(10);
-                navigate_to(app, model, new_idx);
-            }
-        }
-        Key::H | Key::Left => {
-            if handle_arrow(app, model, ArrowDirection::Left) {
-                return;
-            }
-        },
-        Key::L | Key::Right => {
-            if handle_arrow(app, model, ArrowDirection::Right) {
-                return;
-            }
-        },
-        Key::K | Key::Up => {
-            if handle_arrow(app, model, ArrowDirection::Up) {
-                return;
-            }
-        },
-        Key::J | Key::Down => {
-            if handle_arrow(app, model, ArrowDirection::Down) {
-                return;
-            }
-        },
-        Key::Return => {
-            // Toggle between thumbnail and single-image modes.
-            match model.mode {
-                Mode::Thumbnails => {
-                    // Pre-load current and adjacent images, then fit
-                    let len = model.image_paths.len();
-                    let idx = model.current;
-                    request_full_texture(model, idx);
-                    if idx > 0 {
-                        request_full_texture(model, idx - 1);
-                    }
-                    if idx + 1 < len {
-                        request_full_texture(model, idx + 1);
-                    }
-                    // Enter single mode and fit image to window
-                    model.mode = Mode::Single;
-                    apply_fit(app, model);
-                }
-                Mode::Single => {
-                    model.mode = Mode::Thumbnails;
-                }
-            }
-        }
-        // Fit single image to window
-        Key::W => {
-            if let Mode::Single = model.mode {
-                let rect = app.window_rect();
-                if let Some(tex) = model.full_textures.get(&model.current) {
-                    let [w, h] = tex.size();
-                    let fit = (rect.w() / w as f32).min(rect.h() / h as f32);
-                    model.zoom = fit;
-                } else {
-                    model.zoom = 1.0;
-                }
-                model.pan = vec2(0.0, 0.0);
-            }
-        }
-        // Toggle full screen
-        Key::F => {
-            let window = app.main_window();
-            // Query current state, then toggle
-            let is_fs = window.is_fullscreen();
-            window.set_fullscreen(!is_fs);
-        }
-        // Show at 100% scale
-        Key::Equals => {
-            if let Mode::Single = model.mode {
-                model.zoom = 1.0;
-                model.pan = vec2(0.0, 0.0);
-            }
-        }
-        // Clear command output display
-        Key::X => {
-            model.command_output = None;
-        }
-        _ => {}
     }
     // Custom key bindings execution
     let current_file = model.image_paths[model.current]
@@ -1108,7 +1131,8 @@ fn view(app: &App, model: &Model, frame: Frame) {
                             sample_count: 1,
                             dimension: wgpu::TextureDimension::D2,
                             format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                                | wgpu::TextureUsages::COPY_DST,
                             view_formats: &[],
                         };
                         let handle = app.main_window().device().create_texture(&descriptor);
@@ -1127,7 +1151,8 @@ fn view(app: &App, model: &Model, frame: Frame) {
                             },
                             size,
                         );
-                        let n_texture = wgpu::Texture::from_handle_and_descriptor(Arc::new(handle), descriptor);
+                        let n_texture =
+                            wgpu::Texture::from_handle_and_descriptor(Arc::new(handle), descriptor);
                         *tile.texture.borrow_mut() = Some(n_texture);
                     }
                     let n_texture = tile.texture.borrow().as_ref().unwrap().clone();
