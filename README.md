@@ -17,6 +17,32 @@ still work in progress.
 
 mostly vibe coded with AI tbh.
 
+# installation
+
+To build and install the program system-wide on Linux, use one of the following methods:
+
+```bash
+# Build a release and install the binary to /usr/local/bin
+cargo build --release
+sudo install -Dm755 target/release/sriv /usr/local/bin/sriv
+```
+
+Alternatively, install directly with Cargo:
+
+```bash
+sudo cargo install --path . --force --root /usr/local
+```
+
+## Usage
+
+To clear and regenerate the thumbnail cache for all specified images, use the `--clear-cache` flag before the file or directory arguments:
+
+```bash
+sriv-rs --clear-cache <image files or directories>
+```
+
+# configuration
+
 # configuration
 
 you can put custom keybindings in `~/.config/sriv/bindings.toml`. Just put whatever modifiers (`ctrl`, `shift`, `alt`) if you want and `+` and then the letter or number of the key.

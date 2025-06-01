@@ -316,12 +316,47 @@ fn thumbnail_cache_path(cache_base: &Path, image_path: &Path) -> PathBuf {
     cache_base.join(shard).join(format!("{}.png", name))
 }
 
+/// Adjust image orientation based on EXIF orientation tag.
+fn adjust_orientation(img: DynamicImage, path: &Path) -> DynamicImage {
+    let mut oriented = img;
+    if let Ok(exif) = rexif::parse_file(path) {
+        for entry in exif.entries {
+            if entry.tag.to_string() == "Orientation" {
+                if let rexif::TagValue::U16(vals) = entry.value {
+                    if let Some(&code) = vals.get(0) {
+                        oriented = match code {
+                            2 => oriented.fliph(),
+                            3 => oriented.rotate180(),
+                            4 => oriented.flipv(),
+                            5 => oriented.rotate90().fliph(),
+                            6 => oriented.rotate90(),
+                            7 => oriented.rotate270().fliph(),
+                            8 => oriented.rotate270(),
+                            _ => oriented,
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+    oriented
+}
+
 /// The model function for initializing the application state.
 fn model(app: &App) -> Model {
     // Parse command-line arguments: files or directories.
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut regen_cache = false;
+    let mut args: Vec<String> = Vec::new();
+    for arg in std::env::args().skip(1) {
+        if arg == "--clear-cache" || arg == "--regen-cache" {
+            regen_cache = true;
+        } else {
+            args.push(arg);
+        }
+    }
     if args.is_empty() {
-        eprintln!("Usage: sriv-rs <image files or directories>...");
+        eprintln!("Usage: sriv-rs [--clear-cache] <image files or directories>...");
         std::process::exit(1);
     }
     // Collect image file paths.
@@ -367,6 +402,13 @@ fn model(app: &App) -> Model {
         })
         .unwrap_or_else(|| PathBuf::from("."));
     let cache_base = cache_home.join("sriv");
+    if regen_cache {
+        if let Err(e) = fs::remove_dir_all(&cache_base) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("Failed to clear thumbnail cache {}: {}", cache_base.display(), e);
+            }
+        }
+    }
     // Create the window first, so textures can reference a focused window.
     let _window = app
         .new_window()
@@ -465,7 +507,8 @@ fn model(app: &App) -> Model {
                 if let Some(i) = idx_opt {
                     let p = &paths[i];
                     let cache_path = thumbnail_cache_path(&cache_base, p);
-                    if let Ok(img) = image::open(p) {
+                    if let Ok(img_orig) = image::open(p) {
+                        let img = adjust_orientation(img_orig, p);
                         let mut thumb = img.thumbnail(thumb_size, thumb_size);
                         let (w0, h0) = thumb.dimensions();
                         if w0 != 0 && h0 != 0 {
@@ -505,7 +548,8 @@ fn model(app: &App) -> Model {
             thread::spawn(move || {
                 while let Ok(idx) = req_rx.recv() {
                     if let Some(path) = paths.get(idx) {
-                        if let Ok(img) = image::open(path) {
+                        if let Ok(img_orig) = image::open(path) {
+                            let img = adjust_orientation(img_orig, path);
                             let rgba = img.to_rgba8();
                             let full_w = rgba.width();
                             let full_h = rgba.height();
