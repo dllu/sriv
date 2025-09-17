@@ -11,14 +11,19 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use toml::Value as TomlValue;
 /// Maximum number of full-resolution images to cache in memory.
-const FULL_CACHE_CAPACITY: usize = 64;
+const FULL_CACHE_CAPACITY: usize = 4;
+/// How long to wait before retrying a full-resolution load request.
+const FULL_PENDING_RETRY: Duration = Duration::from_secs(5);
+/// Number of extra rows of thumbnails to keep warm beyond the viewport.
+const THUMB_PREFETCH_ROWS: usize = 1;
+/// Additional thumbnail textures to keep available beyond the visible count.
+const THUMB_POOL_MARGIN: usize = 12;
 
 /// List of recognized raw file extensions for detecting XMP sidecars.
 const RAW_EXTENSIONS: &[&str] = &[
@@ -152,36 +157,46 @@ fn mouse_pressed(app: &App, model: &mut Model, button: MouseButton) {
             let cell = model.thumb_size as f32 + model.gap;
             let cols = ((rect.w() + model.gap) / cell).floor() as usize;
             let cols = cols.max(1);
-            for (i, tex_opt) in model.thumb_textures.iter().enumerate() {
-                let row = i / cols;
-                let col = i % cols;
-                let x = -rect.w() / 2.0
-                    + (model.thumb_size as f32) / 2.0
-                    + model.gap / 2.0
-                    + (col as f32) * cell;
-                let y = rect.h() / 2.0
+            let total = model.image_paths.len();
+            let rows = total.div_ceil(cols);
+            let half_gap = model.gap / 2.0;
+            let scroll = model.scroll_offset;
+            let row_min_f = (scroll - model.thumb_size as f32 - half_gap) / cell;
+            let row_min = row_min_f.ceil().max(0.0) as usize;
+            let row_max_f = (rect.h() + scroll - half_gap) / cell;
+            let row_max = row_max_f.floor().min(rows.saturating_sub(1) as f32) as usize;
+            for row in row_min..=row_max {
+                let base_y = rect.h() / 2.0
                     - (model.thumb_size as f32) / 2.0
-                    - model.gap / 2.0
-                    - (row as f32) * cell
-                    + model.scroll_offset;
-                let width = tex_opt
-                    .as_ref()
-                    .map(|t| t.size()[0] as f32)
-                    .unwrap_or(model.thumb_size as f32);
-                let height = tex_opt
-                    .as_ref()
-                    .map(|t| t.size()[1] as f32)
-                    .unwrap_or(model.thumb_size as f32);
-                let x_min = x - width / 2.0;
-                let x_max = x + width / 2.0;
-                let y_min = y - height / 2.0;
-                let y_max = y + height / 2.0;
-                if pos.x >= x_min && pos.x <= x_max && pos.y >= y_min && pos.y <= y_max {
-                    model.current = i;
-                    // Reset preload timer on click selection
-                    model.selection_changed_at = Instant::now();
-                    model.selection_pending = false;
-                    break;
+                    - half_gap
+                    - (row as f32) * cell;
+                for col in 0..cols {
+                    let i = row * cols + col;
+                    if i >= total {
+                        break;
+                    }
+                    let x = -rect.w() / 2.0
+                        + (model.thumb_size as f32) / 2.0
+                        + half_gap
+                        + (col as f32) * cell;
+                    let y = base_y + scroll;
+                    let (width, height) = if let Some(tex) = model.thumb_textures.get(&i) {
+                        let [tw, th] = tex.size();
+                        (tw as f32, th as f32)
+                    } else {
+                        let size = model.thumb_size as f32;
+                        (size, size)
+                    };
+                    let x_min = x - width / 2.0;
+                    let x_max = x + width / 2.0;
+                    let y_min = y - height / 2.0;
+                    let y_max = y + height / 2.0;
+                    if pos.x >= x_min && pos.x <= x_max && pos.y >= y_min && pos.y <= y_max {
+                        model.current = i;
+                        model.selection_changed_at = Instant::now();
+                        model.selection_pending = false;
+                        return;
+                    }
                 }
             }
         }
@@ -204,15 +219,11 @@ fn mouse_wheel(app: &App, model: &mut Model, delta: MouseScrollDelta, _phase: To
             // Number of columns and rows in the thumbnail grid
             let cols = ((rect.w() + model.gap) / cell).floor() as usize;
             let cols = cols.max(1);
-            let total = model.thumb_textures.len();
+            let total = model.image_paths.len();
             let rows = ((total + cols - 1) / cols) as f32;
             // Maximum scroll to show last row at bottom
             let max_scroll = (rows * cell - rect.h()).max(0.0);
             model.scroll_offset = model.scroll_offset.clamp(0.0, max_scroll);
-            // Update view parameters for thumbnail prioritization
-            if let Ok(mut vp) = model.view_params.lock() {
-                vp.2 = model.scroll_offset;
-            }
         }
         Mode::Single => {
             // Zoom in/out around mouse cursor
@@ -269,16 +280,18 @@ impl TiledTexture {
 #[derive(Debug)]
 struct Model {
     image_paths: Vec<PathBuf>,
-    thumb_textures: Vec<Option<wgpu::Texture>>,
+    thumb_textures: HashMap<usize, wgpu::Texture>,
     thumb_has_xmp: Vec<bool>,
     thumb_rx: Receiver<(usize, DynamicImage)>,
-    // View parameters (window width, height, scroll offset) for prioritization
-    view_params: Arc<Mutex<(f32, f32, f32)>>,
+    thumb_req_tx: CbSender<usize>,
+    thumb_pending: HashSet<usize>,
+    thumb_usage: VecDeque<usize>,
+    thumb_capacity: usize,
     // Channels for full-resolution image loading
     full_req_tx: CbSender<usize>,
     full_resp_rx: CbReceiver<(usize, u32, u32, Vec<(u32, u32, u32, u32, Vec<u8>)>)>,
     // Track indices currently requested but not yet loaded
-    full_pending: HashSet<usize>,
+    full_pending: HashMap<usize, Instant>,
     // LRU cache of full-resolution tiled textures
     full_textures: HashMap<usize, TiledTexture>,
     // Usage order for LRU eviction: front = most recently used
@@ -470,8 +483,6 @@ fn model(app: &App) -> Model {
     let thumb_has_xmp = detect_thumb_sidecars(&image_paths);
     // Prepare thumbnail size, gap, and cache base directory.
     let thumb_size: u32 = 256;
-    // Gap between thumbnails
-    let gap: f32 = 10.0;
     let cache_home = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| {
@@ -505,118 +516,70 @@ fn model(app: &App) -> Model {
         .mouse_pressed(mouse_pressed)
         .build()
         .unwrap();
-    // Channel for receiving thumbnails from background thread.
+    // Channel for receiving thumbnails from background threads.
     let (tx, rx) = channel::<(usize, DynamicImage)>();
-    // Prioritized thumbnail generation: shared queue and view parameters
-    let rect0 = app.window_rect();
-    let thumb_queue = Arc::new(Mutex::new(VecDeque::new()));
-    let view_params = Arc::new(Mutex::new((rect0.w(), rect0.h(), 0.0_f32)));
-    // Flag to signal completion of initial thumbnail enqueue scan
-    let scanning_done: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
-    // Kick off first-pass scanning on a background thread: load cached thumbnails & queue misses
-    {
-        let paths = image_paths.clone();
-        let cache_base = cache_base.clone();
-        let thumb_queue = Arc::clone(&thumb_queue);
-        let tx = tx.clone();
-        let scanning_done = Arc::clone(&scanning_done);
-        thread::spawn(move || {
-            for (i, p) in paths.iter().enumerate() {
-                let cache_path = thumbnail_cache_path(&cache_base, p);
-                let mut loaded = false;
-                if let (Ok(meta_orig), Ok(meta_cache)) =
-                    (fs::metadata(p), fs::metadata(&cache_path))
-                {
-                    if let (Ok(orig_mtime), Ok(cache_mtime)) =
-                        (meta_orig.modified(), meta_cache.modified())
-                    {
-                        if cache_mtime >= orig_mtime {
-                            if let Ok(img) = image::open(&cache_path) {
-                                let thumb = DynamicImage::ImageRgba8(img.to_rgba8());
-                                let _ = tx.send((i, thumb));
-                                loaded = true;
-                            }
-                        }
-                    }
-                }
-                if !loaded {
-                    thumb_queue.lock().unwrap().push_back(i);
-                }
-            }
-            // Signal that initial scanning and queuing is complete
-            scanning_done.store(true, Ordering::SeqCst);
-        });
-    }
-    // Spawn worker threads to generate missing thumbnails by priority
+    // Channel for requesting thumbnail loads on demand.
+    let (thumb_req_tx, thumb_req_rx) = unbounded::<usize>();
     let num_workers = rayon::current_num_threads().clamp(1, 8);
+    let shared_paths = Arc::new(image_paths.clone());
     for _ in 0..num_workers {
-        let paths = image_paths.clone();
+        let paths = Arc::clone(&shared_paths);
         let cache_base = cache_base.clone();
-        let thumb_queue = Arc::clone(&thumb_queue);
+        let thumb_req_rx = thumb_req_rx.clone();
         let tx = tx.clone();
-        let scanning_done = Arc::clone(&scanning_done);
-        // Clone view parameters and gap for prioritization
-        let view_params = Arc::clone(&view_params);
         thread::spawn(move || {
-            loop {
-                let idx_opt = {
-                    let mut q = thumb_queue.lock().unwrap();
-                    if q.is_empty() {
-                        // If scanning is complete and no more tasks, exit
-                        if scanning_done.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        // Wait briefly for tasks
-                        drop(q);
-                        thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-                    // Prioritize thumbnails near viewport center
-                    if q.len() > 1 {
-                        let (rect_w, rect_h, scroll_offset) = *view_params.lock().unwrap();
-                        let cell = thumb_size as f32 + gap;
-                        let cols = ((rect_w + gap) / cell).floor() as usize;
-                        let y0 = rect_h / 2.0 - thumb_size as f32 / 2.0 - gap / 2.0;
-                        let slice = q.make_contiguous();
-                        slice.sort_by(|&i1, &i2| {
-                            let row1 = (i1 / cols) as f32;
-                            let y1 = y0 - row1 * cell + scroll_offset;
-                            let row2 = (i2 / cols) as f32;
-                            let y2 = y0 - row2 * cell + scroll_offset;
-                            y1.abs()
-                                .partial_cmp(&y2.abs())
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                    }
-                    q.pop_front()
-                };
-                if let Some(i) = idx_opt {
-                    let p = &paths[i];
+            while let Ok(i) = thumb_req_rx.recv() {
+                if let Some(p) = paths.get(i) {
                     let cache_path = thumbnail_cache_path(&cache_base, p);
-                    if let Ok(img_orig) = image::open(p) {
-                        let img = adjust_orientation(img_orig, p);
-                        let mut thumb = img.thumbnail(thumb_size, thumb_size);
-                        let (w0, h0) = thumb.dimensions();
-                        if w0 != 0 && h0 != 0 {
-                            let w = if w0 < 2 { 2 } else { w0 };
-                            let h = if h0 < 2 { 2 } else { h0 };
-                            if w != w0 || h != h0 {
-                                thumb = thumb.resize_exact(w, h, FilterType::Nearest);
+                    let mut result: Option<DynamicImage> = None;
+                    if let (Ok(meta_orig), Ok(meta_cache)) =
+                        (fs::metadata(p), fs::metadata(&cache_path))
+                    {
+                        if let (Ok(orig_mtime), Ok(cache_mtime)) =
+                            (meta_orig.modified(), meta_cache.modified())
+                        {
+                            if cache_mtime >= orig_mtime {
+                                if let Ok(img) = image::open(&cache_path) {
+                                    result = Some(DynamicImage::ImageRgba8(img.to_rgba8()));
+                                }
                             }
-                            if let Some(parent) = cache_path.parent() {
-                                let _ = fs::create_dir_all(parent);
-                            }
-                            let thumb = DynamicImage::ImageRgba8(thumb.to_rgba8());
-                            let _ = thumb.save(&cache_path);
-                            let _ = tx.send((i, thumb));
                         }
+                    }
+                    if result.is_none() {
+                        if let Ok(img_orig) = image::open(p) {
+                            let img = adjust_orientation(img_orig, p);
+                            let mut thumb = img.thumbnail(thumb_size, thumb_size);
+                            let (w0, h0) = thumb.dimensions();
+                            if w0 != 0 && h0 != 0 {
+                                let w = w0.max(2);
+                                let h = h0.max(2);
+                                if w != w0 || h != h0 {
+                                    thumb = thumb.resize_exact(w, h, FilterType::Nearest);
+                                }
+                                if let Some(parent) = cache_path.parent() {
+                                    let _ = fs::create_dir_all(parent);
+                                }
+                                let dyn_thumb = DynamicImage::ImageRgba8(thumb.to_rgba8());
+                                let _ = dyn_thumb.save(&cache_path);
+                                result = Some(dyn_thumb);
+                            }
+                        }
+                    }
+                    if let Some(img) = result {
+                        let _ = tx.send((i, img));
+                    } else {
+                        let placeholder = DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+                            2,
+                            2,
+                            image::Rgba([128, 128, 128, 255]),
+                        ));
+                        let _ = tx.send((i, placeholder));
                     }
                 }
             }
         });
     }
-    // Initialize thumbnail texture placeholders.
-    let thumb_textures: Vec<Option<wgpu::Texture>> = (0..image_paths.len()).map(|_| None).collect();
+    drop(thumb_req_rx);
     // Initialize channels and state for full-resolution LRU cache.
     // Channel for requesting full-resolution images (by index)
     let (full_req_tx, full_req_rx) = unbounded::<usize>();
@@ -659,7 +622,7 @@ fn model(app: &App) -> Model {
             });
         }
     }
-    let full_pending: HashSet<usize> = HashSet::new();
+    let full_pending: HashMap<usize, Instant> = HashMap::new();
     let full_textures: HashMap<usize, TiledTexture> = HashMap::new();
     let full_usage: VecDeque<usize> = VecDeque::new();
     // Get initial window rect for resize tracking
@@ -677,12 +640,15 @@ fn model(app: &App) -> Model {
     };
     // Channel for receiving command output from custom commands
     let (command_tx, command_rx) = channel::<String>();
-    Model {
+    let mut model = Model {
         image_paths,
-        thumb_textures,
+        thumb_textures: HashMap::new(),
         thumb_has_xmp,
         thumb_rx: rx,
-        view_params,
+        thumb_req_tx: thumb_req_tx.clone(),
+        thumb_pending: HashSet::new(),
+        thumb_usage: VecDeque::new(),
+        thumb_capacity: 0,
         full_req_tx,
         full_resp_rx,
         full_pending,
@@ -705,7 +671,9 @@ fn model(app: &App) -> Model {
         command_tx,
         command_rx,
         command_output: None,
-    }
+    };
+    update_thumbnail_requests(app, &mut model);
+    model
 }
 
 fn main() -> Result<()> {
@@ -1023,10 +991,6 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             model.scroll_offset += bottom_bound - target_y;
         }
     }
-    // Update view parameters after auto-scroll
-    if let Ok(mut vp) = model.view_params.lock() {
-        vp.2 = model.scroll_offset;
-    }
     // On thumbnail mode selection (via keys), reset preload timer
     if let Mode::Thumbnails = model.mode {
         model.selection_changed_at = Instant::now();
@@ -1043,8 +1007,9 @@ fn update(app: &App, model: &mut Model, _update: Update) {
     // Receive thumbnails from background thread and create textures
     // Process incoming thumbnails
     while let Ok((i, img)) = model.thumb_rx.try_recv() {
+        model.thumb_pending.remove(&i);
         let tex = wgpu::Texture::from_image(app, &img);
-        model.thumb_textures[i] = Some(tex);
+        insert_thumbnail_texture(model, i, tex);
     }
     // Process loaded full-resolution tile data
     while let Ok((idx, full_w, full_h, tiles_data)) = model.full_resp_rx.try_recv() {
@@ -1089,12 +1054,6 @@ fn update(app: &App, model: &mut Model, _update: Update) {
     let rect = app.window_rect();
     if rect != model.prev_window_rect {
         model.prev_window_rect = rect;
-        // Update view parameters for thumbnail prioritization
-        if let Ok(mut vp) = model.view_params.lock() {
-            vp.0 = rect.w();
-            vp.1 = rect.h();
-            vp.2 = model.scroll_offset;
-        }
         if let Mode::Single = model.mode {
             if model.fit_mode {
                 apply_fit(app, model);
@@ -1115,19 +1074,138 @@ fn update(app: &App, model: &mut Model, _update: Update) {
         let cell = model.thumb_size as f32 + model.gap;
         let cols = ((rect.w() + model.gap) / cell).floor() as usize;
         let cols = cols.max(1);
-        let total = model.thumb_textures.len();
+        let total = model.image_paths.len();
         let rows = ((total + cols - 1) / cols) as f32;
         let max_scroll = (rows * cell - rect.h()).max(0.0);
         model.scroll_offset = model.scroll_offset.clamp(0.0, max_scroll);
     }
+    if matches!(model.mode, Mode::Single) {
+        if !model.full_textures.contains_key(&model.current) {
+            request_full_texture(model, model.current);
+        }
+    }
+    update_thumbnail_requests(app, model);
 }
 /// Ensure the full-resolution texture for `idx` is loaded and update LRU cache.
 /// Request loading of full-resolution image at `idx` in background.  Adds to pending set.
 fn request_full_texture(model: &mut Model, idx: usize) {
-    if !model.full_textures.contains_key(&idx) && !model.full_pending.contains(&idx) {
-        model.full_pending.insert(idx);
-        let _ = model.full_req_tx.send(idx);
+    if model.full_textures.contains_key(&idx) {
+        return;
     }
+    let now = Instant::now();
+    let needs_request = match model.full_pending.get(&idx) {
+        None => true,
+        Some(&sent_at) => now.duration_since(sent_at) > FULL_PENDING_RETRY,
+    };
+    if needs_request {
+        model.full_pending.insert(idx, now);
+        if let Err(err) = model.full_req_tx.send(idx) {
+            model.full_pending.remove(&idx);
+            eprintln!("failed to request full image load for index {idx}: {err}");
+        }
+    }
+}
+
+fn insert_thumbnail_texture(model: &mut Model, idx: usize, tex: wgpu::Texture) {
+    model.thumb_textures.insert(idx, tex);
+    touch_thumbnail(model, idx);
+    enforce_thumbnail_capacity(model);
+}
+
+fn touch_thumbnail(model: &mut Model, idx: usize) {
+    if let Some(pos) = model.thumb_usage.iter().position(|&v| v == idx) {
+        model.thumb_usage.remove(pos);
+    }
+    model.thumb_usage.push_front(idx);
+}
+
+fn enforce_thumbnail_capacity(model: &mut Model) {
+    while model.thumb_textures.len() > model.thumb_capacity {
+        if let Some(old_idx) = model.thumb_usage.pop_back() {
+            model.thumb_textures.remove(&old_idx);
+        } else {
+            break;
+        }
+    }
+}
+
+fn update_thumbnail_requests(app: &App, model: &mut Model) {
+    if !matches!(model.mode, Mode::Thumbnails) {
+        return;
+    }
+    let total = model.image_paths.len();
+    if total == 0 {
+        model.thumb_capacity = 0;
+        model.thumb_usage.clear();
+        model.thumb_textures.clear();
+        model.thumb_pending.clear();
+        return;
+    }
+    let rect = app.window_rect();
+    let visible = visible_thumbnail_indices(model, rect);
+    let required = visible.len();
+    let target_capacity = required
+        .saturating_add(THUMB_POOL_MARGIN)
+        .min(total)
+        .max(required);
+    if model.thumb_capacity != target_capacity {
+        model.thumb_capacity = target_capacity;
+        enforce_thumbnail_capacity(model);
+    }
+    for &idx in &visible {
+        if model.thumb_textures.contains_key(&idx) {
+            touch_thumbnail(model, idx);
+        } else if !model.thumb_pending.contains(&idx) {
+            model.thumb_pending.insert(idx);
+            let _ = model.thumb_req_tx.send(idx);
+        }
+    }
+    enforce_thumbnail_capacity(model);
+}
+
+fn visible_thumbnail_indices(model: &Model, rect: Rect) -> Vec<usize> {
+    let total = model.image_paths.len();
+    if total == 0 {
+        return Vec::new();
+    }
+    let cell = model.thumb_size as f32 + model.gap;
+    let mut cols = ((rect.w() + model.gap) / cell).floor() as isize;
+    if cols < 1 {
+        cols = 1;
+    }
+    let cols = cols as usize;
+    let rows = (total + cols - 1) / cols;
+    if rows == 0 {
+        return Vec::new();
+    }
+    let half_gap = model.gap / 2.0;
+    let scroll = model.scroll_offset;
+    let row_min_f = (scroll - model.thumb_size as f32 - half_gap) / cell;
+    let row_max_f = (rect.h() + scroll - half_gap) / cell;
+    let mut row_min = row_min_f.ceil() as isize - THUMB_PREFETCH_ROWS as isize;
+    let mut row_max = row_max_f.floor() as isize + THUMB_PREFETCH_ROWS as isize;
+    let max_row = rows as isize - 1;
+    if row_min < 0 {
+        row_min = 0;
+    }
+    if row_max > max_row {
+        row_max = max_row;
+    }
+    if row_max < row_min {
+        row_max = row_min;
+    }
+    let mut indices = Vec::new();
+    for row in row_min..=row_max {
+        let base = row as usize * cols;
+        for col in 0..cols {
+            let idx = base + col;
+            if idx >= total {
+                break;
+            }
+            indices.push(idx);
+        }
+    }
+    indices
 }
 /// Apply fit-to-window for current single-image view
 fn apply_fit(app: &App, model: &mut Model) {
@@ -1153,7 +1231,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
             let cols = ((rect.w() + model.gap) / cell).floor() as usize;
             let cols = cols.max(1);
             // Only draw thumbnails within the visible viewport rows
-            let total = model.thumb_textures.len();
+            let total = model.image_paths.len();
             let rows = total.div_ceil(cols);
             let half_gap = model.gap / 2.0;
             let scroll = model.scroll_offset;
@@ -1177,54 +1255,49 @@ fn view(app: &App, model: &Model, frame: Frame) {
                         + half_gap
                         + (col as f32) * cell;
                     let y = base_y + scroll;
-                    let tex_opt = &model.thumb_textures[i];
-                    match tex_opt {
-                        Some(tex) => {
-                            let [tw, th] = tex.size();
-                            let w = tw as f32;
-                            let h = th as f32;
-                            draw.texture(tex).x_y(x, y).w_h(w, h);
-                            if model.thumb_has_xmp.get(i).copied().unwrap_or(false) {
-                                let icon_w = 38.0;
-                                let icon_h = 18.0;
-                                let margin = 6.0;
-                                let icon_center_x = x + w / 2.0 - icon_w / 2.0 - margin;
-                                let icon_center_y = y + h / 2.0 - icon_h / 2.0 - margin;
-                                draw.rect()
-                                    .x_y(icon_center_x, icon_center_y)
-                                    .w_h(icon_w, icon_h)
-                                    .color(srgba(0.0, 0.0, 0.0, 0.65));
-                                draw.text("XMP")
-                                    .font_size(12)
-                                    .w_h(icon_w, icon_h)
-                                    .x_y(icon_center_x, icon_center_y - 1.0)
-                                    .color(WHITE);
-                            }
-                            if i == model.current {
-                                draw.rect()
-                                    .x_y(x, y)
-                                    .w_h(w + 4.0, h + 4.0)
-                                    .no_fill()
-                                    .stroke(WHITE)
-                                    .stroke_weight(2.0);
-                            }
+                    if let Some(tex) = model.thumb_textures.get(&i) {
+                        let [tw, th] = tex.size();
+                        let w = tw as f32;
+                        let h = th as f32;
+                        draw.texture(tex).x_y(x, y).w_h(w, h);
+                        if model.thumb_has_xmp.get(i).copied().unwrap_or(false) {
+                            let icon_w = 38.0;
+                            let icon_h = 18.0;
+                            let margin = 6.0;
+                            let icon_center_x = x + w / 2.0 - icon_w / 2.0 - margin;
+                            let icon_center_y = y + h / 2.0 - icon_h / 2.0 - margin;
+                            draw.rect()
+                                .x_y(icon_center_x, icon_center_y)
+                                .w_h(icon_w, icon_h)
+                                .color(srgba(0.0, 0.0, 0.0, 0.65));
+                            draw.text("XMP")
+                                .font_size(12)
+                                .w_h(icon_w, icon_h)
+                                .x_y(icon_center_x, icon_center_y - 1.0)
+                                .color(WHITE);
                         }
-                        None => {
+                        if i == model.current {
                             draw.rect()
                                 .x_y(x, y)
-                                .w_h(model.thumb_size as f32, model.thumb_size as f32)
-                                .color(srgba(0.5, 0.5, 0.5, 1.0));
-                            if i == model.current {
-                                draw.rect()
-                                    .x_y(x, y)
-                                    .w_h(
-                                        model.thumb_size as f32 + 4.0,
-                                        model.thumb_size as f32 + 4.0,
-                                    )
-                                    .no_fill()
-                                    .stroke(WHITE)
-                                    .stroke_weight(2.0);
-                            }
+                                .w_h(w + 4.0, h + 4.0)
+                                .no_fill()
+                                .stroke(WHITE)
+                                .stroke_weight(2.0);
+                        }
+                    } else {
+                        let thumb_w = model.thumb_size as f32;
+                        let thumb_h = model.thumb_size as f32;
+                        draw.rect()
+                            .x_y(x, y)
+                            .w_h(thumb_w, thumb_h)
+                            .color(srgba(0.5, 0.5, 0.5, 1.0));
+                        if i == model.current {
+                            draw.rect()
+                                .x_y(x, y)
+                                .w_h(thumb_w + 4.0, thumb_h + 4.0)
+                                .no_fill()
+                                .stroke(WHITE)
+                                .stroke_weight(2.0);
                         }
                     }
                 }
