@@ -20,6 +20,13 @@ use toml::Value as TomlValue;
 /// Maximum number of full-resolution images to cache in memory.
 const FULL_CACHE_CAPACITY: usize = 64;
 
+/// List of recognized raw file extensions for detecting XMP sidecars.
+const RAW_EXTENSIONS: &[&str] = &[
+    "3fr", "ari", "arw", "bay", "cap", "cr2", "cr3", "crw", "cs1", "dcr", "dng", "erf", "fff",
+    "iiq", "k25", "kdc", "mdc", "mef", "mos", "mrw", "nef", "nrw", "orf", "pef", "ptx", "pxn",
+    "raf", "raw", "rwl", "rw2", "rwz", "sr2", "srf", "srw", "x3f",
+];
+
 /// The display mode of the viewer.
 #[derive(Debug)]
 enum Mode {
@@ -263,6 +270,7 @@ impl TiledTexture {
 struct Model {
     image_paths: Vec<PathBuf>,
     thumb_textures: Vec<Option<wgpu::Texture>>,
+    thumb_has_xmp: Vec<bool>,
     thumb_rx: Receiver<(usize, DynamicImage)>,
     // View parameters (window width, height, scroll offset) for prioritization
     view_params: Arc<Mutex<(f32, f32, f32)>>,
@@ -343,6 +351,78 @@ fn adjust_orientation(img: DynamicImage, path: &Path) -> DynamicImage {
     oriented
 }
 
+/// Scan a directory for raw files that have matching XMP sidecars.
+fn scan_raw_sidecars(dir: &Path) -> HashMap<String, bool> {
+    let mut map = HashMap::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let ext_raw = match path.extension().and_then(|s| s.to_str()) {
+                Some(ext) => ext,
+                None => continue,
+            };
+            let ext_lower = ext_raw.to_ascii_lowercase();
+            if !RAW_EXTENSIONS.contains(&ext_lower.as_str()) {
+                continue;
+            }
+            let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(stem) => stem,
+                None => continue,
+            };
+            let mut has_xmp = false;
+            // Typical variants: foo.RAF.xmp, foo.raf.xmp, foo.xmp
+            let base_xmp = path.with_extension("xmp");
+            let candidates = [
+                path.with_extension(format!("{}.xmp", ext_raw)),
+                path.with_extension(format!("{}.xmp", ext_lower)),
+                base_xmp.clone(),
+                path.parent()
+                    .map(|parent| parent.join(format!("{}.xmp", stem)))
+                    .unwrap_or_else(|| base_xmp.clone()),
+            ];
+            for candidate in candidates.iter() {
+                if candidate.exists() {
+                    has_xmp = true;
+                    break;
+                }
+            }
+            let key = stem.to_string();
+            map.entry(key)
+                .and_modify(|flag| *flag |= has_xmp)
+                .or_insert(has_xmp);
+        }
+    }
+    map
+}
+
+/// Determine which images have corresponding raw files with XMP sidecars.
+fn detect_thumb_sidecars(image_paths: &[PathBuf]) -> Vec<bool> {
+    let mut dir_cache: HashMap<PathBuf, HashMap<String, bool>> = HashMap::new();
+    let mut flags = Vec::with_capacity(image_paths.len());
+    for path in image_paths {
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(stem) => stem.to_string(),
+            None => {
+                flags.push(false);
+                continue;
+            }
+        };
+        let parent = path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let entry = dir_cache
+            .entry(parent.clone())
+            .or_insert_with(|| scan_raw_sidecars(&parent));
+        let flag = entry.get(&stem).copied().unwrap_or(false);
+        flags.push(flag);
+    }
+    flags
+}
+
 /// The model function for initializing the application state.
 fn model(app: &App) -> Model {
     // Parse command-line arguments: files or directories.
@@ -387,6 +467,7 @@ fn model(app: &App) -> Model {
         std::process::exit(1);
     }
     image_paths.sort();
+    let thumb_has_xmp = detect_thumb_sidecars(&image_paths);
     // Prepare thumbnail size, gap, and cache base directory.
     let thumb_size: u32 = 256;
     // Gap between thumbnails
@@ -405,7 +486,11 @@ fn model(app: &App) -> Model {
     if regen_cache {
         if let Err(e) = fs::remove_dir_all(&cache_base) {
             if e.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("Failed to clear thumbnail cache {}: {}", cache_base.display(), e);
+                eprintln!(
+                    "Failed to clear thumbnail cache {}: {}",
+                    cache_base.display(),
+                    e
+                );
             }
         }
     }
@@ -447,7 +532,8 @@ fn model(app: &App) -> Model {
                     {
                         if cache_mtime >= orig_mtime {
                             if let Ok(img) = image::open(&cache_path) {
-                                let _ = tx.send((i, img));
+                                let thumb = DynamicImage::ImageRgba8(img.to_rgba8());
+                                let _ = tx.send((i, thumb));
                                 loaded = true;
                             }
                         }
@@ -520,6 +606,7 @@ fn model(app: &App) -> Model {
                             if let Some(parent) = cache_path.parent() {
                                 let _ = fs::create_dir_all(parent);
                             }
+                            let thumb = DynamicImage::ImageRgba8(thumb.to_rgba8());
                             let _ = thumb.save(&cache_path);
                             let _ = tx.send((i, thumb));
                         }
@@ -593,6 +680,7 @@ fn model(app: &App) -> Model {
     Model {
         image_paths,
         thumb_textures,
+        thumb_has_xmp,
         thumb_rx: rx,
         view_params,
         full_req_tx,
@@ -1096,6 +1184,22 @@ fn view(app: &App, model: &Model, frame: Frame) {
                             let w = tw as f32;
                             let h = th as f32;
                             draw.texture(tex).x_y(x, y).w_h(w, h);
+                            if model.thumb_has_xmp.get(i).copied().unwrap_or(false) {
+                                let icon_w = 38.0;
+                                let icon_h = 18.0;
+                                let margin = 6.0;
+                                let icon_center_x = x + w / 2.0 - icon_w / 2.0 - margin;
+                                let icon_center_y = y + h / 2.0 - icon_h / 2.0 - margin;
+                                draw.rect()
+                                    .x_y(icon_center_x, icon_center_y)
+                                    .w_h(icon_w, icon_h)
+                                    .color(srgba(0.0, 0.0, 0.0, 0.65));
+                                draw.text("XMP")
+                                    .font_size(12)
+                                    .w_h(icon_w, icon_h)
+                                    .x_y(icon_center_x, icon_center_y - 1.0)
+                                    .color(WHITE);
+                            }
                             if i == model.current {
                                 draw.rect()
                                     .x_y(x, y)
