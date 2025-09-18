@@ -15,3 +15,9 @@ sha1 = "0.6"
 crossbeam = "0.8.4"
 crossbeam-channel = "0.5"
 rexif = "0.7.5"
+candle = { package = "candle-core", version = "0.9.1" }
+candle-nn = "0.9.1"
+candle-transformers = "0.9.1"
+hf-hub = "0.4.1"
+tokenizers = { version = "0.21.0", default-features = false, features = ["fancy-regex"] }
+num_cpus = "1.17"

@@ -6,8 +6,8 @@ use nannou::image::imageops::crop_imm;
 use nannou::image::{self, DynamicImage, GenericImageView, RgbaImage};
 use nannou::prelude::*;
 use nannou::wgpu;
-use sha1::Sha1;
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,6 +16,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use toml::Value as TomlValue;
+
+mod clip;
+
+use clip::{ClipEngine, ClipEvent};
 /// Maximum number of full-resolution images to cache in memory.
 const FULL_CACHE_CAPACITY: usize = 4;
 /// How long to wait before retrying a full-resolution load request.
@@ -278,6 +282,17 @@ impl TiledTexture {
 
 /// The application state.
 #[derive(Debug)]
+struct SearchState {
+    input: String,
+    active: bool,
+    results: Vec<(usize, f32)>,
+    current: usize,
+    pending_request: Option<u64>,
+    error: Option<String>,
+    last_embedding: Option<Vec<f32>>,
+}
+
+#[derive(Debug)]
 struct Model {
     image_paths: Vec<PathBuf>,
     thumb_textures: HashMap<usize, wgpu::Texture>,
@@ -322,23 +337,22 @@ struct Model {
     command_rx: Receiver<String>,
     // Captured command output for display
     command_output: Option<String>,
+    // CLIP embedding management
+    clip_engine: ClipEngine,
+    clip_embeddings: Vec<Option<Vec<f32>>>,
+    clip_missing: HashSet<usize>,
+    clip_inflight: HashSet<usize>,
+    next_search_request_id: u64,
+    search: Option<SearchState>,
 }
 /// Compute the cache path for an image based on a SHA1 of its path.
 /// The cache layout is: cache_base/<first 3 hex chars>/<remaining hex chars>.png
 fn thumbnail_cache_path(cache_base: &Path, image_path: &Path) -> PathBuf {
-    let hex = {
-        let path_str = image_path.to_string_lossy();
-        let mut hasher = Sha1::new();
-        hasher.update(path_str.as_bytes());
-        hasher.digest().to_string()
-    };
-    let shard = &hex[..3];
-    let name = &hex[3..];
-    cache_base.join(shard).join(format!("{}.png", name))
+    clip::cache_file_path(cache_base, image_path, "png")
 }
 
 /// Adjust image orientation based on EXIF orientation tag.
-fn adjust_orientation(img: DynamicImage, path: &Path) -> DynamicImage {
+pub(crate) fn adjust_orientation(img: DynamicImage, path: &Path) -> DynamicImage {
     let mut oriented = img;
     if let Ok(exif) = rexif::parse_file(path) {
         for entry in exif.entries {
@@ -505,6 +519,42 @@ fn model(app: &App) -> Model {
             }
         }
     }
+    let clip_engine = ClipEngine::new(cache_base.clone()).unwrap_or_else(|err| {
+        eprintln!("Failed to initialize CLIP: {err}");
+        std::process::exit(1);
+    });
+    let mut clip_embeddings = Vec::with_capacity(image_paths.len());
+    let mut clip_missing: HashSet<usize> = HashSet::new();
+    let mut clip_inflight: HashSet<usize> = HashSet::new();
+    for (idx, path) in image_paths.iter().enumerate() {
+        match clip_engine.load_cached_embedding(path) {
+            Ok(Some(vec)) => clip_embeddings.push(Some(vec)),
+            Ok(None) => {
+                clip_embeddings.push(None);
+                clip_missing.insert(idx);
+            }
+            Err(err) => {
+                eprintln!(
+                    "Failed to load cached CLIP embedding for {}: {}",
+                    path.display(),
+                    err
+                );
+                clip_embeddings.push(None);
+                clip_missing.insert(idx);
+            }
+        }
+    }
+    for &idx in clip_missing.iter() {
+        if let Err(err) = clip_engine.ensure_embedding(idx, &image_paths[idx], thumb_size) {
+            eprintln!(
+                "Failed to queue CLIP embedding for {}: {}",
+                image_paths[idx].display(),
+                err
+            );
+        } else {
+            clip_inflight.insert(idx);
+        }
+    }
     // Create the window first, so textures can reference a focused window.
     let _window = app
         .new_window()
@@ -512,6 +562,7 @@ fn model(app: &App) -> Model {
         .title("sriv")
         .view(view)
         .key_pressed(key_pressed)
+        .received_character(received_character)
         .mouse_wheel(mouse_wheel)
         .mouse_pressed(mouse_pressed)
         .build()
@@ -671,6 +722,12 @@ fn model(app: &App) -> Model {
         command_tx,
         command_rx,
         command_output: None,
+        clip_engine,
+        clip_embeddings,
+        clip_missing,
+        clip_inflight,
+        next_search_request_id: 0,
+        search: None,
     };
     update_thumbnail_requests(app, &mut model);
     model
@@ -698,6 +755,234 @@ fn navigate_to(app: &App, model: &mut Model, new_idx: usize) {
     if model.full_textures.contains_key(&new_idx) {
         apply_fit(app, model);
     }
+}
+
+fn focus_image(app: &App, model: &mut Model, idx: usize) {
+    let len = model.image_paths.len();
+    if len == 0 {
+        return;
+    }
+    let idx = idx.min(len - 1);
+    match model.mode {
+        Mode::Single => navigate_to(app, model, idx),
+        Mode::Thumbnails => {
+            model.current = idx;
+            model.selection_changed_at = Instant::now();
+            model.selection_pending = false;
+            ensure_thumbnail_visible(app, model, idx);
+        }
+    }
+}
+
+fn ensure_thumbnail_visible(app: &App, model: &mut Model, idx: usize) {
+    if !matches!(model.mode, Mode::Thumbnails) {
+        return;
+    }
+    let rect = app.window_rect();
+    let cell = model.thumb_size as f32 + model.gap;
+    let mut cols = ((rect.w() + model.gap) / cell).floor() as usize;
+    cols = cols.max(1);
+    let row = idx / cols;
+    let top = row as f32 * cell;
+    let bottom = top + cell;
+    let view_height = rect.h();
+    let mut scroll = model.scroll_offset;
+    if top < scroll {
+        scroll = top;
+    } else if bottom > scroll + view_height {
+        scroll = bottom - view_height;
+    }
+    let rows = model.image_paths.len().div_ceil(cols);
+    let max_scroll = (rows as f32 * cell - view_height).max(0.0);
+    model.scroll_offset = scroll.clamp(0.0, max_scroll);
+}
+
+fn advance_search(app: &App, model: &mut Model, delta: isize) {
+    let mut target = None;
+    if let Some(search) = model.search.as_mut() {
+        if search.results.is_empty() {
+            return;
+        }
+        let len = search.results.len() as isize;
+        let mut idx = search.current as isize + delta;
+        if len == 0 {
+            return;
+        }
+        idx = ((idx % len) + len) % len;
+        search.current = idx as usize;
+        target = search
+            .results
+            .get(search.current)
+            .map(|(image_idx, _)| *image_idx);
+    }
+    if let Some(idx) = target {
+        focus_image(app, model, idx);
+    }
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let mut sum = 0.0f32;
+    let len = a.len().min(b.len());
+    for i in 0..len {
+        sum += a[i] * b[i];
+    }
+    sum
+}
+
+fn handle_text_result(app: &App, model: &mut Model, request_id: u64, embedding: Vec<f32>) {
+    let mut focus_target = None;
+    if let Some(search) = model.search.as_mut() {
+        if search.pending_request != Some(request_id) {
+            return;
+        }
+        search.pending_request = None;
+        search.error = None;
+        search.last_embedding = Some(embedding);
+        if let Some(text_embed) = search.last_embedding.as_ref() {
+            let mut scored = Vec::new();
+            for (idx, maybe_embed) in model.clip_embeddings.iter().enumerate() {
+                if let Some(img_embed) = maybe_embed {
+                    scored.push((idx, cosine_similarity(text_embed, img_embed)));
+                }
+            }
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+            search.results = scored;
+            search.current = 0;
+            focus_target = search.results.first().map(|(idx, _)| *idx);
+            if focus_target.is_none()
+                && model.clip_missing.is_empty()
+                && model.clip_inflight.is_empty()
+            {
+                search.error = Some("No matches found".to_string());
+            }
+        }
+    }
+    if let Some(idx) = focus_target {
+        focus_image(app, model, idx);
+    }
+}
+
+fn update_search_with_image_embedding(app: &App, model: &mut Model, index: usize) {
+    let mut focus_target = None;
+    if let Some(search) = model.search.as_mut() {
+        if let (Some(text_embed), Some(img_embed)) = (
+            search.last_embedding.as_ref(),
+            model
+                .clip_embeddings
+                .get(index)
+                .and_then(|item| item.as_ref()),
+        ) {
+            let had_results = !search.results.is_empty();
+            let score = cosine_similarity(text_embed, img_embed);
+            if let Some(entry) = search.results.iter_mut().find(|(idx, _)| *idx == index) {
+                entry.1 = score;
+            } else {
+                search.results.push((index, score));
+            }
+            search
+                .results
+                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+            if !search.results.is_empty() {
+                search.error = None;
+                if search.current >= search.results.len() {
+                    search.current = search.results.len() - 1;
+                }
+            }
+            if !had_results {
+                search.current = 0;
+                focus_target = Some(index);
+            } else if let Some(pos) = search
+                .results
+                .iter()
+                .position(|(idx, _)| *idx == model.current)
+            {
+                search.current = pos;
+            }
+        }
+    }
+    if let Some(idx) = focus_target {
+        focus_image(app, model, idx);
+    }
+}
+
+fn handle_search_key(app: &App, model: &mut Model, key: Key) -> bool {
+    let mods = app.keys.mods;
+    if mods.ctrl() || mods.alt() || mods.logo() {
+        return false;
+    }
+    if key == Key::Slash {
+        if let Some(search) = model.search.as_mut() {
+            search.input.clear();
+            search.results.clear();
+            search.pending_request = None;
+            search.error = None;
+            search.last_embedding = None;
+            search.current = 0;
+            search.active = true;
+        } else {
+            model.search = Some(SearchState {
+                input: String::new(),
+                active: true,
+                results: Vec::new(),
+                current: 0,
+                pending_request: None,
+                error: None,
+                last_embedding: None,
+            });
+        }
+        return true;
+    }
+    if let Some(search) = model.search.as_mut() {
+        match key {
+            Key::Escape => {
+                model.search = None;
+                return true;
+            }
+            Key::Return => {
+                if !search.active {
+                    return true;
+                }
+                if search.input.trim().is_empty() {
+                    search.error = Some("Enter a search phrase".to_string());
+                    return true;
+                }
+                let request_id = model.next_search_request_id;
+                model.next_search_request_id = model.next_search_request_id.wrapping_add(1);
+                let query = search.input.clone();
+                match model.clip_engine.request_text(request_id, query) {
+                    Ok(()) => {
+                        search.pending_request = Some(request_id);
+                        search.error = None;
+                        search.active = false;
+                    }
+                    Err(err) => {
+                        search.error = Some(format!("Failed to queue search: {err}"));
+                    }
+                }
+                return true;
+            }
+            Key::Back => {
+                if search.active {
+                    search.input.pop();
+                    search.pending_request = None;
+                    search.error = None;
+                    search.last_embedding = None;
+                    search.results.clear();
+                    search.current = 0;
+                }
+                return true;
+            }
+            Key::N => {
+                if !search.results.is_empty() {
+                    let delta = if mods.shift() { -1 } else { 1 };
+                    advance_search(app, model, delta);
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 /// Directions for arrow key navigation.
 enum ArrowDirection {
@@ -796,7 +1081,29 @@ fn handle_arrow(app: &App, model: &mut Model, dir: ArrowDirection) -> bool {
     }
 }
 
+fn received_character(_app: &App, model: &mut Model, ch: char) {
+    if ch.is_control() {
+        return;
+    }
+    if let Some(search) = model.search.as_mut() {
+        if search.active {
+            if ch == '/' && search.input.is_empty() {
+                return;
+            }
+            search.input.push(ch);
+            search.pending_request = None;
+            search.error = None;
+            search.last_embedding = None;
+            search.results.clear();
+            search.current = 0;
+        }
+    }
+}
+
 fn key_pressed(app: &App, model: &mut Model, key: Key) {
+    if handle_search_key(app, model, key) {
+        return;
+    }
     let len = model.image_paths.len();
     let rect = app.window_rect();
     let cell = model.thumb_size as f32 + model.gap;
@@ -1000,6 +1307,48 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
 
 /// Update function to process incoming thumbnail images.
 fn update(app: &App, model: &mut Model, _update: Update) {
+    loop {
+        match model.clip_engine.try_recv() {
+            Ok(event) => match event {
+                ClipEvent::ImageReady { index, embedding } => {
+                    if let Some(slot) = model.clip_embeddings.get_mut(index) {
+                        *slot = Some(embedding);
+                    }
+                    model.clip_missing.remove(&index);
+                    model.clip_inflight.remove(&index);
+                    update_search_with_image_embedding(app, model, index);
+                }
+                ClipEvent::ImageError { index, error } => {
+                    model.clip_inflight.remove(&index);
+                    if let Some(path) = model.image_paths.get(index) {
+                        eprintln!(
+                            "Failed to compute CLIP embedding for {}: {}",
+                            path.display(),
+                            error
+                        );
+                    } else {
+                        eprintln!("Failed to compute CLIP embedding: {}", error);
+                    }
+                }
+                ClipEvent::TextReady {
+                    request_id,
+                    embedding,
+                } => {
+                    handle_text_result(app, model, request_id, embedding);
+                }
+                ClipEvent::TextError { request_id, error } => {
+                    if let Some(search) = model.search.as_mut() {
+                        if search.pending_request == Some(request_id) {
+                            search.pending_request = None;
+                            search.error = Some(error);
+                        }
+                    }
+                }
+            },
+            Err(crossbeam_channel::TryRecvError::Empty) => break,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+        }
+    }
     // Receive command output messages for display
     while let Ok(msg) = model.command_rx.try_recv() {
         model.command_output = Some(msg);
@@ -1434,6 +1783,49 @@ fn view(app: &App, model: &Model, frame: Frame) {
                     .left_justify();
             }
         }
+    }
+
+    if let Some(search) = &model.search {
+        let prompt = if search.active {
+            format!("/{}_", search.input)
+        } else {
+            format!("/{}", search.input)
+        };
+        let mut status_parts = Vec::new();
+        if let Some(err) = &search.error {
+            status_parts.push(err.clone());
+        } else if search.pending_request.is_some() {
+            status_parts.push("searching…".to_string());
+        } else if !search.results.is_empty() {
+            status_parts.push(format!(
+                "match {}/{}",
+                search.current + 1,
+                search.results.len()
+            ));
+        }
+        let pending = model.clip_missing.len() + model.clip_inflight.len();
+        if pending > 0 {
+            status_parts.push(format!("pending embeddings: {}", pending));
+        }
+        let status = status_parts.join(" | ");
+        let bar_h = 28.0;
+        let bar_y = rect.top() - bar_h / 2.0 - 10.0;
+        draw.rect()
+            .x_y(0.0, bar_y)
+            .w_h(rect.w(), bar_h)
+            .color(srgba(0.0, 0.0, 0.0, 0.6));
+        draw.text(&prompt)
+            .font_size(16)
+            .color(WHITE)
+            .w_h(rect.w(), bar_h)
+            .x_y(0.0, bar_y)
+            .left_justify();
+        draw.text(&status)
+            .font_size(14)
+            .color(WHITE)
+            .w_h(rect.w(), bar_h)
+            .x_y(0.0, bar_y)
+            .right_justify();
     }
 
     // Draw command output overlay if present
