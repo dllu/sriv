@@ -285,6 +285,7 @@ impl TiledTexture {
 struct SearchState {
     input: String,
     focused: bool,
+    skip_next_char: bool,
     results: Vec<(usize, f32)>,
     current: usize,
     pending_request: Option<u64>,
@@ -913,11 +914,16 @@ fn handle_search_key(app: &App, model: &mut Model, key: Key) -> bool {
 
     if key == Key::Slash {
         if let Some(search) = model.search.as_mut() {
+            if search.focused {
+                return false;
+            }
             search.focused = true;
+            search.skip_next_char = true;
         } else {
             model.search = Some(SearchState {
                 input: String::new(),
                 focused: true,
+                skip_next_char: true,
                 results: Vec::new(),
                 current: 0,
                 pending_request: None,
@@ -950,6 +956,7 @@ fn handle_search_key(app: &App, model: &mut Model, key: Key) -> bool {
                         search.last_embedding = None;
                         search.results.clear();
                         search.current = 0;
+                        search.skip_next_char = false;
                     }
                     let request_id = model.next_search_request_id;
                     model.next_search_request_id = model.next_search_request_id.wrapping_add(1);
@@ -958,12 +965,14 @@ fn handle_search_key(app: &App, model: &mut Model, key: Key) -> bool {
                             if let Some(search) = model.search.as_mut() {
                                 search.pending_request = Some(request_id);
                                 search.focused = false;
+                                search.skip_next_char = false;
                             }
                         }
                         Err(err) => {
                             if let Some(search) = model.search.as_mut() {
                                 search.error = Some(format!("Failed to queue search: {err}"));
                                 search.focused = false;
+                                search.skip_next_char = false;
                             }
                         }
                     }
@@ -984,6 +993,7 @@ fn handle_search_key(app: &App, model: &mut Model, key: Key) -> bool {
                         search.last_embedding = None;
                         search.results.clear();
                         search.current = 0;
+                        search.skip_next_char = false;
                     }
                 }
                 if remove_search {
@@ -1138,6 +1148,10 @@ fn received_character(_app: &App, model: &mut Model, ch: char) {
     }
     if let Some(search) = model.search.as_mut() {
         if search.focused {
+            if search.skip_next_char {
+                search.skip_next_char = false;
+                return;
+            }
             search.input.push(ch);
             search.pending_request = None;
             search.error = None;
@@ -1861,7 +1875,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
         }
         let status = status_parts.join(" | ");
         let bar_h = 28.0;
-        let bar_y = rect.top() - bar_h / 2.0 - 10.0;
+        let bar_y = rect.top() - bar_h / 2.0;
         let bg = if search.focused {
             srgba(0.2549, 0.2039, 0.3490, 0.9)
         } else {
