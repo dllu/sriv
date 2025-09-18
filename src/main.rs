@@ -284,7 +284,7 @@ impl TiledTexture {
 #[derive(Debug)]
 struct SearchState {
     input: String,
-    active: bool,
+    focused: bool,
     results: Vec<(usize, f32)>,
     current: usize,
     pending_request: Option<u64>,
@@ -910,19 +910,14 @@ fn handle_search_key(app: &App, model: &mut Model, key: Key) -> bool {
     if mods.ctrl() || mods.alt() || mods.logo() {
         return false;
     }
+
     if key == Key::Slash {
         if let Some(search) = model.search.as_mut() {
-            search.input.clear();
-            search.results.clear();
-            search.pending_request = None;
-            search.error = None;
-            search.last_embedding = None;
-            search.current = 0;
-            search.active = true;
+            search.focused = true;
         } else {
             model.search = Some(SearchState {
                 input: String::new(),
-                active: true,
+                focused: true,
                 results: Vec::new(),
                 current: 0,
                 pending_request: None,
@@ -932,49 +927,104 @@ fn handle_search_key(app: &App, model: &mut Model, key: Key) -> bool {
         }
         return true;
     }
-    if let Some(search) = model.search.as_mut() {
+
+    if let Some(true) = model.search.as_ref().map(|s| s.focused) {
         match key {
             Key::Escape => {
                 model.search = None;
                 return true;
             }
             Key::Return => {
-                if !search.active {
-                    return true;
-                }
-                if search.input.trim().is_empty() {
-                    search.error = Some("Enter a search phrase".to_string());
-                    return true;
-                }
-                let request_id = model.next_search_request_id;
-                model.next_search_request_id = model.next_search_request_id.wrapping_add(1);
-                let query = search.input.clone();
-                match model.clip_engine.request_text(request_id, query) {
-                    Ok(()) => {
-                        search.pending_request = Some(request_id);
+                let query_opt = model.search.as_ref().and_then(|s| {
+                    let trimmed = s.input.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                });
+                if let Some(query) = query_opt {
+                    if let Some(search) = model.search.as_mut() {
+                        search.pending_request = None;
                         search.error = None;
-                        search.active = false;
+                        search.last_embedding = None;
+                        search.results.clear();
+                        search.current = 0;
                     }
-                    Err(err) => {
-                        search.error = Some(format!("Failed to queue search: {err}"));
+                    let request_id = model.next_search_request_id;
+                    model.next_search_request_id = model.next_search_request_id.wrapping_add(1);
+                    match model.clip_engine.request_text(request_id, query) {
+                        Ok(()) => {
+                            if let Some(search) = model.search.as_mut() {
+                                search.pending_request = Some(request_id);
+                                search.focused = false;
+                            }
+                        }
+                        Err(err) => {
+                            if let Some(search) = model.search.as_mut() {
+                                search.error = Some(format!("Failed to queue search: {err}"));
+                                search.focused = false;
+                            }
+                        }
                     }
+                } else if let Some(search) = model.search.as_mut() {
+                    search.error = Some("Enter a search phrase".to_string());
                 }
                 return true;
             }
             Key::Back => {
-                if search.active {
-                    search.input.pop();
-                    search.pending_request = None;
-                    search.error = None;
-                    search.last_embedding = None;
-                    search.results.clear();
-                    search.current = 0;
+                let mut remove_search = false;
+                if let Some(search) = model.search.as_mut() {
+                    if search.input.is_empty() {
+                        remove_search = true;
+                    } else {
+                        search.input.pop();
+                        search.pending_request = None;
+                        search.error = None;
+                        search.last_embedding = None;
+                        search.results.clear();
+                        search.current = 0;
+                    }
+                }
+                if remove_search {
+                    model.search = None;
                 }
                 return true;
             }
+            _ => {
+                return true;
+            }
+        }
+    }
+
+    if let Some(false) = model.search.as_ref().map(|s| s.focused) {
+        match key {
+            Key::Escape => {
+                model.search = None;
+                return true;
+            }
             Key::N => {
-                if !search.results.is_empty() {
+                if matches!(model.mode, Mode::Thumbnails)
+                    && model
+                        .search
+                        .as_ref()
+                        .map(|s| !s.results.is_empty())
+                        .unwrap_or(false)
+                {
                     let delta = if mods.shift() { -1 } else { 1 };
+                    advance_search(app, model, delta);
+                    return true;
+                }
+            }
+            Key::P => {
+                if matches!(model.mode, Mode::Thumbnails)
+                    && model
+                        .search
+                        .as_ref()
+                        .map(|s| !s.results.is_empty())
+                        .unwrap_or(false)
+                {
+                    let delta = if mods.shift() { 1 } else { -1 };
                     advance_search(app, model, delta);
                     return true;
                 }
@@ -982,6 +1032,7 @@ fn handle_search_key(app: &App, model: &mut Model, key: Key) -> bool {
             _ => {}
         }
     }
+
     false
 }
 /// Directions for arrow key navigation.
@@ -1086,10 +1137,7 @@ fn received_character(_app: &App, model: &mut Model, ch: char) {
         return;
     }
     if let Some(search) = model.search.as_mut() {
-        if search.active {
-            if ch == '/' && search.input.is_empty() {
-                return;
-            }
+        if search.focused {
             search.input.push(ch);
             search.pending_request = None;
             search.error = None;
@@ -1786,7 +1834,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
     }
 
     if let Some(search) = &model.search {
-        let prompt = if search.active {
+        let prompt = if search.focused {
             format!("/{}_", search.input)
         } else {
             format!("/{}", search.input)
@@ -1805,15 +1853,21 @@ fn view(app: &App, model: &Model, frame: Frame) {
         }
         let pending = model.clip_missing.len() + model.clip_inflight.len();
         if pending > 0 {
-            status_parts.push(format!("pending embeddings: {}", pending));
+            status_parts.push(format!(
+                "pending embeddings: {} ({})",
+                pending,
+                model.clip_engine.device_kind()
+            ));
         }
         let status = status_parts.join(" | ");
         let bar_h = 28.0;
         let bar_y = rect.top() - bar_h / 2.0 - 10.0;
-        draw.rect()
-            .x_y(0.0, bar_y)
-            .w_h(rect.w(), bar_h)
-            .color(srgba(0.0, 0.0, 0.0, 0.6));
+        let bg = if search.focused {
+            srgba(0.2549, 0.2039, 0.3490, 0.9)
+        } else {
+            srgba(0.0471, 0.0471, 0.0471, 0.9)
+        };
+        draw.rect().x_y(0.0, bar_y).w_h(rect.w(), bar_h).color(bg);
         draw.text(&prompt)
             .font_size(16)
             .color(WHITE)

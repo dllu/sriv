@@ -2,6 +2,8 @@ use std::convert::TryInto;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -54,6 +56,7 @@ pub struct ClipEngine {
     cache_base: PathBuf,
     job_tx: Sender<ClipJob>,
     result_rx: Receiver<ClipEvent>,
+    using_cuda: Arc<AtomicBool>,
 }
 
 impl ClipEngine {
@@ -61,8 +64,9 @@ impl ClipEngine {
         let (job_tx, job_rx) = unbounded::<ClipJob>();
         let (result_tx, result_rx) = unbounded::<ClipEvent>();
         let config = clip::ClipConfig::vit_base_patch32();
-        let use_cuda = cuda_is_available();
-        let worker_count = if use_cuda {
+        let want_cuda = cuda_is_available();
+        let using_cuda = Arc::new(AtomicBool::new(false));
+        let worker_count = if want_cuda {
             1
         } else {
             num_cpus::get().clamp(1, 8)
@@ -72,21 +76,30 @@ impl ClipEngine {
             let worker_rx = job_rx.clone();
             let worker_tx = result_tx.clone();
             let worker_config = config.clone();
+            let device_flag = using_cuda.clone();
             thread::Builder::new()
                 .name(format!("clip-worker-{worker_idx}"))
                 .spawn(move || {
-                    if let Err(err) =
-                        run_worker(worker_cache, worker_config, worker_rx, worker_tx, use_cuda)
-                    {
+                    if let Err(err) = run_worker(
+                        worker_cache,
+                        worker_config,
+                        worker_rx,
+                        worker_tx,
+                        want_cuda,
+                        device_flag,
+                    ) {
                         eprintln!("clip worker terminated: {err:#}");
                     }
                 })
                 .context("failed to spawn clip worker thread")?;
         }
+        drop(job_rx);
+        drop(result_tx);
         Ok(Self {
             cache_base,
             job_tx,
             result_rx,
+            using_cuda,
         })
     }
 
@@ -117,6 +130,14 @@ impl ClipEngine {
     pub fn try_recv(&self) -> Result<ClipEvent, TryRecvError> {
         self.result_rx.try_recv()
     }
+
+    pub fn device_kind(&self) -> &'static str {
+        if self.using_cuda.load(Ordering::Relaxed) {
+            "GPU"
+        } else {
+            "CPU"
+        }
+    }
 }
 
 fn run_worker(
@@ -125,16 +146,22 @@ fn run_worker(
     job_rx: Receiver<ClipJob>,
     result_tx: Sender<ClipEvent>,
     use_cuda: bool,
+    device_flag: Arc<AtomicBool>,
 ) -> Result<()> {
     let device = if use_cuda {
         match Device::new_cuda(0) {
-            Ok(device) => device,
+            Ok(device) => {
+                device_flag.store(true, Ordering::Relaxed);
+                device
+            }
             Err(err) => {
                 eprintln!("Failed to initialize CUDA device: {err}. Falling back to CPU.");
+                device_flag.store(false, Ordering::Relaxed);
                 Device::Cpu
             }
         }
     } else {
+        device_flag.store(false, Ordering::Relaxed);
         Device::Cpu
     };
     let api = hf_hub::api::sync::Api::new()?;
