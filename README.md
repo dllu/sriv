@@ -10,6 +10,7 @@ similar to [nsxiv](https://github.com/nsxiv/nsxiv) but:
 * parallel thumbnail generation
 * supports images more than 32768 or 65536 px wide or whatever arcane limit that imlib2 has
 * works in wayland natively thanks to nannou using wgpu/winit
+* optional CLIP-powered semantic search across your library
 
 built on [nannou](https://nannou.cc/).
 
@@ -33,7 +34,7 @@ Alternatively, install directly with Cargo:
 sudo cargo install --path . --force --root /usr/local
 ```
 
-## Usage
+## usage
 
 To clear and regenerate the thumbnail cache for all specified images, use the `--clear-cache` flag before the file or directory arguments:
 
@@ -41,7 +42,21 @@ To clear and regenerate the thumbnail cache for all specified images, use the `-
 sriv-rs --clear-cache <image files or directories>
 ```
 
-# configuration
+### clip semantic search
+
+sriv can index your images with [OpenAI CLIP (ViT-B/32)](https://github.com/openai/CLIP) via the
+[Hugging Face Candle](https://github.com/huggingface/candle) runtime. The first launch may download the
+model weights and tokenizer from the Hugging Face Hub, after which embeddings are cached alongside your
+thumbnails in `${XDG_CACHE_HOME}/sriv/`.
+
+- Press `/` to focus the search bar and type a natural-language prompt. The bar glows purple when focused.
+- Hit `Enter` to run the search; results are ranked by cosine similarity and highlighted at the top.
+- While unfocused in thumbnail mode, `n`/`Shift+n` (or `p`/`Shift+p`) step through the match list, keeping
+  search results intact.
+- Press `/` again to refocus and refine the query, or `Esc`/`Backspace` on an empty field to clear the search.
+
+Embedding generation automatically uses CUDA when available; otherwise sriv fans out across your CPU cores.
+The status area shows how many embeddings are still pending and whether the GPU or CPU is in use.
 
 # configuration
 
