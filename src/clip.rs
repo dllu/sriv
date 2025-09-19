@@ -534,7 +534,7 @@ fn process_text_job(
     let mut tokens = vec![ids];
     for token_vec in tokens.iter_mut() {
         if token_vec.len() < max_len {
-            token_vec.extend(std::iter::repeat(pad_id).take(max_len - token_vec.len()));
+            token_vec.extend(std::iter::repeat_n(pad_id, max_len - token_vec.len()));
         }
     }
     let input_ids = Tensor::new(tokens, device)?;

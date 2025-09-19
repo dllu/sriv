@@ -224,7 +224,7 @@ fn mouse_wheel(app: &App, model: &mut Model, delta: MouseScrollDelta, _phase: To
             let cols = ((rect.w() + model.gap) / cell).floor() as usize;
             let cols = cols.max(1);
             let total = model.image_paths.len();
-            let rows = ((total + cols - 1) / cols) as f32;
+            let rows = total.div_ceil(cols) as f32;
             // Maximum scroll to show last row at bottom
             let max_scroll = (rows * cell - rect.h()).max(0.0);
             model.scroll_offset = model.scroll_offset.clamp(0.0, max_scroll);
@@ -360,7 +360,7 @@ pub(crate) fn adjust_orientation(img: DynamicImage, path: &Path) -> DynamicImage
         for entry in exif.entries {
             if entry.tag.to_string() == "Orientation" {
                 if let rexif::TagValue::U16(vals) = entry.value {
-                    if let Some(&code) = vals.get(0) {
+                    if let Some(&code) = vals.first() {
                         oriented = match code {
                             2 => oriented.fliph(),
                             3 => oriented.rotate180(),
@@ -1306,16 +1306,13 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             _ => {}
         }
     } else if app.keys.mods == ModifiersState::SHIFT {
-        match key {
-            Key::G => {
-                if let Mode::Thumbnails = model.mode {
-                    let len = model.image_paths.len();
-                    if len > 0 {
-                        model.current = len - 1;
-                    }
+        if key == Key::G {
+            if let Mode::Thumbnails = model.mode {
+                let len = model.image_paths.len();
+                if len > 0 {
+                    model.current = len - 1;
                 }
             }
-            _ => {}
         }
     }
     // Custom key bindings execution
@@ -1493,15 +1490,14 @@ fn update(app: &App, model: &mut Model, _update: Update) {
         let cols = ((rect.w() + model.gap) / cell).floor() as usize;
         let cols = cols.max(1);
         let total = model.image_paths.len();
-        let rows = ((total + cols - 1) / cols) as f32;
+        let rows = total.div_ceil(cols) as f32;
         let max_scroll = (rows * cell - rect.h()).max(0.0);
         model.scroll_offset = model.scroll_offset.clamp(0.0, max_scroll);
     }
-    if matches!(model.mode, Mode::Single) {
-        if !model.full_textures.contains_key(&model.current) {
+    if matches!(model.mode, Mode::Single)
+        && !model.full_textures.contains_key(&model.current) {
             request_full_texture(model, model.current);
         }
-    }
     update_thumbnail_requests(app, model);
 }
 /// Ensure the full-resolution texture for `idx` is loaded and update LRU cache.
@@ -1592,7 +1588,7 @@ fn visible_thumbnail_indices(model: &Model, rect: Rect) -> Vec<usize> {
         cols = 1;
     }
     let cols = cols as usize;
-    let rows = (total + cols - 1) / cols;
+    let rows = total.div_ceil(cols);
     if rows == 0 {
         return Vec::new();
     }
