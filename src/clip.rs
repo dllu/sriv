@@ -1,10 +1,13 @@
+use std::collections::HashMap;
 use std::convert::TryInto;
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use candle::{utils::cuda_is_available, DType, Device, Tensor};
@@ -40,6 +43,105 @@ pub enum ClipEvent {
     },
 }
 
+#[derive(Clone, Default)]
+pub struct ThumbnailCache {
+    inner: Arc<ThumbnailCacheInner>,
+}
+
+impl fmt::Debug for ThumbnailCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ThumbnailCache").finish()
+    }
+}
+
+#[derive(Default)]
+struct ThumbnailCacheInner {
+    slots: Mutex<HashMap<usize, Arc<ThumbSlot>>>,
+}
+
+struct ThumbSlot {
+    state: Mutex<ThumbState>,
+    condvar: Condvar,
+}
+
+#[derive(Default)]
+struct ThumbState {
+    image: Option<RgbImage>,
+    requested: bool,
+}
+
+impl ThumbnailCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn slot(&self, index: usize) -> Arc<ThumbSlot> {
+        let mut slots = self.inner.slots.lock().unwrap();
+        slots
+            .entry(index)
+            .or_insert_with(|| Arc::new(ThumbSlot::new()))
+            .clone()
+    }
+
+    pub fn store_rgb_image(&self, index: usize, image: RgbImage) {
+        let slot = self.slot(index);
+        let mut state = slot.state.lock().unwrap();
+        state.image = Some(image);
+        state.requested = false;
+        slot.condvar.notify_all();
+    }
+
+    pub fn store_dynamic(&self, index: usize, image: &DynamicImage) {
+        self.store_rgb_image(index, image.to_rgb8());
+    }
+
+    pub fn wait_for(&self, index: usize, thumb_req_tx: &Sender<usize>) -> Result<RgbImage> {
+        let slot = self.slot(index);
+        let mut state = slot.state.lock().unwrap();
+        if state.image.is_none() && !state.requested {
+            thumb_req_tx
+                .send(index)
+                .map_err(|err| anyhow!("failed to request thumbnail {index}: {err}"))?;
+            state.requested = true;
+        }
+        let mut waited = Duration::from_millis(0);
+        while state.image.is_none() {
+            let (next_state, timeout) = slot
+                .condvar
+                .wait_timeout(state, Duration::from_millis(50))
+                .unwrap();
+            state = next_state;
+            if state.image.is_some() {
+                break;
+            }
+            if timeout.timed_out() {
+                waited += Duration::from_millis(50);
+                if waited >= Duration::from_secs(2) {
+                    return Err(anyhow!("timed out waiting for thumbnail index {index}"));
+                }
+                if !state.requested {
+                    thumb_req_tx
+                        .send(index)
+                        .map_err(|err| anyhow!("failed to request thumbnail {index}: {err}"))?;
+                    state.requested = true;
+                }
+            }
+        }
+        let image = state.image.take().unwrap();
+        state.requested = false;
+        Ok(image)
+    }
+}
+
+impl ThumbSlot {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ThumbState::default()),
+            condvar: Condvar::new(),
+        }
+    }
+}
+
 enum ClipJob {
     Image {
         index: usize,
@@ -62,7 +164,11 @@ pub struct ClipEngine {
 }
 
 impl ClipEngine {
-    pub fn new(cache_base: PathBuf) -> Result<Self> {
+    pub fn new(
+        cache_base: PathBuf,
+        thumb_cache: ThumbnailCache,
+        thumb_req_tx: Sender<usize>,
+    ) -> Result<Self> {
         let (job_tx, job_rx) = unbounded::<ClipJob>();
         let (result_tx, result_rx) = unbounded::<ClipEvent>();
         let config = clip::ClipConfig::vit_base_patch32();
@@ -79,6 +185,8 @@ impl ClipEngine {
             let worker_tx = result_tx.clone();
             let worker_config = config.clone();
             let device_flag = using_cuda.clone();
+            let worker_thumb_cache = thumb_cache.clone();
+            let worker_thumb_req_tx = thumb_req_tx.clone();
             thread::Builder::new()
                 .name(format!("clip-worker-{worker_idx}"))
                 .spawn(move || {
@@ -89,6 +197,8 @@ impl ClipEngine {
                         worker_tx,
                         want_cuda,
                         device_flag,
+                        worker_thumb_cache,
+                        worker_thumb_req_tx,
                     ) {
                         eprintln!("clip worker terminated: {err:#}");
                     }
@@ -149,6 +259,8 @@ fn run_worker(
     result_tx: Sender<ClipEvent>,
     use_cuda: bool,
     device_flag: Arc<AtomicBool>,
+    thumb_cache: ThumbnailCache,
+    thumb_req_tx: Sender<usize>,
 ) -> Result<()> {
     let device = if use_cuda {
         match Device::new_cuda(0) {
@@ -218,6 +330,8 @@ fn run_worker(
                 process_image_batch(
                     batch,
                     &cache_base,
+                    &thumb_cache,
+                    &thumb_req_tx,
                     &model,
                     &device,
                     config.image_size,
@@ -235,6 +349,8 @@ fn run_worker(
                         } => process_image_batch(
                             vec![(index, image_path, thumb_size)],
                             &cache_base,
+                            &thumb_cache,
+                            &thumb_req_tx,
                             &model,
                             &device,
                             config.image_size,
@@ -284,6 +400,8 @@ fn handle_text_job(
 fn process_image_batch(
     batch: Vec<(usize, PathBuf, u32)>,
     cache_base: &Path,
+    thumb_cache: &ThumbnailCache,
+    thumb_req_tx: &Sender<usize>,
     model: &ClipModel,
     device: &Device,
     clip_image_size: usize,
@@ -298,21 +416,30 @@ fn process_image_batch(
             Ok(Some(embedding)) => {
                 let _ = result_tx.send(ClipEvent::ImageReady { index, embedding });
             }
-            Ok(None) => match generate_thumbnail(&image_path, thumb_size)
-                .and_then(|thumb| tensor_from_thumbnail(thumb, clip_image_size))
-            {
-                Ok(tensor) => {
-                    compute_indices.push(index);
-                    compute_paths.push(image_path);
-                    compute_tensors.push(tensor);
+            Ok(None) => {
+                let thumb = match thumb_cache.wait_for(index, thumb_req_tx) {
+                    Ok(img) => Ok(img),
+                    Err(wait_err) => generate_thumbnail(&image_path, thumb_size).map_err(|gen_err| {
+                        anyhow!(
+                            "failed to obtain thumbnail for {} (wait error: {wait_err}; fallback error: {gen_err})",
+                            image_path.display()
+                        )
+                    }),
+                };
+                match thumb.and_then(|thumb| tensor_from_thumbnail(thumb, clip_image_size)) {
+                    Ok(tensor) => {
+                        compute_indices.push(index);
+                        compute_paths.push(image_path);
+                        compute_tensors.push(tensor);
+                    }
+                    Err(err) => {
+                        let _ = result_tx.send(ClipEvent::ImageError {
+                            index,
+                            error: format!("{}", err),
+                        });
+                    }
                 }
-                Err(err) => {
-                    let _ = result_tx.send(ClipEvent::ImageError {
-                        index,
-                        error: format!("{}", err),
-                    });
-                }
-            },
+            }
             Err(err) => {
                 let _ = result_tx.send(ClipEvent::ImageError {
                     index,

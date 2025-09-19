@@ -19,7 +19,7 @@ use toml::Value as TomlValue;
 
 mod clip;
 
-use clip::{ClipEngine, ClipEvent};
+use clip::{ClipEngine, ClipEvent, ThumbnailCache};
 /// Maximum number of full-resolution images to cache in memory.
 const FULL_CACHE_CAPACITY: usize = 4;
 /// How long to wait before retrying a full-resolution load request.
@@ -297,6 +297,7 @@ struct SearchState {
 struct Model {
     image_paths: Vec<PathBuf>,
     thumb_textures: HashMap<usize, wgpu::Texture>,
+    thumb_cache: ThumbnailCache,
     thumb_has_xmp: Vec<bool>,
     thumb_rx: Receiver<(usize, DynamicImage)>,
     thumb_req_tx: CbSender<usize>,
@@ -520,54 +521,7 @@ fn model(app: &App) -> Model {
             }
         }
     }
-    let clip_engine = ClipEngine::new(cache_base.clone()).unwrap_or_else(|err| {
-        eprintln!("Failed to initialize CLIP: {err}");
-        std::process::exit(1);
-    });
-    let mut clip_embeddings = Vec::with_capacity(image_paths.len());
-    let mut clip_missing: HashSet<usize> = HashSet::new();
-    let mut clip_inflight: HashSet<usize> = HashSet::new();
-    for (idx, path) in image_paths.iter().enumerate() {
-        match clip_engine.load_cached_embedding(path) {
-            Ok(Some(vec)) => clip_embeddings.push(Some(vec)),
-            Ok(None) => {
-                clip_embeddings.push(None);
-                clip_missing.insert(idx);
-            }
-            Err(err) => {
-                eprintln!(
-                    "Failed to load cached CLIP embedding for {}: {}",
-                    path.display(),
-                    err
-                );
-                clip_embeddings.push(None);
-                clip_missing.insert(idx);
-            }
-        }
-    }
-    for &idx in clip_missing.iter() {
-        if let Err(err) = clip_engine.ensure_embedding(idx, &image_paths[idx], thumb_size) {
-            eprintln!(
-                "Failed to queue CLIP embedding for {}: {}",
-                image_paths[idx].display(),
-                err
-            );
-        } else {
-            clip_inflight.insert(idx);
-        }
-    }
-    // Create the window first, so textures can reference a focused window.
-    let _window = app
-        .new_window()
-        .size(800, 600)
-        .title("sriv")
-        .view(view)
-        .key_pressed(key_pressed)
-        .received_character(received_character)
-        .mouse_wheel(mouse_wheel)
-        .mouse_pressed(mouse_pressed)
-        .build()
-        .unwrap();
+    let thumbnail_cache = ThumbnailCache::new();
     // Channel for receiving thumbnails from background threads.
     let (tx, rx) = channel::<(usize, DynamicImage)>();
     // Channel for requesting thumbnail loads on demand.
@@ -617,21 +571,72 @@ fn model(app: &App) -> Model {
                             }
                         }
                     }
-                    if let Some(img) = result {
-                        let _ = tx.send((i, img));
-                    } else {
-                        let placeholder = DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+                    let image = result.unwrap_or_else(|| {
+                        DynamicImage::ImageRgba8(RgbaImage::from_pixel(
                             2,
                             2,
                             image::Rgba([128, 128, 128, 255]),
-                        ));
-                        let _ = tx.send((i, placeholder));
-                    }
+                        ))
+                    });
+                    let _ = tx.send((i, image));
                 }
             }
         });
     }
     drop(thumb_req_rx);
+    let clip_engine = ClipEngine::new(
+        cache_base.clone(),
+        thumbnail_cache.clone(),
+        thumb_req_tx.clone(),
+    )
+    .unwrap_or_else(|err| {
+        eprintln!("Failed to initialize CLIP: {err}");
+        std::process::exit(1);
+    });
+    let mut clip_embeddings = Vec::with_capacity(image_paths.len());
+    let mut clip_missing: HashSet<usize> = HashSet::new();
+    let mut clip_inflight: HashSet<usize> = HashSet::new();
+    for (idx, path) in image_paths.iter().enumerate() {
+        match clip_engine.load_cached_embedding(path) {
+            Ok(Some(vec)) => clip_embeddings.push(Some(vec)),
+            Ok(None) => {
+                clip_embeddings.push(None);
+                clip_missing.insert(idx);
+            }
+            Err(err) => {
+                eprintln!(
+                    "Failed to load cached CLIP embedding for {}: {}",
+                    path.display(),
+                    err
+                );
+                clip_embeddings.push(None);
+                clip_missing.insert(idx);
+            }
+        }
+    }
+    for &idx in clip_missing.iter() {
+        if let Err(err) = clip_engine.ensure_embedding(idx, &image_paths[idx], thumb_size) {
+            eprintln!(
+                "Failed to queue CLIP embedding for {}: {}",
+                image_paths[idx].display(),
+                err
+            );
+        } else {
+            clip_inflight.insert(idx);
+        }
+    }
+    // Create the window first, so textures can reference a focused window.
+    let _window = app
+        .new_window()
+        .size(800, 600)
+        .title("sriv")
+        .view(view)
+        .key_pressed(key_pressed)
+        .received_character(received_character)
+        .mouse_wheel(mouse_wheel)
+        .mouse_pressed(mouse_pressed)
+        .build()
+        .unwrap();
     // Initialize channels and state for full-resolution LRU cache.
     // Channel for requesting full-resolution images (by index)
     let (full_req_tx, full_req_rx) = unbounded::<usize>();
@@ -695,6 +700,7 @@ fn model(app: &App) -> Model {
     let mut model = Model {
         image_paths,
         thumb_textures: HashMap::new(),
+        thumb_cache: thumbnail_cache,
         thumb_has_xmp,
         thumb_rx: rx,
         thumb_req_tx: thumb_req_tx.clone(),
@@ -1419,6 +1425,7 @@ fn update(app: &App, model: &mut Model, _update: Update) {
     // Process incoming thumbnails
     while let Ok((i, img)) = model.thumb_rx.try_recv() {
         model.thumb_pending.remove(&i);
+        model.thumb_cache.store_dynamic(i, &img);
         let tex = wgpu::Texture::from_image(app, &img);
         insert_thumbnail_texture(model, i, tex);
     }
