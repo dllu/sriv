@@ -17,6 +17,8 @@ use tokenizers::Tokenizer;
 
 use crate::adjust_orientation;
 
+const MAX_IMAGE_BATCH: usize = 16;
+
 /// Events emitted by the background CLIP worker.
 #[derive(Debug)]
 pub enum ClipEvent {
@@ -181,22 +183,188 @@ fn run_worker(
         VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&model_file), DType::F32, &device)?
     };
     let model = ClipModel::new(vb, &config)?;
-    for job in job_rx.iter() {
+    let mut channel_closed = false;
+    loop {
+        let job = match job_rx.recv() {
+            Ok(job) => job,
+            Err(_) => break,
+        };
         match job {
             ClipJob::Image {
                 index,
                 image_path,
                 thumb_size,
             } => {
-                match process_image_job(
-                    &image_path,
-                    thumb_size,
+                let mut batch = vec![(index, image_path, thumb_size)];
+                let mut deferred_job: Option<ClipJob> = None;
+                while batch.len() < MAX_IMAGE_BATCH {
+                    match job_rx.try_recv() {
+                        Ok(ClipJob::Image {
+                            index,
+                            image_path,
+                            thumb_size,
+                        }) => batch.push((index, image_path, thumb_size)),
+                        Ok(other) => {
+                            deferred_job = Some(other);
+                            break;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            channel_closed = true;
+                            break;
+                        }
+                    }
+                }
+                process_image_batch(
+                    batch,
                     &cache_base,
                     &model,
                     &device,
                     config.image_size,
-                ) {
-                    Ok(embedding) => {
+                    &result_tx,
+                );
+                if let Some(job) = deferred_job {
+                    match job {
+                        ClipJob::Text { request_id, query } => handle_text_job(
+                            request_id, &query, &model, &tokenizer, pad_id, &device, &result_tx,
+                        ),
+                        ClipJob::Image {
+                            index,
+                            image_path,
+                            thumb_size,
+                        } => process_image_batch(
+                            vec![(index, image_path, thumb_size)],
+                            &cache_base,
+                            &model,
+                            &device,
+                            config.image_size,
+                            &result_tx,
+                        ),
+                    }
+                }
+                if channel_closed {
+                    break;
+                }
+            }
+            ClipJob::Text { request_id, query } => {
+                handle_text_job(
+                    request_id, &query, &model, &tokenizer, pad_id, &device, &result_tx,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn handle_text_job(
+    request_id: u64,
+    query: &str,
+    model: &ClipModel,
+    tokenizer: &Tokenizer,
+    pad_id: u32,
+    device: &Device,
+    result_tx: &Sender<ClipEvent>,
+) {
+    match process_text_job(query, model, tokenizer, pad_id, device) {
+        Ok(embedding) => {
+            let _ = result_tx.send(ClipEvent::TextReady {
+                request_id,
+                embedding,
+            });
+        }
+        Err(err) => {
+            let _ = result_tx.send(ClipEvent::TextError {
+                request_id,
+                error: format!("{}", err),
+            });
+        }
+    }
+}
+
+fn process_image_batch(
+    batch: Vec<(usize, PathBuf, u32)>,
+    cache_base: &Path,
+    model: &ClipModel,
+    device: &Device,
+    clip_image_size: usize,
+    result_tx: &Sender<ClipEvent>,
+) {
+    let mut compute_indices = Vec::new();
+    let mut compute_paths = Vec::new();
+    let mut compute_tensors = Vec::new();
+
+    for (index, image_path, thumb_size) in batch {
+        match load_cached_embedding(cache_base, &image_path) {
+            Ok(Some(embedding)) => {
+                let _ = result_tx.send(ClipEvent::ImageReady { index, embedding });
+            }
+            Ok(None) => match generate_thumbnail(&image_path, thumb_size)
+                .and_then(|thumb| tensor_from_thumbnail(thumb, clip_image_size))
+            {
+                Ok(tensor) => {
+                    compute_indices.push(index);
+                    compute_paths.push(image_path);
+                    compute_tensors.push(tensor);
+                }
+                Err(err) => {
+                    let _ = result_tx.send(ClipEvent::ImageError {
+                        index,
+                        error: format!("{}", err),
+                    });
+                }
+            },
+            Err(err) => {
+                let _ = result_tx.send(ClipEvent::ImageError {
+                    index,
+                    error: format!("{}", err),
+                });
+            }
+        }
+    }
+
+    if compute_tensors.is_empty() {
+        return;
+    }
+
+    let tensor_refs: Vec<&Tensor> = compute_tensors.iter().collect();
+    let stacked = match Tensor::stack(&tensor_refs, 0) {
+        Ok(t) => t,
+        Err(err) => {
+            let msg = format!("{}", err);
+            for (idx, _) in compute_indices.into_iter().zip(compute_paths.into_iter()) {
+                let _ = result_tx.send(ClipEvent::ImageError {
+                    index: idx,
+                    error: msg.clone(),
+                });
+            }
+            return;
+        }
+    };
+
+    let stacked = match stacked.to_device(device) {
+        Ok(t) => t,
+        Err(err) => {
+            let msg = format!("{}", err);
+            for (idx, _) in compute_indices.into_iter().zip(compute_paths.into_iter()) {
+                let _ = result_tx.send(ClipEvent::ImageError {
+                    index: idx,
+                    error: msg.clone(),
+                });
+            }
+            return;
+        }
+    };
+
+    match image_embeddings(model, stacked) {
+        Ok(embeddings) => {
+            for ((index, path), embedding) in compute_indices
+                .into_iter()
+                .zip(compute_paths.into_iter())
+                .zip(embeddings.into_iter())
+            {
+                let embed_path = cache_file_path(cache_base, &path, "clip");
+                match write_embedding(&embed_path, &embedding) {
+                    Ok(()) => {
                         let _ = result_tx.send(ClipEvent::ImageReady { index, embedding });
                     }
                     Err(err) => {
@@ -207,44 +375,17 @@ fn run_worker(
                     }
                 }
             }
-            ClipJob::Text { request_id, query } => {
-                match process_text_job(&query, &model, &tokenizer, pad_id, &device) {
-                    Ok(embedding) => {
-                        let _ = result_tx.send(ClipEvent::TextReady {
-                            request_id,
-                            embedding,
-                        });
-                    }
-                    Err(err) => {
-                        let _ = result_tx.send(ClipEvent::TextError {
-                            request_id,
-                            error: format!("{}", err),
-                        });
-                    }
-                }
+        }
+        Err(err) => {
+            let msg = format!("{}", err);
+            for index in compute_indices {
+                let _ = result_tx.send(ClipEvent::ImageError {
+                    index,
+                    error: msg.clone(),
+                });
             }
         }
     }
-    Ok(())
-}
-
-fn process_image_job(
-    image_path: &Path,
-    thumb_size: u32,
-    cache_base: &Path,
-    model: &ClipModel,
-    device: &Device,
-    clip_image_size: usize,
-) -> Result<Vec<f32>> {
-    if let Some(embedding) = load_cached_embedding(cache_base, image_path)? {
-        return Ok(embedding);
-    }
-    let thumb = generate_thumbnail(image_path, thumb_size)?;
-    let tensor = tensor_from_thumbnail(thumb, clip_image_size, device)?;
-    let embedding = image_embedding(model, tensor)?;
-    let embed_path = cache_file_path(cache_base, image_path, "clip");
-    write_embedding(&embed_path, &embedding)?;
-    Ok(embedding)
 }
 
 fn process_text_job(
@@ -277,11 +418,7 @@ fn process_text_job(
     Ok(embedding)
 }
 
-fn tensor_from_thumbnail(
-    thumb: RgbImage,
-    clip_image_size: usize,
-    device: &Device,
-) -> Result<Tensor> {
+fn tensor_from_thumbnail(thumb: RgbImage, clip_image_size: usize) -> Result<Tensor> {
     let mut dyn_thumb = DynamicImage::ImageRgb8(thumb);
     if dyn_thumb.width() != clip_image_size as u32 || dyn_thumb.height() != clip_image_size as u32 {
         dyn_thumb = dyn_thumb.resize_to_fill(
@@ -297,14 +434,13 @@ fn tensor_from_thumbnail(
         .permute((2, 0, 1))?
         .to_dtype(DType::F32)?
         .affine(2.0 / 255.0, -1.0)?;
-    Ok(tensor.unsqueeze(0)?.to_device(device)?)
+    Ok(tensor)
 }
 
-fn image_embedding(model: &ClipModel, tensor: Tensor) -> Result<Vec<f32>> {
+fn image_embeddings(model: &ClipModel, tensor: Tensor) -> Result<Vec<Vec<f32>>> {
     let features = model.get_image_features(&tensor)?;
     let features = clip::div_l2_norm(&features)?;
-    let features = features.squeeze(0)?;
-    Ok(features.to_vec1::<f32>()?)
+    Ok(features.to_vec2::<f32>()?)
 }
 
 fn generate_thumbnail(image_path: &Path, thumb_size: u32) -> Result<RgbImage> {

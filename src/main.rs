@@ -1672,15 +1672,15 @@ fn view(app: &App, model: &Model, frame: Frame) {
                         let h = th as f32;
                         draw.texture(tex).x_y(x, y).w_h(w, h);
                         if model.thumb_has_xmp.get(i).copied().unwrap_or(false) {
-                            let icon_w = 38.0;
-                            let icon_h = 18.0;
+                            let icon_w = 40.0;
+                            let icon_h = 20.0;
                             let margin = 6.0;
                             let icon_center_x = x + w / 2.0 - icon_w / 2.0 - margin;
                             let icon_center_y = y + h / 2.0 - icon_h / 2.0 - margin;
                             draw.rect()
                                 .x_y(icon_center_x, icon_center_y)
                                 .w_h(icon_w, icon_h)
-                                .color(srgba(0.0, 0.0, 0.0, 0.65));
+                                .color(srgba(1.0, 0.0, 0.0, 0.85));
                             draw.text("XMP")
                                 .font_size(12)
                                 .w_h(icon_w, icon_h)

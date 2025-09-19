@@ -58,6 +58,18 @@ thumbnails in `${XDG_CACHE_HOME}/sriv/`.
 Embedding generation automatically uses CUDA when available; otherwise sriv fans out across your CPU cores.
 The status area shows how many embeddings are still pending and whether the GPU or CPU is in use.
 
+#### Building with CUDA
+
+CUDA support in Candle is gated behind Cargo features.  Enable the `cuda` feature when building or
+running sriv to let the CLIP worker run on your NVIDIA GPU:
+
+```bash
+cargo run --release --features cuda -- <image paths>
+```
+
+Make sure the CUDA toolkit/driver libraries are installed and visible at build time; otherwise the
+feature will fall back to the CPU at runtime.
+
 # configuration
 
 you can put custom keybindings in `~/.config/sriv/bindings.toml`. Just put whatever modifiers (`ctrl`, `shift`, `alt`) if you want and `+` and then the letter or number of the key.
