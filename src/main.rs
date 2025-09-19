@@ -14,12 +14,16 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use toml::Value as TomlValue;
 
 mod clip;
 
 use clip::{ClipEngine, ClipEvent, ThumbnailCache};
+
+type FullImageTile = (u32, u32, u32, u32, Vec<u8>);
+type FullImageResponse = (usize, u32, u32, Vec<FullImageTile>);
+
 /// Maximum number of full-resolution images to cache in memory.
 const FULL_CACHE_CAPACITY: usize = 4;
 /// How long to wait before retrying a full-resolution load request.
@@ -28,6 +32,8 @@ const FULL_PENDING_RETRY: Duration = Duration::from_secs(5);
 const THUMB_PREFETCH_ROWS: usize = 1;
 /// Additional thumbnail textures to keep available beyond the visible count.
 const THUMB_POOL_MARGIN: usize = 12;
+/// Number of files to poll for modifications each update tick.
+const FILE_WATCH_BATCH: usize = 32;
 
 /// List of recognized raw file extensions for detecting XMP sidecars.
 const RAW_EXTENSIONS: &[&str] = &[
@@ -304,9 +310,11 @@ struct Model {
     thumb_pending: HashSet<usize>,
     thumb_usage: VecDeque<usize>,
     thumb_capacity: usize,
+    file_mod_times: Vec<Option<SystemTime>>,
+    file_watch_cursor: usize,
     // Channels for full-resolution image loading
     full_req_tx: CbSender<usize>,
-    full_resp_rx: CbReceiver<(usize, u32, u32, Vec<(u32, u32, u32, u32, Vec<u8>)>)>,
+    full_resp_rx: CbReceiver<FullImageResponse>,
     // Track indices currently requested but not yet loaded
     full_pending: HashMap<usize, Instant>,
     // LRU cache of full-resolution tiled textures
@@ -522,6 +530,10 @@ fn model(app: &App) -> Model {
         }
     }
     let thumbnail_cache = ThumbnailCache::new();
+    let mut file_mod_times = Vec::with_capacity(image_paths.len());
+    for path in &image_paths {
+        file_mod_times.push(current_mod_time(path));
+    }
     // Channel for receiving thumbnails from background threads.
     let (tx, rx) = channel::<(usize, DynamicImage)>();
     // Channel for requesting thumbnail loads on demand.
@@ -641,8 +653,7 @@ fn model(app: &App) -> Model {
     // Channel for requesting full-resolution images (by index)
     let (full_req_tx, full_req_rx) = unbounded::<usize>();
     // Channel for receiving loaded full-resolution image tile data
-    let (full_resp_tx, full_resp_rx) =
-        unbounded::<(usize, u32, u32, Vec<(u32, u32, u32, u32, Vec<u8>)>)>();
+    let (full_resp_tx, full_resp_rx) = unbounded::<FullImageResponse>();
     // Spawn a pool of loader threads for full images: load, crop, and convert to raw tile data off the main thread
     {
         // Shared image paths for all workers
@@ -707,6 +718,8 @@ fn model(app: &App) -> Model {
         thumb_pending: HashSet::new(),
         thumb_usage: VecDeque::new(),
         thumb_capacity: 0,
+        file_mod_times,
+        file_watch_cursor: 0,
         full_req_tx,
         full_resp_rx,
         full_pending,
@@ -1305,13 +1318,11 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             }
             _ => {}
         }
-    } else if app.keys.mods == ModifiersState::SHIFT {
-        if key == Key::G {
-            if let Mode::Thumbnails = model.mode {
-                let len = model.image_paths.len();
-                if len > 0 {
-                    model.current = len - 1;
-                }
+    } else if app.keys.mods == ModifiersState::SHIFT && key == Key::G {
+        if let Mode::Thumbnails = model.mode {
+            let len = model.image_paths.len();
+            if len > 0 {
+                model.current = len - 1;
             }
         }
     }
@@ -1418,6 +1429,7 @@ fn update(app: &App, model: &mut Model, _update: Update) {
     while let Ok(msg) = model.command_rx.try_recv() {
         model.command_output = Some(msg);
     }
+    detect_file_changes(app, model);
     // Receive thumbnails from background thread and create textures
     // Process incoming thumbnails
     while let Ok((i, img)) = model.thumb_rx.try_recv() {
@@ -1494,10 +1506,9 @@ fn update(app: &App, model: &mut Model, _update: Update) {
         let max_scroll = (rows * cell - rect.h()).max(0.0);
         model.scroll_offset = model.scroll_offset.clamp(0.0, max_scroll);
     }
-    if matches!(model.mode, Mode::Single)
-        && !model.full_textures.contains_key(&model.current) {
-            request_full_texture(model, model.current);
-        }
+    if matches!(model.mode, Mode::Single) && !model.full_textures.contains_key(&model.current) {
+        request_full_texture(model, model.current);
+    }
     update_thumbnail_requests(app, model);
 }
 /// Ensure the full-resolution texture for `idx` is loaded and update LRU cache.
@@ -1575,6 +1586,100 @@ fn update_thumbnail_requests(app: &App, model: &mut Model) {
         }
     }
     enforce_thumbnail_capacity(model);
+}
+
+fn detect_file_changes(app: &App, model: &mut Model) {
+    let total = model.image_paths.len();
+    if total == 0 {
+        return;
+    }
+    let mut candidates: HashSet<usize> = HashSet::new();
+    candidates.insert(model.current);
+    if matches!(model.mode, Mode::Thumbnails) {
+        let rect = app.window_rect();
+        for idx in visible_thumbnail_indices(model, rect) {
+            candidates.insert(idx);
+        }
+    }
+    let batch = FILE_WATCH_BATCH.min(total);
+    for _ in 0..batch {
+        let idx = model.file_watch_cursor;
+        model.file_watch_cursor = (model.file_watch_cursor + 1) % total;
+        candidates.insert(idx);
+    }
+    for idx in candidates {
+        check_image_modification(model, idx);
+    }
+}
+
+fn check_image_modification(model: &mut Model, idx: usize) {
+    if idx >= model.image_paths.len() {
+        return;
+    }
+    let path = &model.image_paths[idx];
+    let old_mod = model.file_mod_times[idx];
+    let new_mod = current_mod_time(path);
+    let changed = match (old_mod, new_mod) {
+        (Some(old), Some(new)) => match new.duration_since(old) {
+            Ok(diff) => diff > Duration::ZERO,
+            Err(_) => true,
+        },
+        (None, None) => false,
+        _ => true,
+    };
+    model.file_mod_times[idx] = new_mod;
+    if changed {
+        handle_image_modified(model, idx);
+    }
+}
+
+fn handle_image_modified(model: &mut Model, idx: usize) {
+    model.thumb_cache.invalidate(idx);
+    model.thumb_textures.remove(&idx);
+    model.thumb_pending.remove(&idx);
+    if let Some(pos) = model.thumb_usage.iter().position(|&i| i == idx) {
+        model.thumb_usage.remove(pos);
+    }
+    if model.thumb_pending.insert(idx) {
+        if let Err(err) = model.thumb_req_tx.send(idx) {
+            model.thumb_pending.remove(&idx);
+            eprintln!("failed to queue thumbnail regeneration for index {idx}: {err}");
+        }
+    }
+
+    model.full_textures.remove(&idx);
+    if let Some(pos) = model.full_usage.iter().position(|&i| i == idx) {
+        model.full_usage.remove(pos);
+    }
+    model.full_pending.remove(&idx);
+    if matches!(model.mode, Mode::Single) && idx == model.current {
+        request_full_texture(model, idx);
+    }
+
+    if let Some(slot) = model.clip_embeddings.get_mut(idx) {
+        *slot = None;
+    }
+    model.clip_missing.insert(idx);
+    model.clip_inflight.remove(&idx);
+    if idx < model.image_paths.len() {
+        if let Err(err) =
+            model
+                .clip_engine
+                .ensure_embedding(idx, &model.image_paths[idx], model.thumb_size)
+        {
+            eprintln!(
+                "failed to requeue CLIP embedding after change for {}: {}",
+                model.image_paths[idx].display(),
+                err
+            );
+        } else {
+            model.clip_inflight.insert(idx);
+        }
+    }
+}
+
+fn current_mod_time(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).and_then(|meta| meta.modified()).ok()
 }
 
 fn visible_thumbnail_indices(model: &Model, rect: Rect) -> Vec<usize> {
