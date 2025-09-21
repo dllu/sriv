@@ -1,34 +1,39 @@
 # simple rust image viewer (sriv)
 
-![train](https://i.dllu.net/2025-04-18-23-55-48_b097e58701685a85.png)
+https://github.com/user-attachments/assets/734e3a02-e9ff-4f24-9c51-27585d53a806
 
-![trams](https://i.dllu.net/2025-04-18-23-53-34_91b104fa4cc7bc4a.png)
+![screenshot](https://i.dllu.net/20250921_13h39m33s_grim_e1a14e98eb3dddf3.png)
 
-similar to [nsxiv](https://github.com/nsxiv/nsxiv) but:
-
+* minimalistic UI with vim-like keybindings
 * gpu-accelerated image viewing
 * parallel thumbnail generation
 * supports images more than 32768 or 65536 px wide or whatever arcane limit that imlib2 has
+* CLIP-powered semantic search across your library
 * works in wayland natively thanks to nannou using wgpu/winit
-* optional CLIP-powered semantic search across your library
 
 built on [nannou](https://nannou.cc/).
+inspired by [nsxiv](https://github.com/nsxiv/nsxiv).
 
 still work in progress.
 
 mostly vibe coded with AI tbh.
 
-# installation
+# build and installation
 
-To build and install the program system-wide on Linux, use one of the following methods:
+to build and install the program system-wide on Linux, use one of the following methods:
 
 ```bash
-# Build a release and install the binary to /usr/local/bin
 cargo build --release
 sudo install -Dm755 target/release/sriv /usr/local/bin/sriv
 ```
 
-Alternatively, install directly with Cargo:
+if you have a CUDA-capable GPU, you can use
+
+```bash
+cargo build --release --features=cuda
+```
+
+alternatively, install directly with Cargo:
 
 ```bash
 sudo cargo install --path . --force --root /usr/local
@@ -36,7 +41,7 @@ sudo cargo install --path . --force --root /usr/local
 
 ## usage
 
-To clear and regenerate the thumbnail cache for all specified images, use the `--clear-cache` flag before the file or directory arguments:
+to clear and regenerate the thumbnail cache for all specified images, use the `--clear-cache` flag before the file or directory arguments:
 
 ```bash
 sriv-rs --clear-cache <image files or directories>
@@ -44,35 +49,22 @@ sriv-rs --clear-cache <image files or directories>
 
 ### clip semantic search
 
-sriv can index your images with [OpenAI CLIP (ViT-B/32)](https://github.com/openai/CLIP) via the
-[Hugging Face Candle](https://github.com/huggingface/candle) runtime. The first launch may download the
-model weights and tokenizer from the Hugging Face Hub, after which embeddings are cached alongside your
-thumbnails in `${XDG_CACHE_HOME}/sriv/`.
+sriv can index your images with [OpenAI CLIP (ViT-B/32)](https://github.com/openai/CLIP) via the [Hugging Face Candle](https://github.com/huggingface/candle) runtime.
+The first launch downloads model weights and tokenizer from the Hugging Face Hub, after which embeddings are cached alongside your thumbnails in `${XDG_CACHE_HOME}/sriv/`.
 
-- Press `/` to focus the search bar and type a natural-language prompt. The bar glows purple when focused.
-- Hit `Enter` to run the search; results are ranked by cosine similarity and highlighted at the top.
-- While unfocused in thumbnail mode, `n`/`Shift+n` (or `p`/`Shift+p`) step through the match list, keeping
+- press `/` to focus the search bar and type a natural-language prompt. The bar glows purple when focused.
+- hit `Enter` to run the search; results are ranked by cosine similarity and highlighted at the top.
+- while unfocused in thumbnail mode, `n`/`Shift+n` (or `p`/`Shift+p`) step through the match list, keeping
   search results intact.
-- Press `/` again to refocus and refine the query, or `Esc`/`Backspace` on an empty field to clear the search.
+- press `/` again to refocus and refine the query, or `Esc`/`Backspace` on an empty field to clear the search.
 
-Embedding generation automatically uses CUDA when available; otherwise sriv fans out across your CPU cores.
+If built with CUDA support, embedding generation automatically uses CUDA when available; otherwise sriv fans out across your CPU cores.
 The status area shows how many embeddings are still pending and whether the GPU or CPU is in use.
-
-#### Building with CUDA
-
-CUDA support in Candle is gated behind Cargo features.  Enable the `cuda` feature when building or
-running sriv to let the CLIP worker run on your NVIDIA GPU:
-
-```bash
-cargo run --release --features cuda -- <image paths>
-```
-
-Make sure the CUDA toolkit/driver libraries are installed and visible at build time; otherwise the
-feature will fall back to the CPU at runtime.
 
 # configuration
 
-you can put custom keybindings in `~/.config/sriv/bindings.toml`. Just put whatever modifiers (`ctrl`, `shift`, `alt`) if you want and `+` and then the letter or number of the key.
+you can put custom keybindings in `~/.config/sriv/bindings.toml` to execute custom commands.
+Just put whatever modifiers (`ctrl`, `shift`, `alt`) if you want and `+` and then the letter or number of the key.
 
 ```
  # Open the current image in the default viewer
@@ -83,12 +75,12 @@ you can put custom keybindings in `~/.config/sriv/bindings.toml`. Just put whate
 
 > why does it use so much cpu?
 
-it is designed to aggressively generate thumbnails with many threads.
+it is designed to aggressively generate thumbnails with many threads
 
 > why does it use so much ram?
 
-in addition to generating thumbnails in parallel, it also stores a local cache of full size images.
+in addition to generating thumbnails in parallel, it also stores a local cache of full size images
 
 > why does it use so much gpu?
 
-it puts the textures on the gpu for smoother viewing experience.
+it puts the textures on the gpu for a smoother viewing experience, and it may use a CUDA-capable GPU for CLIP embedding generation
