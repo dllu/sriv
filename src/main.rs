@@ -9,6 +9,7 @@ use nannou::wgpu;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::convert::TryFrom;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
@@ -361,31 +362,99 @@ fn thumbnail_cache_path(cache_base: &Path, image_path: &Path) -> PathBuf {
     clip::cache_file_path(cache_base, image_path, "png")
 }
 
+fn orientation_from_tag_value(value: &rexif::TagValue) -> Option<u16> {
+    let raw = match value {
+        rexif::TagValue::U16(vals) => vals.first().copied(),
+        rexif::TagValue::I16(vals) => vals.first().and_then(|v| u16::try_from(*v).ok()),
+        rexif::TagValue::U8(vals) => vals.first().map(|&v| v as u16),
+        rexif::TagValue::I8(vals) => vals.first().and_then(|v| u16::try_from(*v).ok()),
+        rexif::TagValue::U32(vals) => vals.first().and_then(|v| u16::try_from(*v).ok()),
+        rexif::TagValue::I32(vals) => vals.first().and_then(|v| u16::try_from(*v).ok()),
+        rexif::TagValue::URational(vals) => vals.first().and_then(|r| {
+            let num = r.numerator;
+            let den = r.denominator;
+            if den == 0 || num % den != 0 {
+                return None;
+            }
+            u16::try_from(num / den).ok()
+        }),
+        rexif::TagValue::IRational(vals) => vals.first().and_then(|r| {
+            let num = r.numerator;
+            let den = r.denominator;
+            if den == 0 || num % den != 0 {
+                return None;
+            }
+            u16::try_from(num / den).ok()
+        }),
+        _ => None,
+    }?;
+
+    (1..=8).contains(&raw).then_some(raw)
+}
+
+fn parse_exif_quiet(path: &Path) -> Option<rexif::ExifData> {
+    let data = fs::read(path).ok()?;
+    match rexif::parse_buffer_quiet(&data).0 {
+        Ok(exif) => Some(exif),
+        Err(_) => None,
+    }
+}
+
 /// Adjust image orientation based on EXIF orientation tag.
 pub(crate) fn adjust_orientation(img: DynamicImage, path: &Path) -> DynamicImage {
     let mut oriented = img;
-    if let Ok(exif) = rexif::parse_file(path) {
+    if let Some(exif) = parse_exif_quiet(path) {
         for entry in exif.entries {
-            if entry.tag.to_string() == "Orientation" {
-                if let rexif::TagValue::U16(vals) = entry.value {
-                    if let Some(&code) = vals.first() {
-                        oriented = match code {
-                            2 => oriented.fliph(),
-                            3 => oriented.rotate180(),
-                            4 => oriented.flipv(),
-                            5 => oriented.rotate90().fliph(),
-                            6 => oriented.rotate90(),
-                            7 => oriented.rotate270().fliph(),
-                            8 => oriented.rotate270(),
-                            _ => oriented,
-                        }
-                    }
+            if entry.tag == rexif::ExifTag::Orientation {
+                if let Some(code) = orientation_from_tag_value(&entry.value) {
+                    oriented = match code {
+                        2 => oriented.fliph(),
+                        3 => oriented.rotate180(),
+                        4 => oriented.flipv(),
+                        5 => oriented.rotate90().fliph(),
+                        6 => oriented.rotate90(),
+                        7 => oriented.rotate270().fliph(),
+                        8 => oriented.rotate270(),
+                        _ => oriented,
+                    };
                 }
                 break;
             }
         }
     }
     oriented
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orientation_from_urational_rounds_down() {
+        let value = rexif::TagValue::URational(vec![rexif::URational {
+            numerator: 6,
+            denominator: 2,
+        }]);
+        assert_eq!(orientation_from_tag_value(&value), Some(3));
+    }
+
+    #[test]
+    fn orientation_from_irational_with_negative_denominator() {
+        let value = rexif::TagValue::IRational(vec![rexif::IRational {
+            numerator: -12,
+            denominator: -2,
+        }]);
+        assert_eq!(orientation_from_tag_value(&value), Some(6));
+    }
+
+    #[test]
+    fn orientation_from_irational_non_integer() {
+        let value = rexif::TagValue::IRational(vec![rexif::IRational {
+            numerator: 3,
+            denominator: 2,
+        }]);
+        assert_eq!(orientation_from_tag_value(&value), None);
+    }
 }
 
 /// Scan a directory for raw files that have matching XMP sidecars.
