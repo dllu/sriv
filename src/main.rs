@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crossbeam_channel::{unbounded, Receiver as CbReceiver, Sender as CbSender};
+use crossbeam_channel::unbounded;
 use image::imageops::FilterType;
 use nannou::event::{ModifiersState, MouseButton, MouseScrollDelta, TouchPhase, Update};
 use nannou::image::imageops::crop_imm;
@@ -12,15 +12,18 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::channel;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
-use toml::Value as TomlValue;
 
 mod clip;
+mod grid;
+mod state;
 
 use clip::{ClipEngine, ClipEvent, ThumbnailCache};
+use grid::ThumbnailGrid;
+use state::{parse_bindings, FullPendingState, Mode, Model, SearchState, Tile, TiledTexture};
 
 type FullImageTile = (u32, u32, u32, u32, Vec<u8>);
 
@@ -43,7 +46,7 @@ const FULL_CACHE_CAPACITY: usize = 4;
 /// How long to wait before retrying a full-resolution load request.
 const FULL_PENDING_RETRY: Duration = Duration::from_secs(5);
 /// Number of extra rows of thumbnails to keep warm beyond the viewport.
-const THUMB_PREFETCH_ROWS: usize = 1;
+pub(crate) const THUMB_PREFETCH_ROWS: usize = 1;
 /// Additional thumbnail textures to keep available beyond the visible count.
 const THUMB_POOL_MARGIN: usize = 12;
 /// Number of files to poll for modifications each update tick.
@@ -55,122 +58,6 @@ const RAW_EXTENSIONS: &[&str] = &[
     "iiq", "k25", "kdc", "mdc", "mef", "mos", "mrw", "nef", "nrw", "orf", "pef", "ptx", "pxn",
     "raf", "raw", "rwl", "rw2", "rwz", "sr2", "srf", "srw", "x3f",
 ];
-
-/// The display mode of the viewer.
-#[derive(Debug)]
-enum Mode {
-    Thumbnails,
-    Single,
-}
-
-/// A user-defined key binding specification.
-#[derive(Debug)]
-struct KeyBinding {
-    key: Key,
-    ctrl: bool,
-    shift: bool,
-    alt: bool,
-    super_key: bool,
-    command: String,
-}
-
-/// Parse a single binding spec (e.g. "ctrl+u") and command into a KeyBinding.
-fn parse_binding_spec(spec: &str, command: &str) -> Option<KeyBinding> {
-    let mut ctrl = false;
-    let mut shift = false;
-    let mut alt = false;
-    let mut super_key = false;
-    let mut key_opt: Option<Key> = None;
-    for part in spec.split('+').map(|s| s.trim()) {
-        match part.to_lowercase().as_str() {
-            "ctrl" | "control" => ctrl = true,
-            "shift" => shift = true,
-            "alt" => alt = true,
-            "super" | "cmd" | "meta" => super_key = true,
-            tok => {
-                // Parse as main key
-                if key_opt.is_some() {
-                    return None;
-                }
-                let key = match tok.to_ascii_uppercase().as_str() {
-                    // Letters
-                    c if c.len() == 1 && c.chars().all(|ch| ch.is_ascii_alphabetic()) => {
-                        let ch = c.chars().next().unwrap();
-                        // Match variant by character
-                        match ch {
-                            'A' => Key::A,
-                            'B' => Key::B,
-                            'C' => Key::C,
-                            'D' => Key::D,
-                            'E' => Key::E,
-                            'F' => Key::F,
-                            'G' => Key::G,
-                            'H' => Key::H,
-                            'I' => Key::I,
-                            'J' => Key::J,
-                            'K' => Key::K,
-                            'L' => Key::L,
-                            'M' => Key::M,
-                            'N' => Key::N,
-                            'O' => Key::O,
-                            'P' => Key::P,
-                            'Q' => Key::Q,
-                            'R' => Key::R,
-                            'S' => Key::S,
-                            'T' => Key::T,
-                            'U' => Key::U,
-                            'V' => Key::V,
-                            'W' => Key::W,
-                            'X' => Key::X,
-                            'Y' => Key::Y,
-                            'Z' => Key::Z,
-                            _ => return None,
-                        }
-                    }
-                    // Digits
-                    d if d.len() == 1 && d.chars().all(|ch| ch.is_ascii_digit()) => match d {
-                        "0" => Key::Key0,
-                        "1" => Key::Key1,
-                        "2" => Key::Key2,
-                        "3" => Key::Key3,
-                        "4" => Key::Key4,
-                        "5" => Key::Key5,
-                        "6" => Key::Key6,
-                        "7" => Key::Key7,
-                        "8" => Key::Key8,
-                        "9" => Key::Key9,
-                        _ => return None,
-                    },
-                    _ => return None,
-                };
-                key_opt = Some(key);
-            }
-        }
-    }
-    key_opt.map(|key| KeyBinding {
-        key,
-        ctrl,
-        shift,
-        alt,
-        super_key,
-        command: command.to_string(),
-    })
-}
-
-/// Parse TOML-formatted bindings into a list of KeyBindings.
-fn parse_bindings(s: &str) -> Vec<KeyBinding> {
-    let mut bindings = Vec::new();
-    if let Ok(TomlValue::Table(table)) = toml::from_str::<TomlValue>(s) {
-        for (spec, val) in table {
-            if let TomlValue::String(cmd) = val {
-                if let Some(binding) = parse_binding_spec(&spec, &cmd) {
-                    bindings.push(binding);
-                }
-            }
-        }
-    }
-    bindings
-}
 
 /// Mouse click handler: select thumbnail on left-click in thumbnail mode.
 fn mouse_pressed(app: &App, model: &mut Model, button: MouseButton) {
@@ -245,261 +132,6 @@ fn mouse_wheel(app: &App, model: &mut Model, delta: MouseScrollDelta, _phase: To
     }
 }
 
-/// A single tile of a full-resolution image used to bypass GPU texture size limits.
-#[derive(Debug)]
-struct Tile {
-    /// Pixel offset from the left edge of the full image.
-    x_offset: u32,
-    /// Pixel offset from the top edge of the full image.
-    y_offset: u32,
-    /// Width of this tile in pixels.
-    width: u32,
-    /// Height of this tile in pixels.
-    height: u32,
-    /// Raw pixel data stored on the CPU.
-    pixel_data: Vec<u8>,
-    /// Lazily-created GPU texture.
-    texture: RefCell<Option<wgpu::Texture>>,
-}
-/// A full-resolution image represented as a set of tiles.
-#[derive(Debug)]
-struct TiledTexture {
-    /// Full image width in pixels.
-    full_w: u32,
-    /// Full image height in pixels.
-    full_h: u32,
-    /// Tiles composing the full image.
-    tiles: Vec<Tile>,
-}
-// Implement creation and sizing of tiled full-resolution textures.
-impl TiledTexture {
-    /// Return the full image dimensions [width, height].
-    fn size(&self) -> [u32; 2] {
-        [self.full_w, self.full_h]
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ThumbnailGrid {
-    rect: Rect,
-    cell: f32,
-    cols: usize,
-    rows: usize,
-    half_gap: f32,
-    thumb_size: f32,
-    scroll: f32,
-    total: usize,
-}
-
-impl ThumbnailGrid {
-    fn new(model: &Model, rect: Rect) -> Self {
-        let thumb_size = model.thumb_size as f32;
-        let cell = thumb_size + model.gap;
-        let mut cols = ((rect.w() + model.gap) / cell).floor() as isize;
-        if cols < 1 {
-            cols = 1;
-        }
-        let cols = cols as usize;
-        let total = model.image_paths.len();
-        let rows = if cols == 0 { 0 } else { total.div_ceil(cols) };
-        let half_gap = model.gap / 2.0;
-        Self {
-            rect,
-            cell,
-            cols,
-            rows,
-            half_gap,
-            thumb_size,
-            scroll: model.scroll_offset,
-            total,
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.total == 0 || self.cols == 0
-    }
-
-    fn cols(&self) -> usize {
-        self.cols
-    }
-
-    fn total(&self) -> usize {
-        self.total
-    }
-
-    fn rows(&self) -> usize {
-        self.rows
-    }
-
-    fn cell(&self) -> f32 {
-        self.cell
-    }
-
-    fn rect(&self) -> Rect {
-        self.rect
-    }
-
-    fn visible_rows(&self) -> Option<(usize, usize)> {
-        if self.is_empty() || self.rows == 0 {
-            return None;
-        }
-        let row_min_f = (self.scroll - self.thumb_size - self.half_gap) / self.cell;
-        let row_max_f = (self.rect.h() + self.scroll - self.half_gap) / self.cell;
-        let mut row_min = row_min_f.ceil() as isize - THUMB_PREFETCH_ROWS as isize;
-        let mut row_max = row_max_f.floor() as isize + THUMB_PREFETCH_ROWS as isize;
-        let max_row = self.rows.saturating_sub(1) as isize;
-        if row_min < 0 {
-            row_min = 0;
-        }
-        if row_max > max_row {
-            row_max = max_row;
-        }
-        if row_max < row_min {
-            row_max = row_min;
-        }
-        Some((row_min as usize, row_max as usize))
-    }
-
-    fn visible_indices(&self) -> Vec<usize> {
-        let mut indices = Vec::new();
-        if let Some((row_min, row_max)) = self.visible_rows() {
-            for row in row_min..=row_max {
-                let base = row * self.cols;
-                for col in 0..self.cols {
-                    let idx = base + col;
-                    if idx >= self.total {
-                        break;
-                    }
-                    indices.push(idx);
-                }
-            }
-        }
-        indices
-    }
-
-    fn row_base_y(&self, row: usize) -> f32 {
-        self.rect.h() / 2.0 - self.thumb_size / 2.0 - self.half_gap - (row as f32) * self.cell
-    }
-
-    fn col_center_x(&self, col: usize) -> f32 {
-        -self.rect.w() / 2.0 + self.thumb_size / 2.0 + self.half_gap + (col as f32) * self.cell
-    }
-
-    fn index_center(&self, idx: usize) -> Option<Vec2> {
-        if idx >= self.total || self.cols == 0 {
-            return None;
-        }
-        let row = idx / self.cols;
-        let col = idx % self.cols;
-        let base_y = self.row_base_y(row);
-        Some(vec2(self.col_center_x(col), base_y + self.scroll))
-    }
-
-    fn row_for_index(&self, idx: usize) -> Option<usize> {
-        if self.cols == 0 || idx >= self.total {
-            None
-        } else {
-            Some(idx / self.cols)
-        }
-    }
-
-    fn max_scroll(&self) -> f32 {
-        (self.rows as f32 * self.cell - self.rect.h()).max(0.0)
-    }
-
-    fn row_top(&self, row: usize) -> f32 {
-        row as f32 * self.cell
-    }
-
-    fn row_bottom(&self, row: usize) -> f32 {
-        self.row_top(row) + self.cell
-    }
-
-    fn row_length(&self, row: usize) -> usize {
-        if self.cols == 0 || row >= self.rows {
-            return 0;
-        }
-        let base = row * self.cols;
-        let remaining = self.total.saturating_sub(base);
-        remaining.min(self.cols)
-    }
-}
-
-#[derive(Debug)]
-enum FullPendingState {
-    InFlight { _requested_at: Instant },
-    Failed { last_error_at: Instant },
-}
-
-/// The application state.
-#[derive(Debug)]
-struct SearchState {
-    input: String,
-    focused: bool,
-    skip_next_char: bool,
-    results: Vec<(usize, f32)>,
-    current: usize,
-    pending_request: Option<u64>,
-    error: Option<String>,
-    last_embedding: Option<Vec<f32>>,
-}
-
-#[derive(Debug)]
-struct Model {
-    image_paths: Vec<PathBuf>,
-    thumb_textures: HashMap<usize, wgpu::Texture>,
-    thumb_cache: ThumbnailCache,
-    thumb_has_xmp: Vec<bool>,
-    thumb_rx: Receiver<(usize, DynamicImage)>,
-    thumb_req_tx: CbSender<usize>,
-    thumb_pending: HashSet<usize>,
-    thumb_usage: VecDeque<usize>,
-    thumb_capacity: usize,
-    file_mod_times: Vec<Option<SystemTime>>,
-    file_watch_cursor: usize,
-    // Channels for full-resolution image loading
-    full_req_tx: CbSender<usize>,
-    full_resp_rx: CbReceiver<FullImageMessage>,
-    // Track indices currently requested but not yet loaded
-    full_pending: HashMap<usize, FullPendingState>,
-    // LRU cache of full-resolution tiled textures
-    full_textures: HashMap<usize, TiledTexture>,
-    // Usage order for LRU eviction: front = most recently used
-    full_usage: VecDeque<usize>,
-    mode: Mode,
-    current: usize,
-    thumb_size: u32,
-    gap: f32,
-    // Vertical scroll offset for thumbnail view
-    scroll_offset: f32,
-    // Zoom scale for single image view (1.0 = 100%)
-    zoom: f32,
-    // Pan offset for single image view (in window coords)
-    pan: Vec2,
-    // Window rect at last update, for resize detection
-    prev_window_rect: Rect,
-    // Whether to auto-fit the current image when loaded or resized
-    fit_mode: bool,
-    // Timestamp when thumbnail selection last changed
-    selection_changed_at: Instant,
-    // Whether preload has been requested after selection
-    selection_pending: bool,
-    // User-defined key bindings
-    key_bindings: Vec<KeyBinding>,
-    // Channel for sending command output messages
-    command_tx: std::sync::mpsc::Sender<String>,
-    // Channel for receiving command output messages
-    command_rx: Receiver<String>,
-    // Captured command output for display
-    command_output: Option<String>,
-    // CLIP embedding management
-    clip_engine: ClipEngine,
-    clip_embeddings: Vec<Option<Vec<f32>>>,
-    clip_missing: HashSet<usize>,
-    clip_inflight: HashSet<usize>,
-    next_search_request_id: u64,
-    search: Option<SearchState>,
-}
 /// Compute the cache path for an image based on a SHA1 of its path.
 /// The cache layout is: cache_base/<first 3 hex chars>/<remaining hex chars>.png
 fn thumbnail_cache_path(cache_base: &Path, image_path: &Path) -> PathBuf {
@@ -1828,15 +1460,6 @@ fn enforce_thumbnail_capacity(model: &mut Model) {
     }
 }
 
-fn thumbnail_distance(idx: usize, cols: usize, cell: f32, viewport_center: f32) -> f32 {
-    if cols == 0 {
-        return f32::MAX;
-    }
-    let row = (idx / cols) as f32;
-    let center = row * cell + cell / 2.0;
-    (center - viewport_center).abs()
-}
-
 fn update_thumbnail_requests(app: &App, model: &mut Model) {
     if !matches!(model.mode, Mode::Thumbnails) {
         return;
@@ -1861,13 +1484,11 @@ fn update_thumbnail_requests(app: &App, model: &mut Model) {
         model.thumb_capacity = target_capacity;
         enforce_thumbnail_capacity(model);
     }
-    let cell = grid.cell();
-    let cols = grid.cols();
     let viewport_center = model.scroll_offset + rect.h() / 2.0;
     let mut ordered = visible;
     ordered.sort_by(|a, b| {
-        let da = thumbnail_distance(*a, cols, cell, viewport_center);
-        let db = thumbnail_distance(*b, cols, cell, viewport_center);
+        let da = grid.distance_from_center(*a, viewport_center);
+        let db = grid.distance_from_center(*b, viewport_center);
         da.partial_cmp(&db).unwrap_or(Ordering::Equal)
     });
     for idx in ordered {
