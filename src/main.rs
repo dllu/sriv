@@ -178,48 +178,34 @@ fn mouse_pressed(app: &App, model: &mut Model, button: MouseButton) {
         if button == MouseButton::Left {
             let pos = app.mouse.position();
             let rect = app.window_rect();
-            let cell = model.thumb_size as f32 + model.gap;
-            let cols = ((rect.w() + model.gap) / cell).floor() as usize;
-            let cols = cols.max(1);
-            let total = model.image_paths.len();
-            let rows = total.div_ceil(cols);
-            let half_gap = model.gap / 2.0;
-            let scroll = model.scroll_offset;
-            let row_min_f = (scroll - model.thumb_size as f32 - half_gap) / cell;
-            let row_min = row_min_f.ceil().max(0.0) as usize;
-            let row_max_f = (rect.h() + scroll - half_gap) / cell;
-            let row_max = row_max_f.floor().min(rows.saturating_sub(1) as f32) as usize;
-            for row in row_min..=row_max {
-                let base_y = rect.h() / 2.0
-                    - (model.thumb_size as f32) / 2.0
-                    - half_gap
-                    - (row as f32) * cell;
-                for col in 0..cols {
-                    let i = row * cols + col;
-                    if i >= total {
-                        break;
-                    }
-                    let x = -rect.w() / 2.0
-                        + (model.thumb_size as f32) / 2.0
-                        + half_gap
-                        + (col as f32) * cell;
-                    let y = base_y + scroll;
-                    let (width, height) = if let Some(tex) = model.thumb_textures.get(&i) {
-                        let [tw, th] = tex.size();
-                        (tw as f32, th as f32)
-                    } else {
-                        let size = model.thumb_size as f32;
-                        (size, size)
-                    };
-                    let x_min = x - width / 2.0;
-                    let x_max = x + width / 2.0;
-                    let y_min = y - height / 2.0;
-                    let y_max = y + height / 2.0;
-                    if pos.x >= x_min && pos.x <= x_max && pos.y >= y_min && pos.y <= y_max {
-                        model.current = i;
-                        model.selection_changed_at = Instant::now();
-                        model.selection_pending = false;
-                        return;
+            let grid = ThumbnailGrid::new(model, rect);
+            if let Some((row_min, row_max)) = grid.visible_rows() {
+                for row in row_min..=row_max {
+                    for col in 0..grid.cols() {
+                        let i = row * grid.cols() + col;
+                        if i >= grid.total() {
+                            break;
+                        }
+                        let center = grid.index_center(i).unwrap();
+                        let x = center.x;
+                        let y = center.y;
+                        let (width, height) = if let Some(tex) = model.thumb_textures.get(&i) {
+                            let [tw, th] = tex.size();
+                            (tw as f32, th as f32)
+                        } else {
+                            let size = model.thumb_size as f32;
+                            (size, size)
+                        };
+                        let x_min = x - width / 2.0;
+                        let x_max = x + width / 2.0;
+                        let y_min = y - height / 2.0;
+                        let y_max = y + height / 2.0;
+                        if pos.x >= x_min && pos.x <= x_max && pos.y >= y_min && pos.y <= y_max {
+                            model.current = i;
+                            model.selection_changed_at = Instant::now();
+                            model.selection_pending = false;
+                            return;
+                        }
                     }
                 }
             }
@@ -239,15 +225,8 @@ fn mouse_wheel(app: &App, model: &mut Model, delta: MouseScrollDelta, _phase: To
             // Update scroll offset and clamp to content bounds
             model.scroll_offset += scroll_amount;
             let rect = app.window_rect();
-            let cell = model.thumb_size as f32 + model.gap;
-            // Number of columns and rows in the thumbnail grid
-            let cols = ((rect.w() + model.gap) / cell).floor() as usize;
-            let cols = cols.max(1);
-            let total = model.image_paths.len();
-            let rows = total.div_ceil(cols) as f32;
-            // Maximum scroll to show last row at bottom
-            let max_scroll = (rows * cell - rect.h()).max(0.0);
-            model.scroll_offset = model.scroll_offset.clamp(0.0, max_scroll);
+            let grid = ThumbnailGrid::new(model, rect);
+            model.scroll_offset = model.scroll_offset.clamp(0.0, grid.max_scroll());
         }
         Mode::Single => {
             // Zoom in/out around mouse cursor
@@ -297,6 +276,152 @@ impl TiledTexture {
     /// Return the full image dimensions [width, height].
     fn size(&self) -> [u32; 2] {
         [self.full_w, self.full_h]
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ThumbnailGrid {
+    rect: Rect,
+    cell: f32,
+    cols: usize,
+    rows: usize,
+    half_gap: f32,
+    thumb_size: f32,
+    scroll: f32,
+    total: usize,
+}
+
+impl ThumbnailGrid {
+    fn new(model: &Model, rect: Rect) -> Self {
+        let thumb_size = model.thumb_size as f32;
+        let cell = thumb_size + model.gap;
+        let mut cols = ((rect.w() + model.gap) / cell).floor() as isize;
+        if cols < 1 {
+            cols = 1;
+        }
+        let cols = cols as usize;
+        let total = model.image_paths.len();
+        let rows = if cols == 0 { 0 } else { total.div_ceil(cols) };
+        let half_gap = model.gap / 2.0;
+        Self {
+            rect,
+            cell,
+            cols,
+            rows,
+            half_gap,
+            thumb_size,
+            scroll: model.scroll_offset,
+            total,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.total == 0 || self.cols == 0
+    }
+
+    fn cols(&self) -> usize {
+        self.cols
+    }
+
+    fn total(&self) -> usize {
+        self.total
+    }
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn cell(&self) -> f32 {
+        self.cell
+    }
+
+    fn rect(&self) -> Rect {
+        self.rect
+    }
+
+    fn visible_rows(&self) -> Option<(usize, usize)> {
+        if self.is_empty() || self.rows == 0 {
+            return None;
+        }
+        let row_min_f = (self.scroll - self.thumb_size - self.half_gap) / self.cell;
+        let row_max_f = (self.rect.h() + self.scroll - self.half_gap) / self.cell;
+        let mut row_min = row_min_f.ceil() as isize - THUMB_PREFETCH_ROWS as isize;
+        let mut row_max = row_max_f.floor() as isize + THUMB_PREFETCH_ROWS as isize;
+        let max_row = self.rows.saturating_sub(1) as isize;
+        if row_min < 0 {
+            row_min = 0;
+        }
+        if row_max > max_row {
+            row_max = max_row;
+        }
+        if row_max < row_min {
+            row_max = row_min;
+        }
+        Some((row_min as usize, row_max as usize))
+    }
+
+    fn visible_indices(&self) -> Vec<usize> {
+        let mut indices = Vec::new();
+        if let Some((row_min, row_max)) = self.visible_rows() {
+            for row in row_min..=row_max {
+                let base = row * self.cols;
+                for col in 0..self.cols {
+                    let idx = base + col;
+                    if idx >= self.total {
+                        break;
+                    }
+                    indices.push(idx);
+                }
+            }
+        }
+        indices
+    }
+
+    fn row_base_y(&self, row: usize) -> f32 {
+        self.rect.h() / 2.0 - self.thumb_size / 2.0 - self.half_gap - (row as f32) * self.cell
+    }
+
+    fn col_center_x(&self, col: usize) -> f32 {
+        -self.rect.w() / 2.0 + self.thumb_size / 2.0 + self.half_gap + (col as f32) * self.cell
+    }
+
+    fn index_center(&self, idx: usize) -> Option<Vec2> {
+        if idx >= self.total || self.cols == 0 {
+            return None;
+        }
+        let row = idx / self.cols;
+        let col = idx % self.cols;
+        let base_y = self.row_base_y(row);
+        Some(vec2(self.col_center_x(col), base_y + self.scroll))
+    }
+
+    fn row_for_index(&self, idx: usize) -> Option<usize> {
+        if self.cols == 0 || idx >= self.total {
+            None
+        } else {
+            Some(idx / self.cols)
+        }
+    }
+
+    fn max_scroll(&self) -> f32 {
+        (self.rows as f32 * self.cell - self.rect.h()).max(0.0)
+    }
+
+    fn row_top(&self, row: usize) -> f32 {
+        row as f32 * self.cell
+    }
+
+    fn row_bottom(&self, row: usize) -> f32 {
+        self.row_top(row) + self.cell
+    }
+
+    fn row_length(&self, row: usize) -> usize {
+        if self.cols == 0 || row >= self.rows {
+            return 0;
+        }
+        let base = row * self.cols;
+        let remaining = self.total.saturating_sub(base);
+        remaining.min(self.cols)
     }
 }
 
@@ -907,22 +1032,19 @@ fn ensure_thumbnail_visible(app: &App, model: &mut Model, idx: usize) {
         return;
     }
     let rect = app.window_rect();
-    let cell = model.thumb_size as f32 + model.gap;
-    let mut cols = ((rect.w() + model.gap) / cell).floor() as usize;
-    cols = cols.max(1);
-    let row = idx / cols;
-    let top = row as f32 * cell;
-    let bottom = top + cell;
-    let view_height = rect.h();
-    let mut scroll = model.scroll_offset;
-    if top < scroll {
-        scroll = top;
-    } else if bottom > scroll + view_height {
-        scroll = bottom - view_height;
+    let grid = ThumbnailGrid::new(model, rect);
+    if let Some(row) = grid.row_for_index(idx) {
+        let view_height = grid.rect().h();
+        let mut scroll = model.scroll_offset;
+        let top = grid.row_top(row);
+        let bottom = grid.row_bottom(row);
+        if top < scroll {
+            scroll = top;
+        } else if bottom > scroll + view_height {
+            scroll = bottom - view_height;
+        }
+        model.scroll_offset = scroll.clamp(0.0, grid.max_scroll());
     }
-    let rows = model.image_paths.len().div_ceil(cols);
-    let max_scroll = (rows as f32 * cell - view_height).max(0.0);
-    model.scroll_offset = scroll.clamp(0.0, max_scroll);
 }
 
 fn advance_search(app: &App, model: &mut Model, delta: isize) {
@@ -1185,47 +1307,69 @@ enum ArrowDirection {
 fn handle_arrow(app: &App, model: &mut Model, dir: ArrowDirection) -> bool {
     let len = model.image_paths.len();
     let rect = app.window_rect();
-    // Thumbnail grid parameters for thumbnail navigation
-    let cell = model.thumb_size as f32 + model.gap;
-    let cols = ((rect.w() + model.gap) / cell).floor() as usize;
-    let cols = cols.max(1);
     match model.mode {
         Mode::Thumbnails => {
-            // Compute target row and column
-            let row = match dir {
+            if len == 0 {
+                return false;
+            }
+            let grid = ThumbnailGrid::new(model, rect);
+            let cols = grid.cols();
+            if cols == 0 {
+                return false;
+            }
+            let current = model.current.min(len - 1);
+            let mut row = current / cols;
+            let mut col = current % cols;
+            let total_rows = grid.rows();
+            let mut changed = false;
+            match dir {
                 ArrowDirection::Up => {
-                    if model.current < cols {
-                        (len - 1) / cols
-                    } else {
-                        model.current / cols - 1
+                    if row > 0 {
+                        row -= 1;
+                        let row_len = grid.row_length(row).max(1);
+                        col = col.min(row_len - 1);
+                        changed = true;
                     }
                 }
-                ArrowDirection::Down => model.current / cols + 1,
-                _ => model.current / cols,
-            };
-            let col = match dir {
+                ArrowDirection::Down => {
+                    if row + 1 < total_rows {
+                        row += 1;
+                        let row_len = grid.row_length(row).max(1);
+                        col = col.min(row_len - 1);
+                        changed = true;
+                    }
+                }
                 ArrowDirection::Left => {
-                    let c = model.current % cols;
-                    if c == 0 {
-                        cols - 1
-                    } else {
-                        c - 1
+                    if col > 0 {
+                        col -= 1;
+                        changed = true;
+                    } else if row > 0 {
+                        row -= 1;
+                        let row_len = grid.row_length(row).max(1);
+                        col = row_len - 1;
+                        changed = true;
                     }
                 }
                 ArrowDirection::Right => {
-                    let c = model.current % cols;
-                    if c + 1 >= cols {
-                        0
-                    } else {
-                        c + 1
+                    let row_len = grid.row_length(row);
+                    if col + 1 < row_len {
+                        col += 1;
+                        changed = true;
+                    } else if row + 1 < total_rows {
+                        row += 1;
+                        col = 0;
+                        changed = true;
                     }
                 }
-                _ => model.current % cols,
-            };
-            let idx = row * cols + col;
-            if idx < len {
+            }
+            if changed {
+                let mut idx = row * cols + col;
+                if idx >= len {
+                    idx = len - 1;
+                }
                 model.current = idx;
             }
+            // Compute target row and column
             false
         }
         Mode::Single => {
@@ -1294,10 +1438,6 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
         return;
     }
     let len = model.image_paths.len();
-    let rect = app.window_rect();
-    let cell = model.thumb_size as f32 + model.gap;
-    let cols = ((rect.w() + model.gap) / cell).floor() as usize;
-    let cols = cols.max(1);
     if app.keys.mods == ModifiersState::empty() {
         match key {
             // Quit on 'q'
@@ -1471,16 +1611,7 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
 
     // Auto-scroll to keep current thumbnail in view
     if let Mode::Thumbnails = model.mode {
-        let row = model.current / cols;
-        let y0 = rect.h() / 2.0 - (model.thumb_size as f32) / 2.0 - model.gap / 2.0;
-        let target_y = y0 - (row as f32) * cell + model.scroll_offset;
-        let top_bound = rect.h() / 2.0 - (model.thumb_size as f32) / 2.0 - model.gap / 2.0;
-        let bottom_bound = -rect.h() / 2.0 + (model.thumb_size as f32) / 2.0 + model.gap / 2.0;
-        if target_y > top_bound {
-            model.scroll_offset -= target_y - top_bound;
-        } else if target_y < bottom_bound {
-            model.scroll_offset += bottom_bound - target_y;
-        }
+        ensure_thumbnail_visible(app, model, model.current);
     }
     // On thumbnail mode selection (via keys), reset preload timer
     if let Mode::Thumbnails = model.mode {
@@ -1628,13 +1759,8 @@ fn update(app: &App, model: &mut Model, _update: Update) {
     }
     // Clamp thumbnail scrolling to content bounds
     if let Mode::Thumbnails = model.mode {
-        let cell = model.thumb_size as f32 + model.gap;
-        let cols = ((rect.w() + model.gap) / cell).floor() as usize;
-        let cols = cols.max(1);
-        let total = model.image_paths.len();
-        let rows = total.div_ceil(cols) as f32;
-        let max_scroll = (rows * cell - rect.h()).max(0.0);
-        model.scroll_offset = model.scroll_offset.clamp(0.0, max_scroll);
+        let grid = ThumbnailGrid::new(model, rect);
+        model.scroll_offset = model.scroll_offset.clamp(0.0, grid.max_scroll());
     }
     if matches!(model.mode, Mode::Single) && !model.full_textures.contains_key(&model.current) {
         request_full_texture(model, model.current);
@@ -1702,6 +1828,15 @@ fn enforce_thumbnail_capacity(model: &mut Model) {
     }
 }
 
+fn thumbnail_distance(idx: usize, cols: usize, cell: f32, viewport_center: f32) -> f32 {
+    if cols == 0 {
+        return f32::MAX;
+    }
+    let row = (idx / cols) as f32;
+    let center = row * cell + cell / 2.0;
+    (center - viewport_center).abs()
+}
+
 fn update_thumbnail_requests(app: &App, model: &mut Model) {
     if !matches!(model.mode, Mode::Thumbnails) {
         return;
@@ -1715,7 +1850,8 @@ fn update_thumbnail_requests(app: &App, model: &mut Model) {
         return;
     }
     let rect = app.window_rect();
-    let visible = visible_thumbnail_indices(model, rect);
+    let grid = ThumbnailGrid::new(model, rect);
+    let visible = grid.visible_indices();
     let required = visible.len();
     let target_capacity = required
         .saturating_add(THUMB_POOL_MARGIN)
@@ -1725,7 +1861,16 @@ fn update_thumbnail_requests(app: &App, model: &mut Model) {
         model.thumb_capacity = target_capacity;
         enforce_thumbnail_capacity(model);
     }
-    for &idx in &visible {
+    let cell = grid.cell();
+    let cols = grid.cols();
+    let viewport_center = model.scroll_offset + rect.h() / 2.0;
+    let mut ordered = visible;
+    ordered.sort_by(|a, b| {
+        let da = thumbnail_distance(*a, cols, cell, viewport_center);
+        let db = thumbnail_distance(*b, cols, cell, viewport_center);
+        da.partial_cmp(&db).unwrap_or(Ordering::Equal)
+    });
+    for idx in ordered {
         if model.thumb_textures.contains_key(&idx) {
             touch_thumbnail(model, idx);
         } else if !model.thumb_pending.contains(&idx) {
@@ -1831,48 +1976,7 @@ fn current_mod_time(path: &Path) -> Option<SystemTime> {
 }
 
 fn visible_thumbnail_indices(model: &Model, rect: Rect) -> Vec<usize> {
-    let total = model.image_paths.len();
-    if total == 0 {
-        return Vec::new();
-    }
-    let cell = model.thumb_size as f32 + model.gap;
-    let mut cols = ((rect.w() + model.gap) / cell).floor() as isize;
-    if cols < 1 {
-        cols = 1;
-    }
-    let cols = cols as usize;
-    let rows = total.div_ceil(cols);
-    if rows == 0 {
-        return Vec::new();
-    }
-    let half_gap = model.gap / 2.0;
-    let scroll = model.scroll_offset;
-    let row_min_f = (scroll - model.thumb_size as f32 - half_gap) / cell;
-    let row_max_f = (rect.h() + scroll - half_gap) / cell;
-    let mut row_min = row_min_f.ceil() as isize - THUMB_PREFETCH_ROWS as isize;
-    let mut row_max = row_max_f.floor() as isize + THUMB_PREFETCH_ROWS as isize;
-    let max_row = rows as isize - 1;
-    if row_min < 0 {
-        row_min = 0;
-    }
-    if row_max > max_row {
-        row_max = max_row;
-    }
-    if row_max < row_min {
-        row_max = row_min;
-    }
-    let mut indices = Vec::new();
-    for row in row_min..=row_max {
-        let base = row as usize * cols;
-        for col in 0..cols {
-            let idx = base + col;
-            if idx >= total {
-                break;
-            }
-            indices.push(idx);
-        }
-    }
-    indices
+    ThumbnailGrid::new(model, rect).visible_indices()
 }
 /// Apply fit-to-window for current single-image view
 fn apply_fit(app: &App, model: &mut Model) {
@@ -1894,77 +1998,62 @@ fn view(app: &App, model: &Model, frame: Frame) {
     let rect = app.window_rect();
     match model.mode {
         Mode::Thumbnails => {
-            let cell = model.thumb_size as f32 + model.gap;
-            let cols = ((rect.w() + model.gap) / cell).floor() as usize;
-            let cols = cols.max(1);
-            // Only draw thumbnails within the visible viewport rows
-            let total = model.image_paths.len();
-            let rows = total.div_ceil(cols);
-            let half_gap = model.gap / 2.0;
-            let scroll = model.scroll_offset;
-            // Compute visible row range
-            let row_min_f = (scroll - model.thumb_size as f32 - half_gap) / cell;
-            let row_min = row_min_f.ceil().max(0.0) as usize;
-            let row_max_f = (rect.h() + scroll - half_gap) / cell;
-            let row_max = row_max_f.floor().min(rows.saturating_sub(1) as f32) as usize;
-            for row in row_min..=row_max {
-                let base_y = rect.h() / 2.0
-                    - (model.thumb_size as f32) / 2.0
-                    - half_gap
-                    - (row as f32) * cell;
-                for col in 0..cols {
-                    let i = row * cols + col;
-                    if i >= total {
-                        break;
-                    }
-                    let x = -rect.w() / 2.0
-                        + (model.thumb_size as f32) / 2.0
-                        + half_gap
-                        + (col as f32) * cell;
-                    let y = base_y + scroll;
-                    if let Some(tex) = model.thumb_textures.get(&i) {
-                        let [tw, th] = tex.size();
-                        let w = tw as f32;
-                        let h = th as f32;
-                        draw.texture(tex).x_y(x, y).w_h(w, h);
-                        if model.thumb_has_xmp.get(i).copied().unwrap_or(false) {
-                            let icon_w = 40.0;
-                            let icon_h = 20.0;
-                            let margin = 6.0;
-                            let icon_center_x = x + w / 2.0 - icon_w / 2.0 - margin;
-                            let icon_center_y = y + h / 2.0 - icon_h / 2.0 - margin;
-                            draw.rect()
-                                .x_y(icon_center_x, icon_center_y)
-                                .w_h(icon_w, icon_h)
-                                .color(srgba(1.0, 0.0, 0.0, 0.85));
-                            draw.text("XMP")
-                                .font_size(12)
-                                .w_h(icon_w, icon_h)
-                                .x_y(icon_center_x, icon_center_y - 1.0)
-                                .color(WHITE);
+            let grid = ThumbnailGrid::new(model, rect);
+            if let Some((row_min, row_max)) = grid.visible_rows() {
+                for row in row_min..=row_max {
+                    for col in 0..grid.cols() {
+                        let i = row * grid.cols() + col;
+                        if i >= grid.total() {
+                            break;
                         }
-                        if i == model.current {
+                        let center = match grid.index_center(i) {
+                            Some(c) => c,
+                            None => continue,
+                        };
+                        if let Some(tex) = model.thumb_textures.get(&i) {
+                            let [tw, th] = tex.size();
+                            let w = tw as f32;
+                            let h = th as f32;
+                            draw.texture(tex).x_y(center.x, center.y).w_h(w, h);
+                            if model.thumb_has_xmp.get(i).copied().unwrap_or(false) {
+                                let icon_w = 40.0;
+                                let icon_h = 20.0;
+                                let margin = 6.0;
+                                let icon_center_x = center.x + w / 2.0 - icon_w / 2.0 - margin;
+                                let icon_center_y = center.y + h / 2.0 - icon_h / 2.0 - margin;
+                                draw.rect()
+                                    .x_y(icon_center_x, icon_center_y)
+                                    .w_h(icon_w, icon_h)
+                                    .color(srgba(1.0, 0.0, 0.0, 0.85));
+                                draw.text("XMP")
+                                    .font_size(12)
+                                    .w_h(icon_w, icon_h)
+                                    .x_y(icon_center_x, icon_center_y - 1.0)
+                                    .color(WHITE);
+                            }
+                            if i == model.current {
+                                draw.rect()
+                                    .x_y(center.x, center.y)
+                                    .w_h(w + 4.0, h + 4.0)
+                                    .no_fill()
+                                    .stroke(WHITE)
+                                    .stroke_weight(2.0);
+                            }
+                        } else {
+                            let thumb_w = model.thumb_size as f32;
+                            let thumb_h = model.thumb_size as f32;
                             draw.rect()
-                                .x_y(x, y)
-                                .w_h(w + 4.0, h + 4.0)
-                                .no_fill()
-                                .stroke(WHITE)
-                                .stroke_weight(2.0);
-                        }
-                    } else {
-                        let thumb_w = model.thumb_size as f32;
-                        let thumb_h = model.thumb_size as f32;
-                        draw.rect()
-                            .x_y(x, y)
-                            .w_h(thumb_w, thumb_h)
-                            .color(srgba(0.5, 0.5, 0.5, 1.0));
-                        if i == model.current {
-                            draw.rect()
-                                .x_y(x, y)
-                                .w_h(thumb_w + 4.0, thumb_h + 4.0)
-                                .no_fill()
-                                .stroke(WHITE)
-                                .stroke_weight(2.0);
+                                .x_y(center.x, center.y)
+                                .w_h(thumb_w, thumb_h)
+                                .color(srgba(0.5, 0.5, 0.5, 1.0));
+                            if i == model.current {
+                                draw.rect()
+                                    .x_y(center.x, center.y)
+                                    .w_h(thumb_w + 4.0, thumb_h + 4.0)
+                                    .no_fill()
+                                    .stroke(WHITE)
+                                    .stroke_weight(2.0);
+                            }
                         }
                     }
                 }
