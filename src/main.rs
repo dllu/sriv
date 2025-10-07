@@ -64,7 +64,9 @@ fn mouse_pressed(app: &App, model: &mut Model, button: MouseButton) {
     if let Mode::Thumbnails = model.mode {
         if button == MouseButton::Left {
             let pos = app.mouse.position();
-            let rect = app.window_rect();
+            let Some(rect) = current_window_rect(app, model) else {
+                return;
+            };
             let grid = ThumbnailGrid::new(model, rect);
             if let Some((row_min, row_max)) = grid.visible_rows() {
                 for row in row_min..=row_max {
@@ -111,7 +113,9 @@ fn mouse_wheel(app: &App, model: &mut Model, delta: MouseScrollDelta, _phase: To
             };
             // Update scroll offset and clamp to content bounds
             model.scroll_offset += scroll_amount;
-            let rect = app.window_rect();
+            let Some(rect) = current_window_rect(app, model) else {
+                return;
+            };
             let grid = ThumbnailGrid::new(model, rect);
             model.scroll_offset = model.scroll_offset.clamp(0.0, grid.max_scroll());
         }
@@ -170,10 +174,7 @@ fn orientation_from_tag_value(value: &rexif::TagValue) -> Option<u16> {
 
 fn parse_exif_quiet(path: &Path) -> Option<rexif::ExifData> {
     let data = fs::read(path).ok()?;
-    match rexif::parse_buffer_quiet(&data).0 {
-        Ok(exif) => Some(exif),
-        Err(_) => None,
-    }
+    rexif::parse_buffer_quiet(&data).0.ok()
 }
 
 /// Adjust image orientation based on EXIF orientation tag.
@@ -485,7 +486,7 @@ fn model(app: &App) -> Model {
         }
     }
     // Create the window first, so textures can reference a focused window.
-    let _window = app
+    let window_id = app
         .new_window()
         .size(800, 600)
         .title("sriv")
@@ -559,7 +560,10 @@ fn model(app: &App) -> Model {
     let full_textures: HashMap<usize, TiledTexture> = HashMap::new();
     let full_usage: VecDeque<usize> = VecDeque::new();
     // Get initial window rect for resize tracking
-    let initial_rect = app.window_rect();
+    let initial_rect = app
+        .window(window_id)
+        .map(|w| w.rect())
+        .unwrap_or_else(|| Rect::from_w_h(0.0, 0.0));
     // Load user key bindings from config file
     let config_home = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -613,6 +617,7 @@ fn model(app: &App) -> Model {
         clip_inflight,
         next_search_request_id: 0,
         search: None,
+        window_id,
     };
     update_thumbnail_requests(app, &mut model);
     model
@@ -663,7 +668,9 @@ fn ensure_thumbnail_visible(app: &App, model: &mut Model, idx: usize) {
     if !matches!(model.mode, Mode::Thumbnails) {
         return;
     }
-    let rect = app.window_rect();
+    let Some(rect) = current_window_rect(app, model) else {
+        return;
+    };
     let grid = ThumbnailGrid::new(model, rect);
     if let Some(row) = grid.row_for_index(idx) {
         let view_height = grid.rect().h();
@@ -938,7 +945,9 @@ enum ArrowDirection {
 /// Returns true if event was fully consumed (e.g., panned in single mode).
 fn handle_arrow(app: &App, model: &mut Model, dir: ArrowDirection) -> bool {
     let len = model.image_paths.len();
-    let rect = app.window_rect();
+    let Some(rect) = current_window_rect(app, model) else {
+        return matches!(model.mode, Mode::Single);
+    };
     match model.mode {
         Mode::Thumbnails => {
             if len == 0 {
@@ -1167,11 +1176,14 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             // Fit single image to window
             Key::W => {
                 if let Mode::Single = model.mode {
-                    let rect = app.window_rect();
-                    if let Some(tex) = model.full_textures.get(&model.current) {
-                        let [w, h] = tex.size();
-                        let fit = (rect.w() / w as f32).min(rect.h() / h as f32);
-                        model.zoom = fit;
+                    if let Some(rect) = current_window_rect(app, model) {
+                        if let Some(tex) = model.full_textures.get(&model.current) {
+                            let [w, h] = tex.size();
+                            let fit = (rect.w() / w as f32).min(rect.h() / h as f32);
+                            model.zoom = fit;
+                        } else {
+                            model.zoom = 1.0;
+                        }
                     } else {
                         model.zoom = 1.0;
                     }
@@ -1180,10 +1192,10 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             }
             // Toggle full screen
             Key::F => {
-                let window = app.main_window();
-                // Query current state, then toggle
-                let is_fs = window.is_fullscreen();
-                window.set_fullscreen(!is_fs);
+                if let Some(window) = app.window(model.window_id) {
+                    let is_fs = window.is_fullscreen();
+                    window.set_fullscreen(!is_fs);
+                }
             }
             // Show at 100% scale
             Key::Equals => {
@@ -1371,12 +1383,14 @@ fn update(app: &App, model: &mut Model, _update: Update) {
         }
     }
     // Handle window resize: update view parameters and re-apply fit if in fit mode
-    let rect = app.window_rect();
-    if rect != model.prev_window_rect {
-        model.prev_window_rect = rect;
-        if let Mode::Single = model.mode {
-            if model.fit_mode {
-                apply_fit(app, model);
+    let window_rect = current_window_rect(app, model);
+    if let Some(rect) = window_rect {
+        if rect != model.prev_window_rect {
+            model.prev_window_rect = rect;
+            if let Mode::Single = model.mode {
+                if model.fit_mode {
+                    apply_fit(app, model);
+                }
             }
         }
     }
@@ -1391,8 +1405,10 @@ fn update(app: &App, model: &mut Model, _update: Update) {
     }
     // Clamp thumbnail scrolling to content bounds
     if let Mode::Thumbnails = model.mode {
-        let grid = ThumbnailGrid::new(model, rect);
-        model.scroll_offset = model.scroll_offset.clamp(0.0, grid.max_scroll());
+        if let Some(rect) = window_rect {
+            let grid = ThumbnailGrid::new(model, rect);
+            model.scroll_offset = model.scroll_offset.clamp(0.0, grid.max_scroll());
+        }
     }
     if matches!(model.mode, Mode::Single) && !model.full_textures.contains_key(&model.current) {
         request_full_texture(model, model.current);
@@ -1472,7 +1488,9 @@ fn update_thumbnail_requests(app: &App, model: &mut Model) {
         model.thumb_pending.clear();
         return;
     }
-    let rect = app.window_rect();
+    let Some(rect) = current_window_rect(app, model) else {
+        return;
+    };
     let grid = ThumbnailGrid::new(model, rect);
     let visible = grid.visible_indices();
     let required = visible.len();
@@ -1510,9 +1528,10 @@ fn detect_file_changes(app: &App, model: &mut Model) {
     let mut candidates: HashSet<usize> = HashSet::new();
     candidates.insert(model.current);
     if matches!(model.mode, Mode::Thumbnails) {
-        let rect = app.window_rect();
-        for idx in visible_thumbnail_indices(model, rect) {
-            candidates.insert(idx);
+        if let Some(rect) = current_window_rect(app, model) {
+            for idx in visible_thumbnail_indices(model, rect) {
+                candidates.insert(idx);
+            }
         }
     }
     let batch = FILE_WATCH_BATCH.min(total);
@@ -1596,16 +1615,23 @@ fn current_mod_time(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).and_then(|meta| meta.modified()).ok()
 }
 
+fn current_window_rect(app: &App, model: &Model) -> Option<Rect> {
+    app.window(model.window_id).map(|w| w.rect())
+}
+
 fn visible_thumbnail_indices(model: &Model, rect: Rect) -> Vec<usize> {
     ThumbnailGrid::new(model, rect).visible_indices()
 }
 /// Apply fit-to-window for current single-image view
 fn apply_fit(app: &App, model: &mut Model) {
     model.fit_mode = true;
-    let rect = app.window_rect();
-    if let Some(tex) = model.full_textures.get(&model.current) {
-        let [w, h] = tex.size();
-        model.zoom = (rect.w() / w as f32).min(rect.h() / h as f32);
+    if let Some(rect) = current_window_rect(app, model) {
+        if let Some(tex) = model.full_textures.get(&model.current) {
+            let [w, h] = tex.size();
+            model.zoom = (rect.w() / w as f32).min(rect.h() / h as f32);
+        } else {
+            model.zoom = 1.0;
+        }
     } else {
         model.zoom = 1.0;
     }
@@ -1616,7 +1642,9 @@ fn view(app: &App, model: &Model, frame: Frame) {
     let draw = app.draw();
     draw.background().color(BLACK);
 
-    let rect = app.window_rect();
+    let Some(rect) = current_window_rect(app, model) else {
+        return;
+    };
     match model.mode {
         Mode::Thumbnails => {
             let grid = ThumbnailGrid::new(model, rect);
@@ -1707,6 +1735,9 @@ fn view(app: &App, model: &Model, frame: Frame) {
             // Attempt to draw the full-resolution tiled texture if loaded;
             // otherwise display a loading message.
             if let Some(tex) = model.full_textures.get(&model.current) {
+                let Some(window) = app.window(model.window_id) else {
+                    return;
+                };
                 // Draw each tile at the correct position, applying zoom and pan
                 let [full_w, full_h] = tex.size();
                 for tile in &tex.tiles {
@@ -1733,8 +1764,8 @@ fn view(app: &App, model: &Model, frame: Frame) {
                                 | wgpu::TextureUsages::COPY_DST,
                             view_formats: &[],
                         };
-                        let handle = app.main_window().device().create_texture(&descriptor);
-                        app.main_window().queue().write_texture(
+                        let handle = window.device().create_texture(&descriptor);
+                        window.queue().write_texture(
                             wgpu::ImageCopyTexture {
                                 texture: &handle,
                                 mip_level: 0,

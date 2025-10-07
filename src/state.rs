@@ -2,7 +2,7 @@ use crate::clip::{ClipEngine, ThumbnailCache};
 use crate::FullImageMessage;
 use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender};
 use nannou::image::DynamicImage;
-use nannou::prelude::{Key, Rect, Vec2};
+use nannou::prelude::{Key, Rect, Vec2, WindowId};
 use nannou::wgpu;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -199,4 +199,5 @@ pub struct Model {
     pub clip_inflight: HashSet<usize>,
     pub next_search_request_id: u64,
     pub search: Option<SearchState>,
+    pub window_id: WindowId,
 }
