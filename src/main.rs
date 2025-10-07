@@ -23,7 +23,20 @@ mod clip;
 use clip::{ClipEngine, ClipEvent, ThumbnailCache};
 
 type FullImageTile = (u32, u32, u32, u32, Vec<u8>);
-type FullImageResponse = (usize, u32, u32, Vec<FullImageTile>);
+
+#[derive(Debug)]
+enum FullImageMessage {
+    Loaded {
+        index: usize,
+        full_w: u32,
+        full_h: u32,
+        tiles: Vec<FullImageTile>,
+    },
+    Failed {
+        index: usize,
+        error: String,
+    },
+}
 
 /// Maximum number of full-resolution images to cache in memory.
 const FULL_CACHE_CAPACITY: usize = 4;
@@ -287,6 +300,12 @@ impl TiledTexture {
     }
 }
 
+#[derive(Debug)]
+enum FullPendingState {
+    InFlight { _requested_at: Instant },
+    Failed { last_error_at: Instant },
+}
+
 /// The application state.
 #[derive(Debug)]
 struct SearchState {
@@ -315,9 +334,9 @@ struct Model {
     file_watch_cursor: usize,
     // Channels for full-resolution image loading
     full_req_tx: CbSender<usize>,
-    full_resp_rx: CbReceiver<FullImageResponse>,
+    full_resp_rx: CbReceiver<FullImageMessage>,
     // Track indices currently requested but not yet loaded
-    full_pending: HashMap<usize, Instant>,
+    full_pending: HashMap<usize, FullPendingState>,
     // LRU cache of full-resolution tiled textures
     full_textures: HashMap<usize, TiledTexture>,
     // Usage order for LRU eviction: front = most recently used
@@ -614,6 +633,7 @@ fn model(app: &App) -> Model {
         let cache_base = cache_base.clone();
         let thumb_req_rx = thumb_req_rx.clone();
         let tx = tx.clone();
+        let thumb_cache = thumbnail_cache.clone();
         thread::spawn(move || {
             while let Ok(i) = thumb_req_rx.recv() {
                 if let Some(p) = paths.get(i) {
@@ -659,6 +679,7 @@ fn model(app: &App) -> Model {
                             image::Rgba([128, 128, 128, 255]),
                         ))
                     });
+                    thumb_cache.store_dynamic(i, &image);
                     let _ = tx.send((i, image));
                 }
             }
@@ -722,7 +743,7 @@ fn model(app: &App) -> Model {
     // Channel for requesting full-resolution images (by index)
     let (full_req_tx, full_req_rx) = unbounded::<usize>();
     // Channel for receiving loaded full-resolution image tile data
-    let (full_resp_tx, full_resp_rx) = unbounded::<FullImageResponse>();
+    let (full_resp_tx, full_resp_rx) = unbounded::<FullImageMessage>();
     // Spawn a pool of loader threads for full images: load, crop, and convert to raw tile data off the main thread
     {
         // Shared image paths for all workers
@@ -735,31 +756,49 @@ fn model(app: &App) -> Model {
             thread::spawn(move || {
                 while let Ok(idx) = req_rx.recv() {
                     if let Some(path) = paths.get(idx) {
-                        if let Ok(img_orig) = image::open(path) {
-                            let img = adjust_orientation(img_orig, path);
-                            let rgba = img.to_rgba8();
-                            let full_w = rgba.width();
-                            let full_h = rgba.height();
-                            const MAX_TILE_SIZE: u32 = 8192;
-                            let mut tiles_data = Vec::new();
-                            for y in (0..full_h).step_by(MAX_TILE_SIZE as usize) {
-                                for x in (0..full_w).step_by(MAX_TILE_SIZE as usize) {
-                                    let tile_w = (full_w - x).min(MAX_TILE_SIZE);
-                                    let tile_h = (full_h - y).min(MAX_TILE_SIZE);
-                                    let sub_image: RgbaImage =
-                                        crop_imm(&rgba, x, y, tile_w, tile_h).to_image();
-                                    let raw_pixels = sub_image.into_raw();
-                                    tiles_data.push((x, y, tile_w, tile_h, raw_pixels));
+                        match image::open(path) {
+                            Ok(img_orig) => {
+                                let img = adjust_orientation(img_orig, path);
+                                let rgba = img.to_rgba8();
+                                let full_w = rgba.width();
+                                let full_h = rgba.height();
+                                const MAX_TILE_SIZE: u32 = 8192;
+                                let mut tiles_data = Vec::new();
+                                for y in (0..full_h).step_by(MAX_TILE_SIZE as usize) {
+                                    for x in (0..full_w).step_by(MAX_TILE_SIZE as usize) {
+                                        let tile_w = (full_w - x).min(MAX_TILE_SIZE);
+                                        let tile_h = (full_h - y).min(MAX_TILE_SIZE);
+                                        let sub_image: RgbaImage =
+                                            crop_imm(&rgba, x, y, tile_w, tile_h).to_image();
+                                        let raw_pixels = sub_image.into_raw();
+                                        tiles_data.push((x, y, tile_w, tile_h, raw_pixels));
+                                    }
                                 }
+                                let _ = resp_tx.send(FullImageMessage::Loaded {
+                                    index: idx,
+                                    full_w,
+                                    full_h,
+                                    tiles: tiles_data,
+                                });
                             }
-                            let _ = resp_tx.send((idx, full_w, full_h, tiles_data));
+                            Err(err) => {
+                                let _ = resp_tx.send(FullImageMessage::Failed {
+                                    index: idx,
+                                    error: format!("failed to open {}: {}", path.display(), err),
+                                });
+                            }
                         }
+                    } else {
+                        let _ = resp_tx.send(FullImageMessage::Failed {
+                            index: idx,
+                            error: "image index out of range".to_string(),
+                        });
                     }
                 }
             });
         }
     }
-    let full_pending: HashMap<usize, Instant> = HashMap::new();
+    let full_pending: HashMap<usize, FullPendingState> = HashMap::new();
     let full_textures: HashMap<usize, TiledTexture> = HashMap::new();
     let full_usage: VecDeque<usize> = VecDeque::new();
     // Get initial window rect for resize tracking
@@ -1503,47 +1542,69 @@ fn update(app: &App, model: &mut Model, _update: Update) {
     // Process incoming thumbnails
     while let Ok((i, img)) = model.thumb_rx.try_recv() {
         model.thumb_pending.remove(&i);
-        model.thumb_cache.store_dynamic(i, &img);
         let tex = wgpu::Texture::from_image(app, &img);
         insert_thumbnail_texture(model, i, tex);
     }
     // Process loaded full-resolution tile data
-    while let Ok((idx, full_w, full_h, tiles_data)) = model.full_resp_rx.try_recv() {
-        // Store raw pixel data for lazy texture creation
-        let mut tiles = Vec::new();
+    while let Ok(message) = model.full_resp_rx.try_recv() {
+        match message {
+            FullImageMessage::Loaded {
+                index: idx,
+                full_w,
+                full_h,
+                tiles,
+            } => {
+                // Store raw pixel data for lazy texture creation
+                let mut prepared_tiles = Vec::new();
 
-        for (x_offset, y_offset, width, height, pixel_data) in tiles_data {
-            tiles.push(Tile {
-                x_offset,
-                y_offset,
-                width,
-                height,
-                pixel_data,
-                texture: RefCell::new(None),
-            });
-        }
-        let tiled = TiledTexture {
-            full_w,
-            full_h,
-            tiles,
-        };
-        // Insert into cache and update LRU
-        model.full_textures.insert(idx, tiled);
-        // Mark use and remove pending
-        if let Some(pos) = model.full_usage.iter().position(|&i| i == idx) {
-            model.full_usage.remove(pos);
-        }
-        model.full_usage.push_front(idx);
-        model.full_pending.remove(&idx);
-        // Evict least recently used if over capacity
-        if model.full_usage.len() > FULL_CACHE_CAPACITY {
-            if let Some(old_idx) = model.full_usage.pop_back() {
-                model.full_textures.remove(&old_idx);
+                for (x_offset, y_offset, width, height, pixel_data) in tiles {
+                    prepared_tiles.push(Tile {
+                        x_offset,
+                        y_offset,
+                        width,
+                        height,
+                        pixel_data,
+                        texture: RefCell::new(None),
+                    });
+                }
+                let tiled = TiledTexture {
+                    full_w,
+                    full_h,
+                    tiles: prepared_tiles,
+                };
+                // Insert into cache and update LRU
+                model.full_textures.insert(idx, tiled);
+                touch_full_texture(model, idx);
+                model.full_pending.remove(&idx);
+                // Evict least recently used if over capacity
+                if model.full_usage.len() > FULL_CACHE_CAPACITY {
+                    if let Some(old_idx) = model.full_usage.pop_back() {
+                        model.full_textures.remove(&old_idx);
+                    }
+                }
+                // If this is the current image and in fit mode, resize to fit
+                if idx == model.current && model.fit_mode {
+                    apply_fit(app, model);
+                }
             }
-        }
-        // If this is the current image and in fit mode, resize to fit
-        if idx == model.current && model.fit_mode {
-            apply_fit(app, model);
+            FullImageMessage::Failed { index: idx, error } => {
+                model.full_pending.insert(
+                    idx,
+                    FullPendingState::Failed {
+                        last_error_at: Instant::now(),
+                    },
+                );
+                let path_info = model
+                    .image_paths
+                    .get(idx)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| format!("image index {idx}"));
+                eprintln!("failed to load full image {path_info}: {error}");
+                model.full_textures.remove(&idx);
+                if let Some(pos) = model.full_usage.iter().position(|&i| i == idx) {
+                    model.full_usage.remove(pos);
+                }
+            }
         }
     }
     // Handle window resize: update view parameters and re-apply fit if in fit mode
@@ -1580,21 +1641,39 @@ fn update(app: &App, model: &mut Model, _update: Update) {
     }
     update_thumbnail_requests(app, model);
 }
+fn touch_full_texture(model: &mut Model, idx: usize) {
+    if !model.full_textures.contains_key(&idx) {
+        return;
+    }
+    if let Some(pos) = model.full_usage.iter().position(|&i| i == idx) {
+        model.full_usage.remove(pos);
+    }
+    model.full_usage.push_front(idx);
+}
+
 /// Ensure the full-resolution texture for `idx` is loaded and update LRU cache.
 /// Request loading of full-resolution image at `idx` in background.  Adds to pending set.
 fn request_full_texture(model: &mut Model, idx: usize) {
     if model.full_textures.contains_key(&idx) {
+        touch_full_texture(model, idx);
         return;
     }
     let now = Instant::now();
-    let needs_request = match model.full_pending.get(&idx) {
+    let should_request = match model.full_pending.get(&idx) {
         None => true,
-        Some(&sent_at) => now.duration_since(sent_at) > FULL_PENDING_RETRY,
+        Some(FullPendingState::InFlight { .. }) => false,
+        Some(FullPendingState::Failed { last_error_at }) => {
+            now.duration_since(*last_error_at) > FULL_PENDING_RETRY
+        }
     };
-    if needs_request {
-        model.full_pending.insert(idx, now);
+    if should_request {
+        model
+            .full_pending
+            .insert(idx, FullPendingState::InFlight { _requested_at: now });
         if let Err(err) = model.full_req_tx.send(idx) {
-            model.full_pending.remove(&idx);
+            model
+                .full_pending
+                .insert(idx, FullPendingState::Failed { last_error_at: now });
             eprintln!("failed to request full image load for index {idx}: {err}");
         }
     }
