@@ -16,14 +16,16 @@ use std::sync::mpsc::channel;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
-
 mod clip;
 mod grid;
 mod state;
 
 use clip::{ClipEngine, ClipEvent, ThumbnailCache};
 use grid::ThumbnailGrid;
-use state::{parse_bindings, FullPendingState, Mode, Model, SearchState, Tile, TiledTexture};
+use state::{
+    parse_bindings, FullPendingState, Mode, Model, SearchState, ThumbRequestQueue, Tile,
+    TiledTexture,
+};
 
 type FullImageTile = (u32, u32, u32, u32, Vec<u8>);
 
@@ -47,8 +49,6 @@ const FULL_CACHE_CAPACITY: usize = 4;
 const FULL_PENDING_RETRY: Duration = Duration::from_secs(5);
 /// Number of extra rows of thumbnails to keep warm beyond the viewport.
 pub(crate) const THUMB_PREFETCH_ROWS: usize = 1;
-/// Additional thumbnail textures to keep available beyond the visible count.
-const THUMB_POOL_MARGIN: usize = 12;
 /// Number of files to poll for modifications each update tick.
 const FILE_WATCH_BATCH: usize = 32;
 
@@ -382,18 +382,18 @@ fn model(app: &App) -> Model {
     }
     // Channel for receiving thumbnails from background threads.
     let (tx, rx) = channel::<(usize, DynamicImage)>();
-    // Channel for requesting thumbnail loads on demand.
-    let (thumb_req_tx, thumb_req_rx) = unbounded::<usize>();
+    let thumb_queue = ThumbRequestQueue::new();
+    thumb_queue.enqueue_batch(0..image_paths.len());
     let num_workers = rayon::current_num_threads().clamp(1, 8);
     let shared_paths = Arc::new(image_paths.clone());
     for _ in 0..num_workers {
         let paths = Arc::clone(&shared_paths);
         let cache_base = cache_base.clone();
-        let thumb_req_rx = thumb_req_rx.clone();
         let tx = tx.clone();
         let thumb_cache = thumbnail_cache.clone();
+        let thumb_queue = thumb_queue.clone();
         thread::spawn(move || {
-            while let Ok(i) = thumb_req_rx.recv() {
+            while let Some(i) = thumb_queue.pop() {
                 if let Some(p) = paths.get(i) {
                     let cache_path = thumbnail_cache_path(&cache_base, p);
                     let mut result: Option<DynamicImage> = None;
@@ -443,11 +443,10 @@ fn model(app: &App) -> Model {
             }
         });
     }
-    drop(thumb_req_rx);
     let clip_engine = ClipEngine::new(
         cache_base.clone(),
         thumbnail_cache.clone(),
-        thumb_req_tx.clone(),
+        thumb_queue.clone(),
     )
     .unwrap_or_else(|err| {
         eprintln!("Failed to initialize CLIP: {err}");
@@ -583,10 +582,7 @@ fn model(app: &App) -> Model {
         thumb_cache: thumbnail_cache,
         thumb_has_xmp,
         thumb_rx: rx,
-        thumb_req_tx: thumb_req_tx.clone(),
-        thumb_pending: HashSet::new(),
-        thumb_usage: VecDeque::new(),
-        thumb_capacity: 0,
+        thumb_queue: thumb_queue.clone(),
         file_mod_times,
         file_watch_cursor: 0,
         full_req_tx,
@@ -602,6 +598,7 @@ fn model(app: &App) -> Model {
         zoom: 1.0,
         pan: vec2(0.0, 0.0),
         prev_window_rect: initial_rect,
+        prev_scroll: 0.0,
         fit_mode: false,
         selection_changed_at: Instant::now(),
         selection_pending: false,
@@ -1315,10 +1312,8 @@ fn update(app: &App, model: &mut Model, _update: Update) {
     detect_file_changes(app, model);
     // Receive thumbnails from background thread and create textures
     // Process incoming thumbnails
-    while let Ok((i, img)) = model.thumb_rx.try_recv() {
-        model.thumb_pending.remove(&i);
-        let tex = wgpu::Texture::from_image(app, &img);
-        insert_thumbnail_texture(model, i, tex);
+    while let Ok((i, _img)) = model.thumb_rx.try_recv() {
+        model.thumb_textures.remove(&i);
     }
     // Process loaded full-resolution tile data
     while let Ok(message) = model.full_resp_rx.try_recv() {
@@ -1453,39 +1448,13 @@ fn request_full_texture(model: &mut Model, idx: usize) {
     }
 }
 
-fn insert_thumbnail_texture(model: &mut Model, idx: usize, tex: wgpu::Texture) {
-    model.thumb_textures.insert(idx, tex);
-    touch_thumbnail(model, idx);
-    enforce_thumbnail_capacity(model);
-}
-
-fn touch_thumbnail(model: &mut Model, idx: usize) {
-    if let Some(pos) = model.thumb_usage.iter().position(|&v| v == idx) {
-        model.thumb_usage.remove(pos);
-    }
-    model.thumb_usage.push_front(idx);
-}
-
-fn enforce_thumbnail_capacity(model: &mut Model) {
-    while model.thumb_textures.len() > model.thumb_capacity {
-        if let Some(old_idx) = model.thumb_usage.pop_back() {
-            model.thumb_textures.remove(&old_idx);
-        } else {
-            break;
-        }
-    }
-}
-
 fn update_thumbnail_requests(app: &App, model: &mut Model) {
     if !matches!(model.mode, Mode::Thumbnails) {
         return;
     }
     let total = model.image_paths.len();
     if total == 0 {
-        model.thumb_capacity = 0;
-        model.thumb_usage.clear();
         model.thumb_textures.clear();
-        model.thumb_pending.clear();
         return;
     }
     let Some(rect) = current_window_rect(app, model) else {
@@ -1493,31 +1462,35 @@ fn update_thumbnail_requests(app: &App, model: &mut Model) {
     };
     let grid = ThumbnailGrid::new(model, rect);
     let visible = grid.visible_indices();
-    let required = visible.len();
-    let target_capacity = required
-        .saturating_add(THUMB_POOL_MARGIN)
-        .min(total)
-        .max(required);
-    if model.thumb_capacity != target_capacity {
-        model.thumb_capacity = target_capacity;
-        enforce_thumbnail_capacity(model);
+
+    let window_changed = if rect != model.prev_window_rect {
+        model.prev_window_rect = rect;
+        true
+    } else {
+        false
+    };
+    let scroll_changed = if (model.scroll_offset - model.prev_scroll).abs() > f32::EPSILON {
+        model.prev_scroll = model.scroll_offset;
+        true
+    } else {
+        false
+    };
+    if window_changed || scroll_changed {
+        model
+            .thumb_queue
+            .reprioritize(|idx| grid.viewport_priority(idx));
     }
-    let viewport_center = model.scroll_offset + rect.h() / 2.0;
-    let mut ordered = visible;
-    ordered.sort_by(|a, b| {
-        let da = grid.distance_from_center(*a, viewport_center);
-        let db = grid.distance_from_center(*b, viewport_center);
-        da.partial_cmp(&db).unwrap_or(Ordering::Equal)
-    });
-    for idx in ordered {
+    let desired: HashSet<usize> = visible.iter().copied().collect();
+    model.thumb_textures.retain(|idx, _| desired.contains(idx));
+    for idx in visible {
         if model.thumb_textures.contains_key(&idx) {
-            touch_thumbnail(model, idx);
-        } else if !model.thumb_pending.contains(&idx) {
-            model.thumb_pending.insert(idx);
-            let _ = model.thumb_req_tx.send(idx);
+            continue;
+        }
+        if let Some(img) = model.thumb_cache.try_clone_dynamic(idx) {
+            let tex = wgpu::Texture::from_image(app, &img);
+            model.thumb_textures.insert(idx, tex);
         }
     }
-    enforce_thumbnail_capacity(model);
 }
 
 fn detect_file_changes(app: &App, model: &mut Model) {
@@ -1569,16 +1542,7 @@ fn check_image_modification(model: &mut Model, idx: usize) {
 fn handle_image_modified(model: &mut Model, idx: usize) {
     model.thumb_cache.invalidate(idx);
     model.thumb_textures.remove(&idx);
-    model.thumb_pending.remove(&idx);
-    if let Some(pos) = model.thumb_usage.iter().position(|&i| i == idx) {
-        model.thumb_usage.remove(pos);
-    }
-    if model.thumb_pending.insert(idx) {
-        if let Err(err) = model.thumb_req_tx.send(idx) {
-            model.thumb_pending.remove(&idx);
-            eprintln!("failed to queue thumbnail regeneration for index {idx}: {err}");
-        }
-    }
+    model.thumb_queue.enqueue(idx);
 
     model.full_textures.remove(&idx);
     if let Some(pos) = model.full_usage.iter().position(|&i| i == idx) {

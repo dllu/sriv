@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Instant, SystemTime};
 use toml::Value as TomlValue;
 
@@ -25,6 +26,96 @@ pub struct KeyBinding {
     pub alt: bool,
     pub super_key: bool,
     pub command: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ThumbRequestQueue {
+    inner: Arc<ThumbQueueInner>,
+}
+
+#[derive(Debug)]
+struct ThumbQueueInner {
+    state: Mutex<ThumbQueueState>,
+    condvar: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct ThumbQueueState {
+    order: VecDeque<usize>,
+    members: HashSet<usize>,
+    closed: bool,
+}
+
+impl ThumbRequestQueue {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(ThumbQueueInner {
+                state: Mutex::new(ThumbQueueState::default()),
+                condvar: Condvar::new(),
+            }),
+        }
+    }
+
+    pub fn enqueue(&self, index: usize) {
+        self.enqueue_batch(std::iter::once(index));
+    }
+
+    pub fn enqueue_batch<I>(&self, indices: I)
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        let mut state = self.inner.state.lock().unwrap();
+        if state.closed {
+            return;
+        }
+        let mut inserted = false;
+        for index in indices {
+            if state.members.insert(index) {
+                state.order.push_back(index);
+                inserted = true;
+            }
+        }
+        if inserted {
+            self.inner.condvar.notify_all();
+        }
+    }
+
+    pub fn pop(&self) -> Option<usize> {
+        let mut state = self.inner.state.lock().unwrap();
+        loop {
+            if let Some(idx) = state.order.pop_front() {
+                state.members.remove(&idx);
+                return Some(idx);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self.inner.condvar.wait(state).unwrap();
+        }
+    }
+
+    pub fn reprioritize<F>(&self, mut priority: F)
+    where
+        F: FnMut(usize) -> f32,
+    {
+        let mut state = self.inner.state.lock().unwrap();
+        if state.order.len() <= 1 {
+            return;
+        }
+        let mut scored: Vec<(usize, f32)> =
+            state.order.iter().copied().map(|idx| (idx, priority(idx))).collect();
+        scored.sort_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        state.order.clear();
+        for (idx, _) in scored {
+            state.order.push_back(idx);
+        }
+    }
+
+    pub fn close(&self) {
+        let mut state = self.inner.state.lock().unwrap();
+        state.closed = true;
+        self.inner.condvar.notify_all();
+    }
 }
 
 fn parse_binding_spec(spec: &str, command: &str) -> Option<KeyBinding> {
@@ -160,6 +251,12 @@ impl TiledTexture {
     }
 }
 
+impl Drop for Model {
+    fn drop(&mut self) {
+        self.thumb_queue.close();
+    }
+}
+
 #[derive(Debug)]
 pub struct Model {
     pub image_paths: Vec<PathBuf>,
@@ -167,10 +264,7 @@ pub struct Model {
     pub thumb_cache: ThumbnailCache,
     pub thumb_has_xmp: Vec<bool>,
     pub thumb_rx: Receiver<(usize, DynamicImage)>,
-    pub thumb_req_tx: CbSender<usize>,
-    pub thumb_pending: HashSet<usize>,
-    pub thumb_usage: VecDeque<usize>,
-    pub thumb_capacity: usize,
+    pub thumb_queue: ThumbRequestQueue,
     pub file_mod_times: Vec<Option<SystemTime>>,
     pub file_watch_cursor: usize,
     pub full_req_tx: CbSender<usize>,
@@ -186,6 +280,7 @@ pub struct Model {
     pub zoom: f32,
     pub pan: Vec2,
     pub prev_window_rect: Rect,
+    pub prev_scroll: f32,
     pub fit_mode: bool,
     pub selection_changed_at: Instant,
     pub selection_pending: bool,

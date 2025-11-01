@@ -135,13 +135,17 @@ impl ThumbnailGrid {
         remaining.min(self.cols)
     }
 
-    pub fn distance_from_center(&self, idx: usize, viewport_center: f32) -> f32 {
-        if self.cols == 0 {
+    pub fn viewport_priority(&self, idx: usize) -> f32 {
+        if self.cols == 0 || idx >= self.total {
             return f32::MAX;
         }
-        let row = (idx / self.cols) as f32;
-        let center = row * self.cell + self.cell / 2.0;
-        (center - viewport_center).abs()
+        let row = idx / self.cols;
+        let col = idx % self.cols;
+        let row_center = row as f32 * self.cell + self.cell / 2.0;
+        let viewport_center = self.scroll + self.rect.h() / 2.0;
+        let vertical = (row_center - viewport_center).abs();
+        let horizontal = self.col_center_x(col).abs();
+        vertical + horizontal * 0.01
     }
 
     fn row_base_y(&self, row: usize) -> f32 {

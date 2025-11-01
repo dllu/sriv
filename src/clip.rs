@@ -19,6 +19,7 @@ use sha1::Sha1;
 use tokenizers::Tokenizer;
 
 use crate::adjust_orientation;
+use crate::state::ThumbRequestQueue;
 
 const MAX_IMAGE_BATCH: usize = 16;
 
@@ -95,13 +96,22 @@ impl ThumbnailCache {
         self.store_rgb_image(index, image.to_rgb8());
     }
 
-    pub fn wait_for(&self, index: usize, thumb_req_tx: &Sender<usize>) -> Result<RgbImage> {
+    pub fn try_clone_dynamic(&self, index: usize) -> Option<DynamicImage> {
+        let slots = self.inner.slots.lock().ok()?;
+        let slot = slots.get(&index)?.clone();
+        drop(slots);
+        let state = slot.state.lock().ok()?;
+        state.image.as_ref().map(|rgb| {
+            let dyn_img = DynamicImage::ImageRgb8(rgb.clone());
+            DynamicImage::ImageRgba8(dyn_img.into_rgba8())
+        })
+    }
+
+    pub fn wait_for(&self, index: usize, thumb_queue: &ThumbRequestQueue) -> Result<RgbImage> {
         let slot = self.slot(index);
         let mut state = slot.state.lock().unwrap();
         if state.image.is_none() && !state.requested {
-            thumb_req_tx
-                .send(index)
-                .map_err(|err| anyhow!("failed to request thumbnail {index}: {err}"))?;
+            thumb_queue.enqueue(index);
             state.requested = true;
         }
         let mut waited = Duration::from_millis(0);
@@ -120,9 +130,7 @@ impl ThumbnailCache {
                     return Err(anyhow!("timed out waiting for thumbnail index {index}"));
                 }
                 if !state.requested {
-                    thumb_req_tx
-                        .send(index)
-                        .map_err(|err| anyhow!("failed to request thumbnail {index}: {err}"))?;
+                    thumb_queue.enqueue(index);
                     state.requested = true;
                 }
             }
@@ -180,14 +188,14 @@ struct ClipWorkerContext {
     result_tx: Sender<ClipEvent>,
     device_flag: Arc<AtomicBool>,
     thumb_cache: ThumbnailCache,
-    thumb_req_tx: Sender<usize>,
+    thumb_queue: ThumbRequestQueue,
 }
 
 impl ClipEngine {
     pub fn new(
         cache_base: PathBuf,
         thumb_cache: ThumbnailCache,
-        thumb_req_tx: Sender<usize>,
+        thumb_queue: ThumbRequestQueue,
     ) -> Result<Self> {
         let (job_tx, job_rx) = unbounded::<ClipJob>();
         let (result_tx, result_rx) = unbounded::<ClipEvent>();
@@ -206,7 +214,7 @@ impl ClipEngine {
                 result_tx: result_tx.clone(),
                 device_flag: using_cuda.clone(),
                 thumb_cache: thumb_cache.clone(),
-                thumb_req_tx: thumb_req_tx.clone(),
+                thumb_queue: thumb_queue.clone(),
             };
             let worker_rx = job_rx.clone();
             thread::Builder::new()
@@ -272,7 +280,7 @@ fn run_worker(ctx: ClipWorkerContext, job_rx: Receiver<ClipJob>, use_cuda: bool)
         result_tx,
         device_flag,
         thumb_cache,
-        thumb_req_tx,
+        thumb_queue,
     } = ctx;
     let device = if use_cuda {
         match Device::new_cuda(0) {
@@ -338,7 +346,7 @@ fn run_worker(ctx: ClipWorkerContext, job_rx: Receiver<ClipJob>, use_cuda: bool)
                 let batch_ctx = ImageBatchContext {
                     cache_base: &cache_base,
                     thumb_cache: &thumb_cache,
-                    thumb_req_tx: &thumb_req_tx,
+                    thumb_queue: &thumb_queue,
                     model: &model,
                     device: &device,
                     clip_image_size: config.image_size,
@@ -354,9 +362,10 @@ fn run_worker(ctx: ClipWorkerContext, job_rx: Receiver<ClipJob>, use_cuda: bool)
                             index,
                             image_path,
                             thumb_size,
-                        } => {
-                            process_image_batch(vec![(index, image_path, thumb_size)], &batch_ctx);
-                        }
+                        } => process_image_batch(
+                            vec![(index, image_path, thumb_size)],
+                            &batch_ctx,
+                        ),
                     }
                 }
                 if channel_closed {
@@ -411,7 +420,7 @@ fn process_image_batch(batch: Vec<(usize, PathBuf, u32)>, ctx: &ImageBatchContex
                     .send(ClipEvent::ImageReady { index, embedding });
             }
             Ok(None) => {
-                let thumb = match ctx.thumb_cache.wait_for(index, ctx.thumb_req_tx) {
+                let thumb = match ctx.thumb_cache.wait_for(index, ctx.thumb_queue) {
                     Ok(img) => Ok(img),
                     Err(wait_err) => generate_thumbnail(&image_path, thumb_size).map_err(
                         |gen_err| {
@@ -508,7 +517,7 @@ fn report_batch_error(indices: &[usize], result_tx: &Sender<ClipEvent>, err: imp
 struct ImageBatchContext<'a> {
     cache_base: &'a Path,
     thumb_cache: &'a ThumbnailCache,
-    thumb_req_tx: &'a Sender<usize>,
+    thumb_queue: &'a ThumbRequestQueue,
     model: &'a ClipModel,
     device: &'a Device,
     clip_image_size: usize,
