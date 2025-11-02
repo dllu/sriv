@@ -5,7 +5,6 @@ use nannou::event::{ModifiersState, MouseButton, MouseScrollDelta, TouchPhase, U
 use nannou::image::imageops::crop_imm;
 use nannou::image::{self, DynamicImage, GenericImageView, RgbaImage};
 use nannou::prelude::*;
-use nannou::wgpu;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -571,11 +570,11 @@ fn model(app: &App) -> Model {
     let mut model = Model {
         image_paths,
         thumb_visible: HashMap::new(),
-        thumb_pool: Vec::new(),
         thumb_data: HashMap::new(),
         thumb_has_xmp,
         thumb_rx: thumb_rx,
         thumb_queue: thumb_queue.clone(),
+        next_thumb_generation: 0,
         file_mod_times,
         file_watch_cursor: 0,
         full_req_tx,
@@ -1460,7 +1459,6 @@ fn update_thumbnail_requests(app: &App, model: &mut Model) {
     let total = model.image_paths.len();
     if total == 0 {
         model.thumb_visible.clear();
-        model.thumb_pool.clear();
         return;
     }
     let Some(rect) = current_window_rect(app, model) else {
@@ -1490,7 +1488,6 @@ fn update_thumbnail_requests(app: &App, model: &mut Model) {
     let mut to_remove = Vec::new();
     for idx in model.thumb_visible.keys() {
         if !visible_set.contains(idx) {
-            eprintln!("Removing {}", idx);
             to_remove.push(*idx);
         }
     }
@@ -1507,12 +1504,16 @@ fn update_thumbnail_requests(app: &App, model: &mut Model) {
         if let Some(entry) = model.thumb_data.get(&idx) {
             let texture = wgpu::Texture::from_image(app, &entry.image);
             let size = texture.size();
+            let generation = model.next_thumb_generation;
+            model.next_thumb_generation = model.next_thumb_generation.wrapping_add(1);
             model.thumb_visible.insert(
                 idx,
                 ThumbnailTexture {
+                    idx,
                     texture,
                     center,
                     size,
+                    generation,
                 },
             );
         }
@@ -1541,17 +1542,6 @@ fn handle_thumbnail_update(app: &App, model: &mut Model, update: ThumbnailUpdate
             clip_embedding: final_embedding,
         },
     );
-    if model.thumb_visible.contains_key(&index) {
-        let texture = {
-            let entry = model.thumb_data.get(&index).unwrap();
-            wgpu::Texture::from_image(app, &entry.image)
-        };
-        let size = texture.size();
-        if let Some(slot) = model.thumb_visible.get_mut(&index) {
-            slot.texture = texture;
-            slot.size = size;
-        }
-    }
     if has_embedding {
         model.clip_missing.remove(&index);
         model.clip_inflight.remove(&index);
@@ -1611,9 +1601,7 @@ fn check_image_modification(model: &mut Model, idx: usize) {
 fn handle_image_modified(model: &mut Model, idx: usize) {
     model.thumb_data.remove(&idx);
     model.pending_clip_embeddings.remove(&idx);
-    if let Some(slot) = model.thumb_visible.remove(&idx) {
-        model.thumb_pool.push(slot);
-    }
+    model.thumb_visible.remove(&idx);
     model.thumb_queue.enqueue(idx);
 
     model.full_textures.remove(&idx);
@@ -1679,9 +1667,30 @@ fn view(app: &App, model: &Model, frame: Frame) {
                             let [tw, th] = slot.size;
                             let w = tw as f32;
                             let h = th as f32;
-                            draw.texture(&slot.texture)
+                            let lod_variation =
+                                1.0 + ((slot.generation % 1_000_000) as f32) / 1_000_000.0;
+                            // nannou caches bind groups by (texture_id, sampler_desc); without the
+                            // generation in the sampler, a recycled texture ID could re-use a stale
+                            // bind group pointing at old GPU contents.
+                            let sampler_desc = wgpu::SamplerDescriptor {
+                                label: Some("thumbnail-sampler"),
+                                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                                address_mode_w: wgpu::AddressMode::ClampToEdge,
+                                mag_filter: wgpu::FilterMode::Linear,
+                                min_filter: wgpu::FilterMode::Linear,
+                                mipmap_filter: wgpu::FilterMode::Nearest,
+                                lod_min_clamp: 0.0,
+                                lod_max_clamp: lod_variation,
+                                compare: None,
+                                anisotropy_clamp: 1,
+                                border_color: None,
+                            };
+                            draw.sampler(sampler_desc)
+                                .texture(&slot.texture)
                                 .x_y(center.x, center.y)
                                 .w_h(w, h);
+
                             if model.thumb_has_xmp.get(i).copied().unwrap_or(false) {
                                 let icon_w = 40.0;
                                 let icon_h = 20.0;

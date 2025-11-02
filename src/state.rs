@@ -272,11 +272,11 @@ pub struct ThumbnailUpdate {
 pub struct Model {
     pub image_paths: Vec<PathBuf>,
     pub thumb_visible: HashMap<usize, ThumbnailTexture>,
-    pub thumb_pool: Vec<ThumbnailTexture>,
     pub thumb_data: HashMap<usize, ThumbnailEntry>,
     pub thumb_has_xmp: Vec<bool>,
     pub thumb_rx: Receiver<ThumbnailUpdate>,
     pub thumb_queue: ThumbRequestQueue,
+    pub next_thumb_generation: u64,
     pub file_mod_times: Vec<Option<SystemTime>>,
     pub file_watch_cursor: usize,
     pub full_req_tx: CbSender<usize>,
@@ -317,7 +317,9 @@ impl Drop for Model {
 
 #[derive(Debug)]
 pub struct ThumbnailTexture {
+    pub idx: usize,
     pub texture: wgpu::Texture,
     pub center: Vec2,
     pub size: [u32; 2],
+    pub generation: u64,
 }
