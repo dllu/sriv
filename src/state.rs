@@ -317,7 +317,6 @@ impl Drop for Model {
 
 #[derive(Debug)]
 pub struct ThumbnailTexture {
-    pub idx: usize,
     pub texture: wgpu::Texture,
     pub center: Vec2,
     pub size: [u32; 2],

@@ -572,7 +572,7 @@ fn model(app: &App) -> Model {
         thumb_visible: HashMap::new(),
         thumb_data: HashMap::new(),
         thumb_has_xmp,
-        thumb_rx: thumb_rx,
+        thumb_rx,
         thumb_queue: thumb_queue.clone(),
         next_thumb_generation: 0,
         file_mod_times,
@@ -1509,7 +1509,6 @@ fn update_thumbnail_requests(app: &App, model: &mut Model) {
             model.thumb_visible.insert(
                 idx,
                 ThumbnailTexture {
-                    idx,
                     texture,
                     center,
                     size,
