@@ -672,7 +672,6 @@ fn ensure_thumbnail_visible(app: &App, model: &mut Model, idx: usize) {
             scroll = bottom - view_height;
         }
         model.scroll_offset = scroll.clamp(0.0, grid.max_scroll());
-        eprintln!("Scrolling to {}", model.scroll_offset);
     }
 }
 
