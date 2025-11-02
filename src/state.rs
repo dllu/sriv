@@ -1,4 +1,4 @@
-use crate::clip::{ClipEngine, ThumbnailCache};
+use crate::clip::ClipEngine;
 use crate::FullImageMessage;
 use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender};
 use nannou::image::DynamicImage;
@@ -102,8 +102,12 @@ impl ThumbRequestQueue {
         if state.order.len() <= 1 {
             return;
         }
-        let mut scored: Vec<(usize, f32)> =
-            state.order.iter().copied().map(|idx| (idx, priority(idx))).collect();
+        let mut scored: Vec<(usize, f32)> = state
+            .order
+            .iter()
+            .copied()
+            .map(|idx| (idx, priority(idx)))
+            .collect();
         scored.sort_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         state.order.clear();
         for (idx, _) in scored {
@@ -251,19 +255,27 @@ impl TiledTexture {
     }
 }
 
-impl Drop for Model {
-    fn drop(&mut self) {
-        self.thumb_queue.close();
-    }
+#[derive(Debug)]
+pub struct ThumbnailEntry {
+    pub image: DynamicImage,
+    pub clip_embedding: Option<Vec<f32>>,
+}
+
+#[derive(Debug)]
+pub struct ThumbnailUpdate {
+    pub index: usize,
+    pub image: DynamicImage,
+    pub clip_embedding: Option<Vec<f32>>,
 }
 
 #[derive(Debug)]
 pub struct Model {
     pub image_paths: Vec<PathBuf>,
-    pub thumb_textures: HashMap<usize, wgpu::Texture>,
-    pub thumb_cache: ThumbnailCache,
+    pub thumb_visible: HashMap<usize, ThumbnailTexture>,
+    pub thumb_pool: Vec<ThumbnailTexture>,
+    pub thumb_data: HashMap<usize, ThumbnailEntry>,
     pub thumb_has_xmp: Vec<bool>,
-    pub thumb_rx: Receiver<(usize, DynamicImage)>,
+    pub thumb_rx: Receiver<ThumbnailUpdate>,
     pub thumb_queue: ThumbRequestQueue,
     pub file_mod_times: Vec<Option<SystemTime>>,
     pub file_watch_cursor: usize,
@@ -289,10 +301,23 @@ pub struct Model {
     pub command_rx: Receiver<String>,
     pub command_output: Option<String>,
     pub clip_engine: ClipEngine,
-    pub clip_embeddings: Vec<Option<Vec<f32>>>,
     pub clip_missing: HashSet<usize>,
     pub clip_inflight: HashSet<usize>,
+    pub pending_clip_embeddings: HashMap<usize, Vec<f32>>,
     pub next_search_request_id: u64,
     pub search: Option<SearchState>,
     pub window_id: WindowId,
+}
+
+impl Drop for Model {
+    fn drop(&mut self) {
+        self.thumb_queue.close();
+    }
+}
+
+#[derive(Debug)]
+pub struct ThumbnailTexture {
+    pub texture: wgpu::Texture,
+    pub center: Vec2,
+    pub size: [u32; 2],
 }

@@ -20,11 +20,11 @@ mod clip;
 mod grid;
 mod state;
 
-use clip::{ClipEngine, ClipEvent, ThumbnailCache};
+use clip::{ClipEngine, ClipEvent};
 use grid::ThumbnailGrid;
 use state::{
-    parse_bindings, FullPendingState, Mode, Model, SearchState, ThumbRequestQueue, Tile,
-    TiledTexture,
+    parse_bindings, FullPendingState, Mode, Model, SearchState, ThumbRequestQueue, ThumbnailEntry,
+    ThumbnailTexture, ThumbnailUpdate, Tile, TiledTexture,
 };
 
 type FullImageTile = (u32, u32, u32, u32, Vec<u8>);
@@ -78,8 +78,8 @@ fn mouse_pressed(app: &App, model: &mut Model, button: MouseButton) {
                         let center = grid.index_center(i).unwrap();
                         let x = center.x;
                         let y = center.y;
-                        let (width, height) = if let Some(tex) = model.thumb_textures.get(&i) {
-                            let [tw, th] = tex.size();
+                        let (width, height) = if let Some(slot) = model.thumb_visible.get(&i) {
+                            let [tw, th] = slot.size;
                             (tw as f32, th as f32)
                         } else {
                             let size = model.thumb_size as f32;
@@ -375,23 +375,27 @@ fn model(app: &App) -> Model {
             }
         }
     }
-    let thumbnail_cache = ThumbnailCache::new();
     let mut file_mod_times = Vec::with_capacity(image_paths.len());
     for path in &image_paths {
         file_mod_times.push(current_mod_time(path));
     }
     // Channel for receiving thumbnails from background threads.
-    let (tx, rx) = channel::<(usize, DynamicImage)>();
+    let (thumb_tx, thumb_rx) = channel::<ThumbnailUpdate>();
     let thumb_queue = ThumbRequestQueue::new();
     thumb_queue.enqueue_batch(0..image_paths.len());
     let num_workers = rayon::current_num_threads().clamp(1, 8);
     let shared_paths = Arc::new(image_paths.clone());
+    let clip_engine = ClipEngine::new(cache_base.clone()).unwrap_or_else(|err| {
+        eprintln!("Failed to initialize CLIP: {err}");
+        std::process::exit(1);
+    });
+    let clip_sender = clip_engine.request_sender();
     for _ in 0..num_workers {
         let paths = Arc::clone(&shared_paths);
         let cache_base = cache_base.clone();
-        let tx = tx.clone();
-        let thumb_cache = thumbnail_cache.clone();
+        let tx = thumb_tx.clone();
         let thumb_queue = thumb_queue.clone();
+        let clip_sender = clip_sender.clone();
         thread::spawn(move || {
             while let Some(i) = thumb_queue.pop() {
                 if let Some(p) = paths.get(i) {
@@ -437,53 +441,41 @@ fn model(app: &App) -> Model {
                             image::Rgba([128, 128, 128, 255]),
                         ))
                     });
-                    thumb_cache.store_dynamic(i, &image);
-                    let _ = tx.send((i, image));
+                    let clip_embedding = match clip::load_cached_embedding(&cache_base, p) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            eprintln!(
+                                "Failed to load cached CLIP embedding for {}: {}",
+                                p.display(),
+                                err
+                            );
+                            None
+                        }
+                    };
+                    if clip_embedding.is_none() {
+                        let clip_thumb = image.to_rgb8();
+                        if let Err(err) = clip_sender.queue_image(i, p.clone(), clip_thumb) {
+                            eprintln!(
+                                "Failed to queue CLIP embedding for {}: {}",
+                                p.display(),
+                                err
+                            );
+                        }
+                    }
+                    let update = ThumbnailUpdate {
+                        index: i,
+                        image,
+                        clip_embedding,
+                    };
+                    if tx.send(update).is_err() {
+                        break;
+                    }
                 }
             }
         });
     }
-    let clip_engine = ClipEngine::new(
-        cache_base.clone(),
-        thumbnail_cache.clone(),
-        thumb_queue.clone(),
-    )
-    .unwrap_or_else(|err| {
-        eprintln!("Failed to initialize CLIP: {err}");
-        std::process::exit(1);
-    });
-    let mut clip_embeddings = Vec::with_capacity(image_paths.len());
-    let mut clip_missing: HashSet<usize> = HashSet::new();
-    let mut clip_inflight: HashSet<usize> = HashSet::new();
-    for (idx, path) in image_paths.iter().enumerate() {
-        match clip_engine.load_cached_embedding(path) {
-            Ok(Some(vec)) => clip_embeddings.push(Some(vec)),
-            Ok(None) => {
-                clip_embeddings.push(None);
-                clip_missing.insert(idx);
-            }
-            Err(err) => {
-                eprintln!(
-                    "Failed to load cached CLIP embedding for {}: {}",
-                    path.display(),
-                    err
-                );
-                clip_embeddings.push(None);
-                clip_missing.insert(idx);
-            }
-        }
-    }
-    for &idx in clip_missing.iter() {
-        if let Err(err) = clip_engine.ensure_embedding(idx, &image_paths[idx], thumb_size) {
-            eprintln!(
-                "Failed to queue CLIP embedding for {}: {}",
-                image_paths[idx].display(),
-                err
-            );
-        } else {
-            clip_inflight.insert(idx);
-        }
-    }
+    let clip_missing: HashSet<usize> = (0..image_paths.len()).collect();
+    let clip_inflight: HashSet<usize> = HashSet::new();
     // Create the window first, so textures can reference a focused window.
     let window_id = app
         .new_window()
@@ -578,10 +570,11 @@ fn model(app: &App) -> Model {
     let (command_tx, command_rx) = channel::<String>();
     let mut model = Model {
         image_paths,
-        thumb_textures: HashMap::new(),
-        thumb_cache: thumbnail_cache,
+        thumb_visible: HashMap::new(),
+        thumb_pool: Vec::new(),
+        thumb_data: HashMap::new(),
         thumb_has_xmp,
-        thumb_rx: rx,
+        thumb_rx: thumb_rx,
         thumb_queue: thumb_queue.clone(),
         file_mod_times,
         file_watch_cursor: 0,
@@ -609,9 +602,9 @@ fn model(app: &App) -> Model {
         command_rx,
         command_output: None,
         clip_engine,
-        clip_embeddings,
         clip_missing,
         clip_inflight,
+        pending_clip_embeddings: HashMap::new(),
         next_search_request_id: 0,
         search: None,
         window_id,
@@ -680,6 +673,7 @@ fn ensure_thumbnail_visible(app: &App, model: &mut Model, idx: usize) {
             scroll = bottom - view_height;
         }
         model.scroll_offset = scroll.clamp(0.0, grid.max_scroll());
+        eprintln!("Scrolling to {}", model.scroll_offset);
     }
 }
 
@@ -726,8 +720,14 @@ fn handle_text_result(app: &App, model: &mut Model, request_id: u64, embedding: 
         search.last_embedding = Some(embedding);
         if let Some(text_embed) = search.last_embedding.as_ref() {
             let mut scored = Vec::new();
-            for (idx, maybe_embed) in model.clip_embeddings.iter().enumerate() {
-                if let Some(img_embed) = maybe_embed {
+            for idx in 0..model.image_paths.len() {
+                if let Some(entry) = model.thumb_data.get(&idx) {
+                    if let Some(img_embed) = entry.clip_embedding.as_ref() {
+                        scored.push((idx, cosine_similarity(text_embed, img_embed)));
+                        continue;
+                    }
+                }
+                if let Some(img_embed) = model.pending_clip_embeddings.get(&idx) {
                     scored.push((idx, cosine_similarity(text_embed, img_embed)));
                 }
             }
@@ -754,9 +754,10 @@ fn update_search_with_image_embedding(app: &App, model: &mut Model, index: usize
         if let (Some(text_embed), Some(img_embed)) = (
             search.last_embedding.as_ref(),
             model
-                .clip_embeddings
-                .get(index)
-                .and_then(|item| item.as_ref()),
+                .thumb_data
+                .get(&index)
+                .and_then(|entry| entry.clip_embedding.as_ref())
+                .or_else(|| model.pending_clip_embeddings.get(&index)),
         ) {
             let had_results = !search.results.is_empty();
             let score = cosine_similarity(text_embed, img_embed);
@@ -1263,16 +1264,24 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
 
 /// Update function to process incoming thumbnail images.
 fn update(app: &App, model: &mut Model, _update: Update) {
+    while let Ok(update) = model.thumb_rx.try_recv() {
+        handle_thumbnail_update(app, model, update);
+    }
     loop {
         match model.clip_engine.try_recv() {
             Ok(event) => match event {
                 ClipEvent::ImageReady { index, embedding } => {
-                    if let Some(slot) = model.clip_embeddings.get_mut(index) {
-                        *slot = Some(embedding);
+                    if let Some(entry) = model.thumb_data.get_mut(&index) {
+                        entry.clip_embedding = Some(embedding);
+                        model.pending_clip_embeddings.remove(&index);
+                        model.clip_missing.remove(&index);
+                        model.clip_inflight.remove(&index);
+                        update_search_with_image_embedding(app, model, index);
+                    } else {
+                        model.pending_clip_embeddings.insert(index, embedding);
+                        model.clip_inflight.remove(&index);
+                        model.clip_missing.remove(&index);
                     }
-                    model.clip_missing.remove(&index);
-                    model.clip_inflight.remove(&index);
-                    update_search_with_image_embedding(app, model, index);
                 }
                 ClipEvent::ImageError { index, error } => {
                     model.clip_inflight.remove(&index);
@@ -1310,11 +1319,7 @@ fn update(app: &App, model: &mut Model, _update: Update) {
         model.command_output = Some(msg);
     }
     detect_file_changes(app, model);
-    // Receive thumbnails from background thread and create textures
-    // Process incoming thumbnails
-    while let Ok((i, _img)) = model.thumb_rx.try_recv() {
-        model.thumb_textures.remove(&i);
-    }
+
     // Process loaded full-resolution tile data
     while let Ok(message) = model.full_resp_rx.try_recv() {
         match message {
@@ -1454,7 +1459,8 @@ fn update_thumbnail_requests(app: &App, model: &mut Model) {
     }
     let total = model.image_paths.len();
     if total == 0 {
-        model.thumb_textures.clear();
+        model.thumb_visible.clear();
+        model.thumb_pool.clear();
         return;
     }
     let Some(rect) = current_window_rect(app, model) else {
@@ -1480,16 +1486,79 @@ fn update_thumbnail_requests(app: &App, model: &mut Model) {
             .thumb_queue
             .reprioritize(|idx| grid.viewport_priority(idx));
     }
-    let desired: HashSet<usize> = visible.iter().copied().collect();
-    model.thumb_textures.retain(|idx, _| desired.contains(idx));
+    let visible_set: HashSet<usize> = visible.iter().copied().collect();
+    let mut to_remove = Vec::new();
+    for idx in model.thumb_visible.keys() {
+        if !visible_set.contains(idx) {
+            eprintln!("Removing {}", idx);
+            to_remove.push(*idx);
+        }
+    }
+    for idx in to_remove {
+        model.thumb_visible.remove(&idx);
+    }
+
     for idx in visible {
-        if model.thumb_textures.contains_key(&idx) {
+        let center = grid.index_center(idx).unwrap_or(vec2(0.0, 0.0));
+        if let Some(slot) = model.thumb_visible.get_mut(&idx) {
+            slot.center = center;
             continue;
         }
-        if let Some(img) = model.thumb_cache.try_clone_dynamic(idx) {
-            let tex = wgpu::Texture::from_image(app, &img);
-            model.thumb_textures.insert(idx, tex);
+        if let Some(entry) = model.thumb_data.get(&idx) {
+            let texture = wgpu::Texture::from_image(app, &entry.image);
+            let size = texture.size();
+            model.thumb_visible.insert(
+                idx,
+                ThumbnailTexture {
+                    texture,
+                    center,
+                    size,
+                },
+            );
         }
+    }
+}
+
+fn handle_thumbnail_update(app: &App, model: &mut Model, update: ThumbnailUpdate) {
+    let ThumbnailUpdate {
+        index,
+        image,
+        clip_embedding,
+    } = update;
+    let mut final_embedding = clip_embedding;
+    if final_embedding.is_none() {
+        if let Some(pending) = model.pending_clip_embeddings.remove(&index) {
+            final_embedding = Some(pending);
+        }
+    } else {
+        model.pending_clip_embeddings.remove(&index);
+    }
+    let has_embedding = final_embedding.is_some();
+    model.thumb_data.insert(
+        index,
+        ThumbnailEntry {
+            image,
+            clip_embedding: final_embedding,
+        },
+    );
+    if model.thumb_visible.contains_key(&index) {
+        let texture = {
+            let entry = model.thumb_data.get(&index).unwrap();
+            wgpu::Texture::from_image(app, &entry.image)
+        };
+        let size = texture.size();
+        if let Some(slot) = model.thumb_visible.get_mut(&index) {
+            slot.texture = texture;
+            slot.size = size;
+        }
+    }
+    if has_embedding {
+        model.clip_missing.remove(&index);
+        model.clip_inflight.remove(&index);
+        update_search_with_image_embedding(app, model, index);
+    } else {
+        model.clip_missing.remove(&index);
+        model.clip_inflight.insert(index);
     }
 }
 
@@ -1502,7 +1571,7 @@ fn detect_file_changes(app: &App, model: &mut Model) {
     candidates.insert(model.current);
     if matches!(model.mode, Mode::Thumbnails) {
         if let Some(rect) = current_window_rect(app, model) {
-            for idx in visible_thumbnail_indices(model, rect) {
+            for idx in ThumbnailGrid::new(model, rect).visible_indices() {
                 candidates.insert(idx);
             }
         }
@@ -1540,8 +1609,11 @@ fn check_image_modification(model: &mut Model, idx: usize) {
 }
 
 fn handle_image_modified(model: &mut Model, idx: usize) {
-    model.thumb_cache.invalidate(idx);
-    model.thumb_textures.remove(&idx);
+    model.thumb_data.remove(&idx);
+    model.pending_clip_embeddings.remove(&idx);
+    if let Some(slot) = model.thumb_visible.remove(&idx) {
+        model.thumb_pool.push(slot);
+    }
     model.thumb_queue.enqueue(idx);
 
     model.full_textures.remove(&idx);
@@ -1553,26 +1625,8 @@ fn handle_image_modified(model: &mut Model, idx: usize) {
         request_full_texture(model, idx);
     }
 
-    if let Some(slot) = model.clip_embeddings.get_mut(idx) {
-        *slot = None;
-    }
     model.clip_missing.insert(idx);
     model.clip_inflight.remove(&idx);
-    if idx < model.image_paths.len() {
-        if let Err(err) =
-            model
-                .clip_engine
-                .ensure_embedding(idx, &model.image_paths[idx], model.thumb_size)
-        {
-            eprintln!(
-                "failed to requeue CLIP embedding after change for {}: {}",
-                model.image_paths[idx].display(),
-                err
-            );
-        } else {
-            model.clip_inflight.insert(idx);
-        }
-    }
 }
 
 fn current_mod_time(path: &Path) -> Option<SystemTime> {
@@ -1583,9 +1637,6 @@ fn current_window_rect(app: &App, model: &Model) -> Option<Rect> {
     app.window(model.window_id).map(|w| w.rect())
 }
 
-fn visible_thumbnail_indices(model: &Model, rect: Rect) -> Vec<usize> {
-    ThumbnailGrid::new(model, rect).visible_indices()
-}
 /// Apply fit-to-window for current single-image view
 fn apply_fit(app: &App, model: &mut Model) {
     model.fit_mode = true;
@@ -1623,11 +1674,14 @@ fn view(app: &App, model: &Model, frame: Frame) {
                             Some(c) => c,
                             None => continue,
                         };
-                        if let Some(tex) = model.thumb_textures.get(&i) {
-                            let [tw, th] = tex.size();
+
+                        if let Some(slot) = model.thumb_visible.get(&i) {
+                            let [tw, th] = slot.size;
                             let w = tw as f32;
                             let h = th as f32;
-                            draw.texture(tex).x_y(center.x, center.y).w_h(w, h);
+                            draw.texture(&slot.texture)
+                                .x_y(center.x, center.y)
+                                .w_h(w, h);
                             if model.thumb_has_xmp.get(i).copied().unwrap_or(false) {
                                 let icon_w = 40.0;
                                 let icon_h = 20.0;
