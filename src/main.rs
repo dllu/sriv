@@ -1,14 +1,11 @@
 use ::image as image_rs;
 use ::image::imageops::FilterType as ImageRsFilterType;
+use ::image::{self, DynamicImage, RgbaImage};
 use anyhow::{anyhow, Result};
 use crossbeam_channel::unbounded;
 use libheif_rs::{ColorSpace as HeifColorSpace, HeifContext, LibHeif, Plane, RgbChroma};
-use nannou::event::{ModifiersState, MouseButton, MouseScrollDelta, TouchPhase, Update};
-use nannou::image::{self, DynamicImage, RgbaImage};
-use nannou::prelude::*;
-use nannou::text;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
@@ -20,12 +17,24 @@ use std::sync::mpsc::channel;
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
+use winit::application::ApplicationHandler;
+use winit::dpi::LogicalSize;
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::keyboard::ModifiersState;
+use winit::window::{Fullscreen, Window};
 mod clip;
+mod geometry;
 mod grid;
+mod input;
+mod renderer;
 mod state;
 
 use clip::{ClipEngine, ClipEvent};
+use geometry::{srgba, vec2, Rect, Rgba, Vec2, WHITE};
 use grid::ThumbnailGrid;
+use input::Key;
+use renderer::{Renderer, Scene};
 use state::{
     parse_bindings, parse_ui_font_path, CommandEvent, FullPendingState, Mode, Model, SearchState,
     TerminalSession, TerminalState, ThumbRequestQueue, ThumbnailEntry, ThumbnailTexture,
@@ -67,6 +76,63 @@ const TERMINAL_CELL_HEIGHT: f32 = 18.0;
 const TERMINAL_SCROLLBACK: usize = 4_000;
 const TERMINAL_NOMINAL_ROWS: u16 = 240;
 
+#[derive(Clone, Copy, Debug)]
+enum UserEvent {
+    Wake,
+}
+
+#[derive(Clone)]
+struct AppProxy(EventLoopProxy<UserEvent>);
+
+impl AppProxy {
+    fn wakeup(&self) -> std::result::Result<(), winit::event_loop::EventLoopClosed<UserEvent>> {
+        self.0.send_event(UserEvent::Wake)
+    }
+}
+
+#[derive(Default)]
+struct Keys {
+    mods: ModifiersState,
+}
+
+#[derive(Default)]
+struct Mouse {
+    position: Vec2,
+}
+
+impl Mouse {
+    fn position(&self) -> Vec2 {
+        self.position
+    }
+}
+
+struct App {
+    window: Arc<Window>,
+    proxy: AppProxy,
+    keys: Keys,
+    mouse: Mouse,
+    rect: Rect,
+    exit_requested: Cell<bool>,
+}
+
+impl App {
+    fn create_proxy(&self) -> AppProxy {
+        self.proxy.clone()
+    }
+
+    fn quit(&self) {
+        self.exit_requested.set(true);
+    }
+
+    fn update_rect(&mut self) {
+        let logical = self
+            .window
+            .inner_size()
+            .to_logical::<f32>(self.window.scale_factor());
+        self.rect = Rect::from_w_h(logical.width, logical.height);
+    }
+}
+
 const IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "bmp", "tiff", "gif", "webp", "tif", "heif", "heic",
 ];
@@ -92,18 +158,6 @@ fn is_supported_image_path(path: &Path) -> bool {
     extension_lower(path)
         .as_deref()
         .is_some_and(|ext| IMAGE_EXTENSIONS.contains(&ext))
-}
-
-fn load_ui_font(configured_path: Option<&Path>) -> text::Font {
-    if let Some(path) = configured_path {
-        match text::font::from_file(path) {
-            Ok(font) => return font,
-            Err(err) => {
-                eprintln!("Failed to load ui_font_path {}: {}", path.display(), err);
-            }
-        }
-    }
-    text::font::default_notosans()
 }
 
 fn terminal_panel_height(rect: Rect) -> f32 {
@@ -839,6 +893,7 @@ fn load_full_image_tiles(path: &Path) -> Result<(u32, u32, Vec<FullImageTile>)> 
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use image_rs::{ImageBuffer, Rgb};
@@ -1174,18 +1229,6 @@ fn model(app: &App) -> Model {
     }
     let clip_missing: HashSet<usize> = (0..image_paths.len()).collect();
     let clip_inflight: HashSet<usize> = HashSet::new();
-    // Create the window first, so textures can reference a focused window.
-    let window_id = app
-        .new_window()
-        .size(800, 600)
-        .title("sriv")
-        .view(view)
-        .key_pressed(key_pressed)
-        .received_character(received_character)
-        .mouse_wheel(mouse_wheel)
-        .mouse_pressed(mouse_pressed)
-        .build()
-        .unwrap();
     // Initialize channels and state for full-resolution LRU cache.
     // Channel for requesting full-resolution images (by index)
     let (full_req_tx, full_req_rx) = unbounded::<usize>();
@@ -1233,10 +1276,7 @@ fn model(app: &App) -> Model {
     let full_textures: HashMap<usize, TiledTexture> = HashMap::new();
     let full_usage: VecDeque<usize> = VecDeque::new();
     // Get initial window rect for resize tracking
-    let initial_rect = app
-        .window(window_id)
-        .map(|w| w.rect())
-        .unwrap_or_else(|| Rect::from_w_h(0.0, 0.0));
+    let initial_rect = app.rect;
     // Load user configuration files.
     let config_home = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -1253,18 +1293,16 @@ fn model(app: &App) -> Model {
     let ui_font_path = fs::read_to_string(&app_config_path)
         .ok()
         .and_then(|contents| parse_ui_font_path(&contents));
-    let ui_font = load_ui_font(ui_font_path.as_deref());
     // Channel for receiving command terminal updates from custom commands
     let (command_tx, command_rx) = channel::<CommandEvent>();
-    let mut model = Model {
+    Model {
         image_paths,
-        ui_font,
+        ui_font_path,
         thumb_visible: HashMap::new(),
         thumb_data: HashMap::new(),
         thumb_has_xmp,
         thumb_rx,
         thumb_queue: thumb_queue.clone(),
-        next_thumb_generation: 0,
         file_mod_times,
         file_watch_cursor: 0,
         full_req_tx,
@@ -1303,16 +1341,187 @@ fn model(app: &App) -> Model {
         pending_clip_embeddings: HashMap::new(),
         next_search_request_id: 0,
         search: None,
-        window_id,
-    };
-    update_thumbnail_requests(app, &mut model);
-    model
+    }
 }
 
 fn main() -> Result<()> {
-    // Launch the nannou application with our model initializer and update callback.
-    nannou::app(model).update(update).run();
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    let proxy = AppProxy(event_loop.create_proxy());
+    event_loop.run_app(&mut SrivApplication { state: None, proxy })?;
     Ok(())
+}
+
+struct ApplicationState {
+    app: App,
+    renderer: Renderer,
+    model: Model,
+    next_update: Instant,
+}
+
+impl ApplicationState {
+    fn update(&mut self) {
+        update(&self.app, &mut self.model, &self.renderer);
+        self.app.window.request_redraw();
+        self.next_update = Instant::now() + Duration::from_millis(16);
+    }
+
+    fn handle_exit_request(&self, event_loop: &ActiveEventLoop) {
+        if self.app.exit_requested.replace(false) {
+            event_loop.exit();
+        }
+    }
+}
+
+struct SrivApplication {
+    state: Option<ApplicationState>,
+    proxy: AppProxy,
+}
+
+impl ApplicationHandler<UserEvent> for SrivApplication {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.state.is_some() {
+            return;
+        }
+        let attributes = Window::default_attributes()
+            .with_title("sriv")
+            .with_inner_size(LogicalSize::new(800.0, 600.0));
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Arc::new(window),
+            Err(error) => {
+                eprintln!("Failed to create the sriv window: {error}");
+                event_loop.exit();
+                return;
+            }
+        };
+        let mut app = App {
+            window: Arc::clone(&window),
+            proxy: self.proxy.clone(),
+            keys: Keys::default(),
+            mouse: Mouse::default(),
+            rect: Rect::default(),
+            exit_requested: Cell::new(false),
+        };
+        app.update_rect();
+        let mut renderer = match pollster::block_on(Renderer::new(window, event_loop)) {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("Failed to initialize graphics: {error:#}");
+                event_loop.exit();
+                return;
+            }
+        };
+        let model = model(&app);
+        renderer.load_ui_font(model.ui_font_path.as_deref());
+        self.state = Some(ApplicationState {
+            app,
+            renderer,
+            model,
+            next_update: Instant::now(),
+        });
+        if let Some(state) = &mut self.state {
+            state.update();
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: UserEvent) {
+        if let Some(state) = &mut self.state {
+            state.update();
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(state) = &mut self.state else {
+            return;
+        };
+        let now = Instant::now();
+        if now >= state.next_update {
+            state.update();
+        }
+        state.handle_exit_request(event_loop);
+        event_loop.set_control_flow(ControlFlow::WaitUntil(state.next_update));
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        let Some(state) = &mut self.state else {
+            return;
+        };
+        if window_id != state.app.window.id() {
+            return;
+        }
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => {
+                state.app.update_rect();
+                state.renderer.resize(size.width, size.height);
+                state.update();
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                state.app.update_rect();
+                let size = state.app.window.inner_size();
+                state.renderer.resize(size.width, size.height);
+                state.update();
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let logical = position.to_logical::<f32>(state.app.window.scale_factor());
+                state.app.mouse.position = vec2(
+                    logical.x - state.app.rect.w() / 2.0,
+                    state.app.rect.h() / 2.0 - logical.y,
+                );
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                state.app.keys.mods = modifiers.state();
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button,
+                ..
+            } => {
+                mouse_pressed(&state.app, &mut state.model, button);
+                state.app.window.request_redraw();
+            }
+            WindowEvent::MouseWheel { delta, phase, .. } => {
+                let delta = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => MouseScrollDelta::LineDelta(x, y),
+                    MouseScrollDelta::PixelDelta(position) => {
+                        let logical = position.to_logical::<f64>(state.app.window.scale_factor());
+                        MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(
+                            logical.x, logical.y,
+                        ))
+                    }
+                };
+                mouse_wheel(&state.app, &mut state.model, delta, phase);
+                state.app.window.request_redraw();
+            }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if let Some(key) = Key::from_physical_key(event.physical_key) {
+                    key_pressed(&state.app, &mut state.model, key);
+                }
+                if !state.app.keys.mods.control_key()
+                    && !state.app.keys.mods.alt_key()
+                    && !state.app.keys.mods.super_key()
+                {
+                    if let Some(text) = event.text {
+                        for ch in text.chars() {
+                            received_character(&state.app, &mut state.model, ch);
+                        }
+                    }
+                }
+                state.handle_exit_request(event_loop);
+                state.app.window.request_redraw();
+            }
+            WindowEvent::RedrawRequested => {
+                if let Err(error) = view(&state.app, &mut state.model, &mut state.renderer) {
+                    eprintln!("Failed to render frame: {error:#}");
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Navigate to a given index in single-image mode: update current, preload neighbors, and fit if loaded.
@@ -1489,7 +1698,7 @@ fn update_search_with_image_embedding(app: &App, model: &mut Model, index: usize
 
 fn handle_search_key(app: &App, model: &mut Model, key: Key) -> bool {
     let mods = app.keys.mods;
-    if mods.ctrl() || mods.alt() || mods.logo() {
+    if mods.control_key() || mods.alt_key() || mods.super_key() {
         return false;
     }
 
@@ -1594,31 +1803,29 @@ fn handle_search_key(app: &App, model: &mut Model, key: Key) -> bool {
                 model.search = None;
                 return true;
             }
-            Key::N => {
+            Key::N
                 if matches!(model.mode, Mode::Thumbnails)
                     && model
                         .search
                         .as_ref()
                         .map(|s| !s.results.is_empty())
-                        .unwrap_or(false)
-                {
-                    let delta = if mods.shift() { -1 } else { 1 };
-                    advance_search(app, model, delta);
-                    return true;
-                }
+                        .unwrap_or(false) =>
+            {
+                let delta = if mods.shift_key() { -1 } else { 1 };
+                advance_search(app, model, delta);
+                return true;
             }
-            Key::P => {
+            Key::P
                 if matches!(model.mode, Mode::Thumbnails)
                     && model
                         .search
                         .as_ref()
                         .map(|s| !s.results.is_empty())
-                        .unwrap_or(false)
-                {
-                    let delta = if mods.shift() { 1 } else { -1 };
-                    advance_search(app, model, delta);
-                    return true;
-                }
+                        .unwrap_or(false) =>
+            {
+                let delta = if mods.shift_key() { 1 } else { -1 };
+                advance_search(app, model, delta);
+                return true;
             }
             _ => {}
         }
@@ -1827,7 +2034,7 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                 if let Mode::Thumbnails = model.mode {
                     let len = model.image_paths.len();
                     // if Shift+G, go to last thumbnail; otherwise go to first
-                    if app.keys.mods.shift() {
+                    if app.keys.mods.shift_key() {
                         if len > 0 {
                             model.current = len - 1;
                         }
@@ -1866,25 +2073,17 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                     navigate_to(app, model, new_idx);
                 }
             }
-            Key::H | Key::Left => {
-                if handle_arrow(app, model, ArrowDirection::Left) {
-                    return;
-                }
+            Key::H | Key::Left if handle_arrow(app, model, ArrowDirection::Left) => {
+                return;
             }
-            Key::L | Key::Right => {
-                if handle_arrow(app, model, ArrowDirection::Right) {
-                    return;
-                }
+            Key::L | Key::Right if handle_arrow(app, model, ArrowDirection::Right) => {
+                return;
             }
-            Key::K | Key::Up => {
-                if handle_arrow(app, model, ArrowDirection::Up) {
-                    return;
-                }
+            Key::K | Key::Up if handle_arrow(app, model, ArrowDirection::Up) => {
+                return;
             }
-            Key::J | Key::Down => {
-                if handle_arrow(app, model, ArrowDirection::Down) {
-                    return;
-                }
+            Key::J | Key::Down if handle_arrow(app, model, ArrowDirection::Down) => {
+                return;
             }
             Key::Return => {
                 // Toggle between thumbnail and single-image modes.
@@ -1928,10 +2127,12 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             }
             // Toggle full screen
             Key::F => {
-                if let Some(window) = app.window(model.window_id) {
-                    let is_fs = window.is_fullscreen();
-                    window.set_fullscreen(!is_fs);
-                }
+                let fullscreen = if app.window.fullscreen().is_some() {
+                    None
+                } else {
+                    Some(Fullscreen::Borderless(None))
+                };
+                app.window.set_fullscreen(fullscreen);
             }
             // Show at 100% scale
             Key::Equals => {
@@ -1957,10 +2158,10 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
     let mut commands_to_launch = Vec::new();
     for binding in &model.key_bindings {
         if key == binding.key
-            && app.keys.mods.ctrl() == binding.ctrl
-            && app.keys.mods.shift() == binding.shift
-            && app.keys.mods.alt() == binding.alt
-            && app.keys.mods.logo() == binding.super_key
+            && app.keys.mods.control_key() == binding.ctrl
+            && app.keys.mods.shift_key() == binding.shift
+            && app.keys.mods.alt_key() == binding.alt
+            && app.keys.mods.super_key() == binding.super_key
         {
             commands_to_launch.push((
                 binding.command.replace("{file}", &current_file),
@@ -1988,7 +2189,7 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
 }
 
 /// Update function to process incoming thumbnail images.
-fn update(app: &App, model: &mut Model, _update: Update) {
+fn update(app: &App, model: &mut Model, renderer: &Renderer) {
     sync_terminal_viewport(app, model);
 
     while let Ok(update) = model.thumb_rx.try_recv() {
@@ -2115,7 +2316,7 @@ fn update(app: &App, model: &mut Model, _update: Update) {
                         height,
                         format,
                         pixel_data,
-                        texture: RefCell::new(None),
+                        texture: None,
                     });
                 }
                 let tiled = TiledTexture {
@@ -2189,7 +2390,7 @@ fn update(app: &App, model: &mut Model, _update: Update) {
     if matches!(model.mode, Mode::Single) && !model.full_textures.contains_key(&model.current) {
         request_full_texture(model, model.current);
     }
-    update_thumbnail_requests(app, model);
+    update_thumbnail_requests(app, model, renderer);
 }
 
 fn terminal_status_text(session: &TerminalSession) -> String {
@@ -2259,7 +2460,7 @@ fn terminal_view_row_start(session: &TerminalSession, visible_rows: u16, visible
     terminal_row_start(session.parser.screen(), visible_rows, visible_cols)
 }
 
-fn draw_terminal_panel(draw: &Draw, model: &Model, rect: Rect) {
+fn draw_terminal_panel(draw: &mut Scene<'_>, model: &Model, rect: Rect) {
     if !model.terminal.visible {
         return;
     }
@@ -2284,7 +2485,6 @@ fn draw_terminal_panel(draw: &Draw, model: &Model, rect: Rect) {
 
     if model.terminal.sessions.is_empty() {
         draw.text("No terminal sessions yet")
-            .font(model.ui_font.clone())
             .font_size(16)
             .color(default_fg)
             .x_y(body_rect.x(), body_rect.y());
@@ -2312,7 +2512,6 @@ fn draw_terminal_panel(draw: &Draw, model: &Model, rect: Rect) {
             .w_h((tab_width - 2.0).max(1.0), TERMINAL_TAB_HEIGHT - 4.0)
             .color(tab_bg);
         draw.text(&label)
-            .font(model.ui_font.clone())
             .font_size(13)
             .color(default_fg)
             .w_h((tab_width - 14.0).max(1.0), TERMINAL_TAB_HEIGHT - 4.0)
@@ -2357,7 +2556,6 @@ fn draw_terminal_panel(draw: &Draw, model: &Model, rect: Rect) {
 
             if cell.has_contents() {
                 draw.text(cell.contents())
-                    .font(model.ui_font.clone())
                     .font_size(TERMINAL_FONT_SIZE)
                     .color(fg)
                     .w_h(TERMINAL_CELL_WIDTH * 2.0, TERMINAL_CELL_HEIGHT)
@@ -2367,11 +2565,11 @@ fn draw_terminal_panel(draw: &Draw, model: &Model, rect: Rect) {
 
             if cell.underline() {
                 draw.line()
-                    .start(pt2(
+                    .start(vec2(
                         x - TERMINAL_CELL_WIDTH / 2.0,
                         y - TERMINAL_CELL_HEIGHT / 2.6,
                     ))
-                    .end(pt2(
+                    .end(vec2(
                         x + TERMINAL_CELL_WIDTH / 2.0,
                         y - TERMINAL_CELL_HEIGHT / 2.6,
                     ))
@@ -2391,7 +2589,6 @@ fn draw_terminal_panel(draw: &Draw, model: &Model, rect: Rect) {
         .w_h(panel_rect.w(), TERMINAL_STATUS_HEIGHT)
         .color(srgba(0.08, 0.09, 0.11, 0.78));
     draw.text(&status)
-        .font(model.ui_font.clone())
         .font_size(12)
         .color(default_fg)
         .w_h(panel_rect.w() - 20.0, TERMINAL_STATUS_HEIGHT)
@@ -2437,7 +2634,7 @@ fn request_full_texture(model: &mut Model, idx: usize) {
     }
 }
 
-fn update_thumbnail_requests(app: &App, model: &mut Model) {
+fn update_thumbnail_requests(app: &App, model: &mut Model, renderer: &Renderer) {
     if !matches!(model.mode, Mode::Thumbnails) {
         return;
     }
@@ -2487,17 +2684,14 @@ fn update_thumbnail_requests(app: &App, model: &mut Model) {
             continue;
         }
         if let Some(entry) = model.thumb_data.get(&idx) {
-            let texture = wgpu::Texture::from_image(app, &entry.image);
+            let texture = renderer.texture_from_image(&entry.image);
             let size = texture.size();
-            let generation = model.next_thumb_generation;
-            model.next_thumb_generation = model.next_thumb_generation.wrapping_add(1);
             model.thumb_visible.insert(
                 idx,
                 ThumbnailTexture {
                     texture,
                     center,
                     size,
-                    generation,
                 },
             );
         }
@@ -2606,7 +2800,8 @@ fn current_mod_time(path: &Path) -> Option<SystemTime> {
 }
 
 fn current_window_rect(app: &App, model: &Model) -> Option<Rect> {
-    app.window(model.window_id).map(|w| w.rect())
+    let _ = model;
+    Some(app.rect)
 }
 
 /// Apply fit-to-window for current single-image view
@@ -2625,13 +2820,52 @@ fn apply_fit(app: &App, model: &mut Model) {
     model.pan = vec2(0.0, 0.0);
 }
 
-fn view(app: &App, model: &Model, frame: Frame) {
-    let draw = app.draw();
-    draw.background().color(BLACK);
-
-    let Some(rect) = current_window_rect(app, model) else {
+fn prepare_current_full_textures(renderer: &Renderer, model: &mut Model) {
+    let Some(tiled) = model.full_textures.get_mut(&model.current) else {
         return;
     };
+    for tile in &mut tiled.tiles {
+        if tile.texture.is_some() {
+            continue;
+        }
+        let (format, bytes_per_row, pixels): (
+            wgpu::TextureFormat,
+            u32,
+            std::borrow::Cow<'_, [u8]>,
+        ) = match tile.format {
+            TilePixelFormat::Rgba8 => (
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+                4 * tile.width,
+                std::borrow::Cow::Borrowed(&tile.pixel_data),
+            ),
+            TilePixelFormat::Rgba16 if renderer.supports_rgba16() => (
+                wgpu::TextureFormat::Rgba16Unorm,
+                8 * tile.width,
+                std::borrow::Cow::Borrowed(&tile.pixel_data),
+            ),
+            TilePixelFormat::Rgba16 => (
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+                4 * tile.width,
+                std::borrow::Cow::Owned(rgba16_bytes_to_rgba8(&tile.pixel_data)),
+            ),
+        };
+        tile.texture = Some(renderer.create_texture(
+            "sriv full-resolution tile",
+            tile.width,
+            tile.height,
+            format,
+            bytes_per_row,
+            pixels.as_ref(),
+        ));
+    }
+}
+
+fn view(app: &App, model: &mut Model, renderer: &mut Renderer) -> Result<()> {
+    prepare_current_full_textures(renderer, model);
+    let Some(rect) = current_window_rect(app, model) else {
+        return Ok(());
+    };
+    let mut draw = Scene::new(rect);
     match model.mode {
         Mode::Thumbnails => {
             let grid = ThumbnailGrid::new(model, rect);
@@ -2651,27 +2885,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
                             let [tw, th] = slot.size;
                             let w = tw as f32;
                             let h = th as f32;
-                            let lod_variation =
-                                1.0 + ((slot.generation % 1_000_000) as f32) / 1_000_000.0;
-                            // nannou caches bind groups by (texture_id, sampler_desc); without the
-                            // generation in the sampler, a recycled texture ID could re-use a stale
-                            // bind group pointing at old GPU contents.
-                            let sampler_desc = wgpu::SamplerDescriptor {
-                                label: Some("thumbnail-sampler"),
-                                address_mode_u: wgpu::AddressMode::ClampToEdge,
-                                address_mode_v: wgpu::AddressMode::ClampToEdge,
-                                address_mode_w: wgpu::AddressMode::ClampToEdge,
-                                mag_filter: wgpu::FilterMode::Linear,
-                                min_filter: wgpu::FilterMode::Linear,
-                                mipmap_filter: wgpu::FilterMode::Nearest,
-                                lod_min_clamp: 0.0,
-                                lod_max_clamp: lod_variation,
-                                compare: None,
-                                anisotropy_clamp: 1,
-                                border_color: None,
-                            };
-                            draw.sampler(sampler_desc)
-                                .texture(&slot.texture)
+                            draw.texture(&slot.texture)
                                 .x_y(center.x, center.y)
                                 .w_h(w, h);
 
@@ -2686,7 +2900,6 @@ fn view(app: &App, model: &Model, frame: Frame) {
                                     .w_h(icon_w, icon_h)
                                     .color(srgba(1.0, 0.0, 0.0, 0.85));
                                 draw.text("XMP")
-                                    .font(model.ui_font.clone())
                                     .font_size(12)
                                     .w_h(icon_w, icon_h)
                                     .x_y(icon_center_x, icon_center_y - 1.0)
@@ -2729,7 +2942,6 @@ fn view(app: &App, model: &Model, frame: Frame) {
                 .color(srgba(0.0, 0.0, 0.0, 0.5));
             let full_path = model.image_paths[model.current].to_string_lossy();
             draw.text(&full_path)
-                .font(model.ui_font.clone())
                 .font_size(14)
                 .w_h(rect.w(), bar_h)
                 .x_y(0.0, bar_y)
@@ -2738,7 +2950,6 @@ fn view(app: &App, model: &Model, frame: Frame) {
             // Index of selected image
             let count = format!("{}/{}", model.current + 1, model.image_paths.len());
             draw.text(&count)
-                .font(model.ui_font.clone())
                 .font_size(14)
                 .w_h(rect.w(), bar_h)
                 .x_y(0.0, bar_y)
@@ -2749,9 +2960,6 @@ fn view(app: &App, model: &Model, frame: Frame) {
             // Attempt to draw the full-resolution tiled texture if loaded;
             // otherwise display a loading message.
             if let Some(tex) = model.full_textures.get(&model.current) {
-                let Some(window) = app.window(model.window_id) else {
-                    return;
-                };
                 // Draw each tile at the correct position, applying zoom and pan
                 let [full_w, full_h] = tex.size();
                 for tile in &tex.tiles {
@@ -2760,71 +2968,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
                         tile.x_offset as f32 - full_w as f32 / 2.0 + tile.width as f32 / 2.0;
                     let y_center =
                         full_h as f32 / 2.0 - tile.y_offset as f32 - tile.height as f32 / 2.0;
-                    // Lazy-create GPU texture if needed
-                    if tile.texture.borrow().is_none() {
-                        let size = wgpu::Extent3d {
-                            width: tile.width,
-                            height: tile.height,
-                            depth_or_array_layers: 1,
-                        };
-                        let supports_rgba16 = window
-                            .device()
-                            .features()
-                            .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
-                        let (texture_format, bytes_per_row, pixel_bytes): (
-                            wgpu::TextureFormat,
-                            u32,
-                            std::borrow::Cow<'_, [u8]>,
-                        ) = match tile.format {
-                            TilePixelFormat::Rgba8 => (
-                                wgpu::TextureFormat::Rgba8UnormSrgb,
-                                4 * tile.width,
-                                std::borrow::Cow::Borrowed(&tile.pixel_data),
-                            ),
-                            TilePixelFormat::Rgba16 if supports_rgba16 => (
-                                wgpu::TextureFormat::Rgba16Unorm,
-                                8 * tile.width,
-                                std::borrow::Cow::Borrowed(&tile.pixel_data),
-                            ),
-                            TilePixelFormat::Rgba16 => (
-                                wgpu::TextureFormat::Rgba8UnormSrgb,
-                                4 * tile.width,
-                                std::borrow::Cow::Owned(rgba16_bytes_to_rgba8(&tile.pixel_data)),
-                            ),
-                        };
-                        let descriptor = wgpu::TextureDescriptor {
-                            label: None,
-                            size,
-                            mip_level_count: 1,
-                            sample_count: 1,
-                            dimension: wgpu::TextureDimension::D2,
-                            format: texture_format,
-                            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                                | wgpu::TextureUsages::COPY_DST,
-                            view_formats: &[],
-                        };
-                        let handle = window.device().create_texture(&descriptor);
-                        window.queue().write_texture(
-                            wgpu::ImageCopyTexture {
-                                texture: &handle,
-                                mip_level: 0,
-                                origin: wgpu::Origin3d::ZERO,
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            pixel_bytes.as_ref(),
-                            wgpu::ImageDataLayout {
-                                offset: 0,
-                                bytes_per_row: Some(bytes_per_row),
-                                rows_per_image: Some(tile.height),
-                            },
-                            size,
-                        );
-                        let n_texture =
-                            wgpu::Texture::from_handle_and_descriptor(Arc::new(handle), descriptor);
-                        *tile.texture.borrow_mut() = Some(n_texture);
-                    }
-                    let n_texture = tile.texture.borrow().as_ref().unwrap().clone();
-                    draw.texture(&n_texture)
+                    draw.texture(tile.texture.as_ref().unwrap())
                         .x_y(
                             model.pan.x + x_center * model.zoom,
                             model.pan.y + y_center * model.zoom,
@@ -2845,7 +2989,6 @@ fn view(app: &App, model: &Model, frame: Frame) {
                 // Full path, left-aligned
                 let full_path = model.image_paths[model.current].to_string_lossy();
                 draw.text(&full_path)
-                    .font(model.ui_font.clone())
                     .font_size(14)
                     .color(WHITE)
                     .w_h(rect.w(), bar_h)
@@ -2854,7 +2997,6 @@ fn view(app: &App, model: &Model, frame: Frame) {
                 // Dimensions and zoom, right-aligned
                 let info = format!("{}×{}  {:.2}×", full_w, full_h, model.zoom);
                 draw.text(&info)
-                    .font(model.ui_font.clone())
                     .font_size(14)
                     .color(WHITE)
                     .w_h(rect.w(), bar_h)
@@ -2862,7 +3004,6 @@ fn view(app: &App, model: &Model, frame: Frame) {
                     .right_justify();
             } else {
                 draw.text("Loading...")
-                    .font(model.ui_font.clone())
                     .font_size(24)
                     .color(WHITE)
                     .x_y(0.0, 0.0);
@@ -2877,7 +3018,6 @@ fn view(app: &App, model: &Model, frame: Frame) {
                 // Full path, left-aligned
                 let full_path = model.image_paths[model.current].to_string_lossy();
                 draw.text(&full_path)
-                    .font(model.ui_font.clone())
                     .font_size(14)
                     .color(WHITE)
                     .w_h(rect.w(), bar_h)
@@ -2923,14 +3063,12 @@ fn view(app: &App, model: &Model, frame: Frame) {
         };
         draw.rect().x_y(0.0, bar_y).w_h(rect.w(), bar_h).color(bg);
         draw.text(&prompt)
-            .font(model.ui_font.clone())
             .font_size(16)
             .color(WHITE)
             .w_h(rect.w(), bar_h)
             .x_y(0.0, bar_y)
             .left_justify();
         draw.text(&status)
-            .font(model.ui_font.clone())
             .font_size(14)
             .color(WHITE)
             .w_h(rect.w(), bar_h)
@@ -2938,6 +3076,6 @@ fn view(app: &App, model: &Model, frame: Frame) {
             .right_justify();
     }
 
-    draw_terminal_panel(&draw, model, rect);
-    draw.to_frame(app, &frame).unwrap();
+    draw_terminal_panel(&mut draw, model, rect);
+    renderer.render(&draw, app.window.scale_factor())
 }

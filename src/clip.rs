@@ -12,7 +12,7 @@ use candle::{utils::cuda_is_available, DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::clip::{self, ClipModel};
 use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
-use nannou::image::{imageops::FilterType, DynamicImage, GenericImageView, RgbImage};
+use image::{imageops::FilterType, DynamicImage, RgbImage};
 use sha1::Sha1;
 use tokenizers::Tokenizer;
 
@@ -327,8 +327,8 @@ fn process_image_batch(batch: Vec<(usize, PathBuf, RgbImage)>, ctx: &ImageBatchC
         Ok(embeddings) => {
             for ((index, path), embedding) in compute_indices
                 .into_iter()
-                .zip(compute_paths.into_iter())
-                .zip(embeddings.into_iter())
+                .zip(compute_paths)
+                .zip(embeddings)
             {
                 let embed_path = cache_file_path(ctx.cache_base, &path, "clip");
                 match write_embedding(&embed_path, &embedding) {

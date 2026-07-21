@@ -1,12 +1,11 @@
 use crate::clip::ClipEngine;
+use crate::geometry::{Rect, Vec2};
+use crate::input::Key;
+use crate::renderer::GpuTexture;
 use crate::FullImageMessage;
 use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender};
-use nannou::image::DynamicImage;
-use nannou::prelude::{Key, Rect, Vec2, WindowId};
-use nannou::text::Font;
-use nannou::wgpu;
+use image::DynamicImage;
 use portable_pty::MasterPty;
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
@@ -275,7 +274,7 @@ pub struct Tile {
     pub height: u32,
     pub format: TilePixelFormat,
     pub pixel_data: Vec<u8>,
-    pub texture: RefCell<Option<wgpu::Texture>>,
+    pub texture: Option<GpuTexture>,
 }
 
 #[derive(Debug)]
@@ -345,13 +344,12 @@ pub struct TerminalState {
 
 pub struct Model {
     pub image_paths: Vec<PathBuf>,
-    pub ui_font: Font,
+    pub ui_font_path: Option<PathBuf>,
     pub thumb_visible: HashMap<usize, ThumbnailTexture>,
     pub thumb_data: HashMap<usize, ThumbnailEntry>,
     pub thumb_has_xmp: Vec<bool>,
     pub thumb_rx: Receiver<ThumbnailUpdate>,
     pub thumb_queue: ThumbRequestQueue,
-    pub next_thumb_generation: u64,
     pub file_mod_times: Vec<Option<SystemTime>>,
     pub file_watch_cursor: usize,
     pub full_req_tx: CbSender<usize>,
@@ -381,7 +379,6 @@ pub struct Model {
     pub pending_clip_embeddings: HashMap<usize, Vec<f32>>,
     pub next_search_request_id: u64,
     pub search: Option<SearchState>,
-    pub window_id: WindowId,
 }
 
 impl Drop for Model {
@@ -392,8 +389,7 @@ impl Drop for Model {
 
 #[derive(Debug)]
 pub struct ThumbnailTexture {
-    pub texture: wgpu::Texture,
+    pub texture: GpuTexture,
     pub center: Vec2,
     pub size: [u32; 2],
-    pub generation: u64,
 }

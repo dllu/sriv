@@ -1,6 +1,6 @@
+use crate::geometry::{vec2, Rect, Vec2};
 use crate::state::Model;
 use crate::THUMB_PREFETCH_ROWS;
-use nannou::prelude::{vec2, Rect, Vec2};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ThumbnailGrid {

@@ -9,9 +9,9 @@ https://github.com/user-attachments/assets/734e3a02-e9ff-4f24-9c51-27585d53a806
 * parallel thumbnail generation
 * supports images more than 32768 or 65536 px wide or whatever arcane limit that imlib2 has
 * CLIP-powered semantic search across your library
-* works in wayland natively thanks to nannou using wgpu/winit
+* works in Wayland natively with winit and wgpu
 
-built on [nannou](https://nannou.cc/).
+built directly on [winit](https://github.com/rust-windowing/winit) and [wgpu](https://wgpu.rs/).
 inspired by [nsxiv](https://github.com/nsxiv/nsxiv).
 
 still work in progress.
@@ -98,7 +98,7 @@ you can also put general UI settings in `~/.config/sriv/config.toml`.
 ui_font_path = "/usr/share/fonts/noto/NotoSansMono-Regular.ttf"
 ```
 
-if `ui_font_path` is unset or fails to load, sriv falls back to nannou's bundled default font.
+if `ui_font_path` is unset or fails to load, sriv falls back to the system sans-serif font.
 
 # design
 
