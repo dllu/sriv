@@ -6,6 +6,7 @@ https://github.com/user-attachments/assets/734e3a02-e9ff-4f24-9c51-27585d53a806
 
 * minimalistic UI with vim-like keybindings
 * gpu-accelerated image viewing
+* animated GIF, WebP, and APNG playback with per-frame timing
 * color-managed ICC and HEIF/NCLX images, with Display P3 output when the surface supports it
 * parallel thumbnail generation
 * supports images more than 32768 or 65536 px wide or whatever arcane limit that imlib2 has

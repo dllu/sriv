@@ -3757,6 +3757,7 @@ dependencies = [
  "libheif-rs",
  "moxcms",
  "num_cpus",
+ "png",
  "pollster",
  "portable-pty",
  "rayon",

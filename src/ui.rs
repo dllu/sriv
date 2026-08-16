@@ -543,7 +543,7 @@ fn prepare_current_full_textures(renderer: &Renderer, model: &mut Model) {
     let Some(tiled) = model.full_textures.get_mut(&model.current) else {
         return;
     };
-    for tile in &mut tiled.tiles {
+    for tile in tiled.current_tiles_mut() {
         if tile.texture.is_some() {
             continue;
         }
@@ -679,7 +679,7 @@ pub(crate) fn render(app: &App, model: &mut Model, renderer: &mut Renderer) -> R
             if let Some(tex) = model.full_textures.get(&model.current) {
                 // Draw each tile at the correct position, applying zoom and pan
                 let [full_w, full_h] = tex.size();
-                for tile in &tex.tiles {
+                for tile in tex.current_tiles() {
                     // Compute tile center relative to full image center
                     let x_center =
                         tile.x_offset as f32 - full_w as f32 / 2.0 + tile.width as f32 / 2.0;
@@ -712,7 +712,18 @@ pub(crate) fn render(app: &App, model: &mut Model, renderer: &mut Renderer) -> R
                     .x_y(0.0, bar_y)
                     .left_justify();
                 // Dimensions and zoom, right-aligned
-                let info = format!("{}×{}  {:.2}×", full_w, full_h, model.zoom);
+                let info = if tex.frame_count() > 1 {
+                    format!(
+                        "{}×{}  {:.2}×  frame {}/{}",
+                        full_w,
+                        full_h,
+                        model.zoom,
+                        tex.current_frame_index() + 1,
+                        tex.frame_count()
+                    )
+                } else {
+                    format!("{}×{}  {:.2}×", full_w, full_h, model.zoom)
+                };
                 draw.text(&info)
                     .font_size(14)
                     .color(WHITE)

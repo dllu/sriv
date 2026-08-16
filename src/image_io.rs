@@ -1,25 +1,35 @@
 use anyhow::{anyhow, Result};
 use image as image_rs;
-use image::{imageops::FilterType, DynamicImage, ImageDecoder, ImageReader, RgbImage, RgbaImage};
+use image::codecs::{gif::GifDecoder, png::PngDecoder, webp::WebPDecoder};
+use image::{
+    imageops::FilterType, AnimationDecoder, DynamicImage, Frames, ImageDecoder, ImageFormat,
+    ImageReader, RgbImage, RgbaImage,
+};
 use libheif_rs::{ColorSpace as HeifColorSpace, HeifContext, LibHeif, Plane, RgbChroma};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use crate::clip;
 use crate::color::{self, EmbeddedColorProfile, OutputColorSpace};
-use crate::state::{FullImageTile, TilePixelFormat};
+use crate::state::{FullImageFrame, FullImageTile, TilePixelFormat};
 
 struct DecodedImage {
     image: DynamicImage,
     embedded_color_profile: Option<EmbeddedColorProfile>,
 }
 
-const IMAGE_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "bmp", "tiff", "gif", "webp", "tif", "heif", "heic",
-];
+const FORMAT_DETECTION_BYTES: u64 = 4096;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DetectedImageFormat {
+    Standard(ImageFormat),
+    Heif,
+}
 
 /// List of recognized raw file extensions for detecting XMP sidecars.
 const RAW_EXTENSIONS: &[&str] = &[
@@ -28,20 +38,86 @@ const RAW_EXTENSIONS: &[&str] = &[
     "raf", "raw", "rwl", "rw2", "rwz", "sr2", "srf", "srw", "x3f",
 ];
 
-fn extension_lower(path: &Path) -> Option<String> {
-    path.extension()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_ascii_lowercase())
+fn is_heif_brand(brand: &[u8]) -> bool {
+    matches!(
+        brand,
+        b"heic"
+            | b"heix"
+            | b"hevc"
+            | b"hevx"
+            | b"heim"
+            | b"heis"
+            | b"hevm"
+            | b"hevs"
+            | b"mif1"
+            | b"mif2"
+            | b"msf1"
+    )
 }
 
-fn is_heif_path(path: &Path) -> bool {
-    matches!(extension_lower(path).as_deref(), Some("heif" | "heic"))
+fn has_heif_file_type_box(bytes: &[u8]) -> bool {
+    if bytes.get(4..8) != Some(b"ftyp") {
+        return false;
+    }
+
+    let Some(size_bytes) = bytes.get(0..4) else {
+        return false;
+    };
+    let size = u32::from_be_bytes(size_bytes.try_into().unwrap());
+    let (payload_start, declared_end) = if size == 1 {
+        let Some(large_size) = bytes.get(8..16) else {
+            return false;
+        };
+        let size = u64::from_be_bytes(large_size.try_into().unwrap());
+        (16, usize::try_from(size).unwrap_or(usize::MAX))
+    } else {
+        (8, size as usize)
+    };
+    let box_end = if declared_end == 0 {
+        bytes.len()
+    } else {
+        declared_end.min(bytes.len())
+    };
+    if box_end < payload_start + 8 {
+        return false;
+    }
+
+    let major_brand = &bytes[payload_start..payload_start + 4];
+    is_heif_brand(major_brand)
+        || bytes[payload_start + 8..box_end]
+            .chunks_exact(4)
+            .any(is_heif_brand)
+}
+
+fn detect_supported_image_format_bytes(bytes: &[u8]) -> Option<DetectedImageFormat> {
+    if has_heif_file_type_box(bytes) {
+        return Some(DetectedImageFormat::Heif);
+    }
+
+    let format = image_rs::guess_format(bytes).ok()?;
+    matches!(
+        format,
+        ImageFormat::Jpeg
+            | ImageFormat::Png
+            | ImageFormat::Bmp
+            | ImageFormat::Gif
+            | ImageFormat::Tiff
+            | ImageFormat::WebP
+    )
+    .then_some(DetectedImageFormat::Standard(format))
+}
+
+fn detect_supported_image_format(path: &Path) -> Result<DetectedImageFormat> {
+    let mut header = Vec::with_capacity(FORMAT_DETECTION_BYTES as usize);
+    fs::File::open(path)?
+        .take(FORMAT_DETECTION_BYTES)
+        .read_to_end(&mut header)?;
+    detect_supported_image_format_bytes(&header)
+        .ok_or_else(|| anyhow!("unrecognized or unsupported image contents"))
 }
 
 pub(crate) fn is_supported_image_path(path: &Path) -> bool {
-    extension_lower(path)
-        .as_deref()
-        .is_some_and(|ext| IMAGE_EXTENSIONS.contains(&ext))
+    detect_supported_image_format(path).is_ok()
 }
 
 /// Compute the cache path for an image based on a SHA1 of its path.
@@ -93,28 +169,32 @@ fn parse_exif_quiet(path: &Path) -> Option<rexif::ExifData> {
     rexif::parse_buffer_quiet(&data).0.ok()
 }
 
-fn adjust_orientation_full(img: image_rs::DynamicImage, path: &Path) -> image_rs::DynamicImage {
-    let mut oriented = img;
-    if let Some(exif) = parse_exif_quiet(path) {
-        for entry in exif.entries {
-            if entry.tag == rexif::ExifTag::Orientation {
-                if let Some(code) = orientation_from_tag_value(&entry.value) {
-                    oriented = match code {
-                        2 => oriented.fliph(),
-                        3 => oriented.rotate180(),
-                        4 => oriented.flipv(),
-                        5 => oriented.rotate90().fliph(),
-                        6 => oriented.rotate90(),
-                        7 => oriented.rotate270().fliph(),
-                        8 => oriented.rotate270(),
-                        _ => oriented,
-                    };
-                }
-                break;
-            }
-        }
+fn orientation_code(path: &Path) -> Option<u16> {
+    parse_exif_quiet(path)?
+        .entries
+        .into_iter()
+        .find_map(|entry| {
+            (entry.tag == rexif::ExifTag::Orientation)
+                .then(|| orientation_from_tag_value(&entry.value))
+                .flatten()
+        })
+}
+
+fn apply_orientation(img: DynamicImage, orientation: Option<u16>) -> DynamicImage {
+    match orientation {
+        Some(2) => img.fliph(),
+        Some(3) => img.rotate180(),
+        Some(4) => img.flipv(),
+        Some(5) => img.rotate90().fliph(),
+        Some(6) => img.rotate90(),
+        Some(7) => img.rotate270().fliph(),
+        Some(8) => img.rotate270(),
+        _ => img,
     }
-    oriented
+}
+
+fn adjust_orientation_full(img: DynamicImage, path: &Path) -> DynamicImage {
+    apply_orientation(img, orientation_code(path))
 }
 
 fn srgb_u16_to_linear_u16(value: u16) -> u16 {
@@ -308,11 +388,23 @@ fn decode_heif_image(path: &Path) -> Result<DecodedImage> {
     })
 }
 
-fn decode_standard_image(path: &Path) -> Result<DecodedImage> {
+fn decode_standard_image(path: &Path, format: ImageFormat) -> Result<DecodedImage> {
     let mut reader = ImageReader::open(path)?;
+    reader.set_format(format);
     reader.no_limits();
     let mut decoder = reader.into_decoder()?;
-    let embedded_color_profile = match decoder.icc_profile() {
+    let embedded_color_profile = read_embedded_color_profile(path, &mut decoder);
+    Ok(DecodedImage {
+        image: DynamicImage::from_decoder(decoder)?,
+        embedded_color_profile,
+    })
+}
+
+fn read_embedded_color_profile(
+    path: &Path,
+    decoder: &mut impl ImageDecoder,
+) -> Option<EmbeddedColorProfile> {
+    match decoder.icc_profile() {
         Ok(profile) => profile.map(EmbeddedColorProfile::Icc),
         Err(error) => {
             eprintln!(
@@ -321,11 +413,7 @@ fn decode_standard_image(path: &Path) -> Result<DecodedImage> {
             );
             None
         }
-    };
-    Ok(DecodedImage {
-        image: DynamicImage::from_decoder(decoder)?,
-        embedded_color_profile,
-    })
+    }
 }
 
 fn convert_decoded_to_output(
@@ -334,17 +422,27 @@ fn convert_decoded_to_output(
     output_color_space: OutputColorSpace,
 ) -> DynamicImage {
     let DecodedImage {
-        mut image,
+        image,
         embedded_color_profile,
     } = decoded;
+    convert_image_to_output(
+        path,
+        image,
+        embedded_color_profile.as_ref(),
+        output_color_space,
+    )
+}
+
+fn convert_image_to_output(
+    path: &Path,
+    mut image: DynamicImage,
+    embedded_color_profile: Option<&EmbeddedColorProfile>,
+    output_color_space: OutputColorSpace,
+) -> DynamicImage {
     if embedded_color_profile.is_none() && output_color_space == OutputColorSpace::Srgb {
         return image;
     }
-    match color::convert_to_output(
-        &mut image,
-        embedded_color_profile.as_ref(),
-        output_color_space,
-    ) {
+    match color::convert_to_output(&mut image, embedded_color_profile, output_color_space) {
         Ok(()) => image,
         Err(error) => {
             eprintln!(
@@ -366,15 +464,22 @@ fn decode_image_no_limits(
     path: &Path,
     output_color_space: OutputColorSpace,
 ) -> Result<image_rs::DynamicImage> {
-    let is_heif = is_heif_path(path);
-    let decoded = if is_heif {
-        decode_heif_image(path)?
-    } else {
-        decode_standard_image(path)?
+    let format = detect_supported_image_format(path)?;
+    decode_image_no_limits_as(path, output_color_space, format)
+}
+
+fn decode_image_no_limits_as(
+    path: &Path,
+    output_color_space: OutputColorSpace,
+    format: DetectedImageFormat,
+) -> Result<image_rs::DynamicImage> {
+    let decoded = match format {
+        DetectedImageFormat::Heif => decode_heif_image(path)?,
+        DetectedImageFormat::Standard(format) => decode_standard_image(path, format)?,
     };
     let image = convert_decoded_to_output(path, decoded, output_color_space);
     // libheif applies HEIF orientation transformations during decoding.
-    Ok(if is_heif {
+    Ok(if format == DetectedImageFormat::Heif {
         image
     } else {
         adjust_orientation_full(image, path)
@@ -410,11 +515,7 @@ where
     tiles
 }
 
-pub(crate) fn load_full_image_tiles(
-    path: &Path,
-    output_color_space: OutputColorSpace,
-) -> Result<(u32, u32, Vec<FullImageTile>)> {
-    let img = decode_image_no_limits(path, output_color_space)?;
+fn tile_dynamic_image(img: DynamicImage) -> (u32, u32, Vec<FullImageTile>) {
     let (full_w, full_h) = (img.width(), img.height());
     let tiles = match img {
         image_rs::DynamicImage::ImageLuma8(buf) => collect_tiled_pixels(
@@ -527,7 +628,128 @@ pub(crate) fn load_full_image_tiles(
             )
         }
     };
-    Ok((full_w, full_h, tiles))
+    (full_w, full_h, tiles)
+}
+
+struct DecodedAnimation {
+    dimensions: (u32, u32),
+    embedded_color_profile: Option<EmbeddedColorProfile>,
+    frames: Frames<'static>,
+}
+
+fn animation_from_decoder<D>(path: &Path, mut decoder: D) -> DecodedAnimation
+where
+    D: AnimationDecoder<'static> + ImageDecoder + 'static,
+{
+    let dimensions = decoder.dimensions();
+    let embedded_color_profile = read_embedded_color_profile(path, &mut decoder);
+    DecodedAnimation {
+        dimensions,
+        embedded_color_profile,
+        frames: decoder.into_frames(),
+    }
+}
+
+fn open_animation(path: &Path, format: DetectedImageFormat) -> Result<Option<DecodedAnimation>> {
+    let reader = || -> Result<_> { Ok(BufReader::new(fs::File::open(path)?)) };
+    match format {
+        DetectedImageFormat::Standard(ImageFormat::Gif) => Ok(Some(animation_from_decoder(
+            path,
+            GifDecoder::new(reader()?)?,
+        ))),
+        DetectedImageFormat::Standard(ImageFormat::WebP) => {
+            let decoder = WebPDecoder::new(reader()?)?;
+            if decoder.has_animation() {
+                Ok(Some(animation_from_decoder(path, decoder)))
+            } else {
+                Ok(None)
+            }
+        }
+        DetectedImageFormat::Standard(ImageFormat::Png) => {
+            let mut decoder = PngDecoder::new(reader()?)?;
+            if !decoder.is_apng()? {
+                return Ok(None);
+            }
+            let dimensions = decoder.dimensions();
+            let embedded_color_profile = read_embedded_color_profile(path, &mut decoder);
+            Ok(Some(DecodedAnimation {
+                dimensions,
+                embedded_color_profile,
+                frames: decoder.apng()?.into_frames(),
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn load_animated_image(
+    path: &Path,
+    output_color_space: OutputColorSpace,
+    animation: DecodedAnimation,
+) -> Result<(u32, u32, Vec<FullImageFrame>)> {
+    let DecodedAnimation {
+        dimensions: expected_dimensions,
+        embedded_color_profile,
+        frames: decoded_frames,
+    } = animation;
+    let orientation = orientation_code(path);
+    let mut full_dimensions = None;
+    let mut frames = Vec::new();
+    for frame in decoded_frames {
+        let frame = frame?;
+        let delay = Duration::from(frame.delay());
+        let buffer = frame.into_buffer();
+        if buffer.dimensions() != expected_dimensions {
+            return Err(anyhow!(
+                "decoded animation frame is {}x{}, expected {}x{}",
+                buffer.width(),
+                buffer.height(),
+                expected_dimensions.0,
+                expected_dimensions.1
+            ));
+        }
+        let image = convert_image_to_output(
+            path,
+            DynamicImage::ImageRgba8(buffer),
+            embedded_color_profile.as_ref(),
+            output_color_space,
+        );
+        let image = apply_orientation(image, orientation);
+        let (frame_w, frame_h, tiles) = tile_dynamic_image(image);
+        let dimensions = (frame_w, frame_h);
+        if full_dimensions.is_some_and(|expected| expected != dimensions) {
+            return Err(anyhow!(
+                "oriented animation frames have inconsistent dimensions"
+            ));
+        }
+        full_dimensions = Some(dimensions);
+        frames.push(FullImageFrame { delay, tiles });
+    }
+
+    let (full_w, full_h) =
+        full_dimensions.ok_or_else(|| anyhow!("image contains no animation frames"))?;
+    Ok((full_w, full_h, frames))
+}
+
+pub(crate) fn load_full_image_tiles(
+    path: &Path,
+    output_color_space: OutputColorSpace,
+) -> Result<(u32, u32, Vec<FullImageFrame>)> {
+    let format = detect_supported_image_format(path)?;
+    if let Some(animation) = open_animation(path, format)? {
+        return load_animated_image(path, output_color_space, animation);
+    }
+
+    let img = decode_image_no_limits_as(path, output_color_space, format)?;
+    let (full_w, full_h, tiles) = tile_dynamic_image(img);
+    Ok((
+        full_w,
+        full_h,
+        vec![FullImageFrame {
+            delay: Duration::ZERO,
+            tiles,
+        }],
+    ))
 }
 
 /// Load a display-ready thumbnail from the output-space-specific cache, or generate it.
@@ -662,7 +884,9 @@ pub(crate) fn detect_thumb_sidecars(image_paths: &[PathBuf]) -> Vec<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image_rs::{ExtendedColorType, ImageBuffer, ImageEncoder, Rgb};
+    use image_rs::codecs::gif::{GifEncoder, Repeat};
+    use image_rs::codecs::webp::WebPEncoder;
+    use image_rs::{Delay, ExtendedColorType, Frame, ImageBuffer, ImageEncoder, Rgb, Rgba};
     use moxcms::ColorProfile;
     use std::time::SystemTime;
 
@@ -753,11 +977,201 @@ mod tests {
     }
 
     #[test]
-    fn supported_image_extensions_include_heif_and_heic() {
-        assert!(is_supported_image_path(Path::new("photo.heif")));
-        assert!(is_supported_image_path(Path::new("photo.HEIC")));
-        assert!(is_heif_path(Path::new("photo.HEIF")));
-        assert!(!is_supported_image_path(Path::new("notes.txt")));
+    fn supported_formats_are_detected_from_magic_bytes() {
+        assert_eq!(
+            detect_supported_image_format_bytes(b"\x89PNG\r\n\x1a\nrest"),
+            Some(DetectedImageFormat::Standard(ImageFormat::Png))
+        );
+        assert_eq!(
+            detect_supported_image_format_bytes(b"GIF89arest"),
+            Some(DetectedImageFormat::Standard(ImageFormat::Gif))
+        );
+        assert_eq!(
+            detect_supported_image_format_bytes(b"\xff\xd8\xffrest"),
+            Some(DetectedImageFormat::Standard(ImageFormat::Jpeg))
+        );
+        assert_eq!(
+            detect_supported_image_format_bytes(b"\0\0\0\x10ftypheic\0\0\0\0"),
+            Some(DetectedImageFormat::Heif)
+        );
+        assert_eq!(
+            detect_supported_image_format_bytes(b"\0\0\0\x14ftypisom\0\0\0\0heix"),
+            Some(DetectedImageFormat::Heif)
+        );
+        assert_eq!(detect_supported_image_format_bytes(b"plain text"), None);
+    }
+
+    #[test]
+    fn supported_file_detection_ignores_the_extension() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let image_path = std::env::temp_dir().join(format!(
+            "sriv-extensionless-image-test-{}-{unique}",
+            std::process::id()
+        ));
+        let fake_path = image_path.with_extension("jpg");
+        image_rs::codecs::png::PngEncoder::new(fs::File::create(&image_path).unwrap())
+            .write_image(&[10, 20, 30, 255], 1, 1, ExtendedColorType::Rgba8)
+            .unwrap();
+        fs::write(&fake_path, b"not really a JPEG").unwrap();
+
+        assert!(is_supported_image_path(&image_path));
+        assert!(!is_supported_image_path(&fake_path));
+        let (width, height, frames) =
+            load_full_image_tiles(&image_path, OutputColorSpace::Srgb).unwrap();
+
+        fs::remove_file(&image_path).unwrap();
+        fs::remove_file(&fake_path).unwrap();
+        assert_eq!((width, height), (1, 1));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].delay, Duration::ZERO);
+        assert_eq!(frames[0].tiles[0].5, [10, 20, 30, 255]);
+    }
+
+    const RED_FRAME: [u8; 8] = [255, 0, 0, 255, 255, 0, 0, 255];
+    const BLUE_FRAME: [u8; 8] = [0, 0, 255, 255, 0, 0, 255, 255];
+
+    fn animation_test_path(format: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "sriv-animated-{format}-test-{}-{unique}.wrong-extension",
+            std::process::id(),
+        ))
+    }
+
+    fn assert_test_animation(path: &Path) {
+        let (width, height, frames) = load_full_image_tiles(path, OutputColorSpace::Srgb).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].delay, Duration::from_millis(40));
+        assert_eq!(frames[1].delay, Duration::from_millis(70));
+        assert_eq!(frames[0].tiles.len(), 1);
+        assert_eq!(frames[1].tiles.len(), 1);
+        assert_eq!(frames[0].tiles[0].5, RED_FRAME);
+        assert_eq!(frames[1].tiles[0].5, BLUE_FRAME);
+    }
+
+    #[test]
+    fn full_gif_loader_uses_shared_animation_path() {
+        let path = animation_test_path("gif");
+        {
+            let file = fs::File::create(&path).unwrap();
+            let mut encoder = GifEncoder::new(file);
+            encoder.set_repeat(Repeat::Infinite).unwrap();
+            encoder
+                .encode_frame(Frame::from_parts(
+                    RgbaImage::from_pixel(2, 1, Rgba([255, 0, 0, 255])),
+                    0,
+                    0,
+                    Delay::from_numer_denom_ms(40, 1),
+                ))
+                .unwrap();
+            encoder
+                .encode_frame(Frame::from_parts(
+                    RgbaImage::from_pixel(2, 1, Rgba([0, 0, 255, 255])),
+                    0,
+                    0,
+                    Delay::from_numer_denom_ms(70, 1),
+                ))
+                .unwrap();
+        }
+
+        assert_test_animation(&path);
+    }
+
+    #[test]
+    fn full_apng_loader_uses_shared_animation_path() {
+        let path = animation_test_path("apng");
+        {
+            let mut encoder = png::Encoder::new(fs::File::create(&path).unwrap(), 2, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_animated(2, 0).unwrap();
+            encoder.set_frame_delay(4, 100).unwrap();
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&RED_FRAME).unwrap();
+            writer.set_frame_delay(7, 100).unwrap();
+            writer.write_image_data(&BLUE_FRAME).unwrap();
+            writer.finish().unwrap();
+        }
+
+        assert_test_animation(&path);
+    }
+
+    fn push_webp_chunk(output: &mut Vec<u8>, fourcc: &[u8; 4], payload: &[u8]) {
+        output.extend_from_slice(fourcc);
+        output.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        output.extend_from_slice(payload);
+        if !payload.len().is_multiple_of(2) {
+            output.push(0);
+        }
+    }
+
+    fn push_le_u24(output: &mut Vec<u8>, value: u32) {
+        output.extend_from_slice(&value.to_le_bytes()[..3]);
+    }
+
+    fn lossless_webp_chunk(rgb: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        WebPEncoder::new_lossless(&mut encoded)
+            .write_image(rgb, 2, 1, ExtendedColorType::Rgb8)
+            .unwrap();
+        assert_eq!(&encoded[..4], b"RIFF");
+        assert_eq!(&encoded[8..12], b"WEBP");
+        encoded[12..].to_vec()
+    }
+
+    fn push_webp_animation_frame(output: &mut Vec<u8>, rgb: &[u8], delay_ms: u32) {
+        let mut payload = Vec::new();
+        push_le_u24(&mut payload, 0); // x / 2
+        push_le_u24(&mut payload, 0); // y / 2
+        push_le_u24(&mut payload, 1); // width - 1
+        push_le_u24(&mut payload, 0); // height - 1
+        push_le_u24(&mut payload, delay_ms);
+        payload.push(0b10); // replace the canvas; do not dispose
+        payload.extend_from_slice(&lossless_webp_chunk(rgb));
+        push_webp_chunk(output, b"ANMF", &payload);
+    }
+
+    #[test]
+    fn full_animated_webp_loader_uses_shared_animation_path() {
+        let path = animation_test_path("webp");
+        let mut chunks = Vec::new();
+        push_webp_chunk(&mut chunks, b"VP8X", &[0b10, 0, 0, 0, 1, 0, 0, 0, 0, 0]);
+        push_webp_chunk(&mut chunks, b"ANIM", &[0; 6]);
+        push_webp_animation_frame(&mut chunks, &[255, 0, 0, 255, 0, 0], 40);
+        push_webp_animation_frame(&mut chunks, &[0, 0, 255, 0, 0, 255], 70);
+
+        let mut encoded = b"RIFF\0\0\0\0WEBP".to_vec();
+        encoded.extend_from_slice(&chunks);
+        let riff_size = (encoded.len() - 8) as u32;
+        encoded[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        fs::write(&path, encoded).unwrap();
+
+        assert_test_animation(&path);
+    }
+
+    #[test]
+    fn non_animated_webp_stays_on_the_still_image_path() {
+        let path = animation_test_path("still-webp");
+        WebPEncoder::new_lossless(fs::File::create(&path).unwrap())
+            .write_image(&RED_FRAME, 2, 1, ExtendedColorType::Rgba8)
+            .unwrap();
+
+        let (width, height, frames) = load_full_image_tiles(&path, OutputColorSpace::Srgb).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].delay, Duration::ZERO);
+        assert_eq!(frames[0].tiles[0].5, RED_FRAME);
     }
 
     #[test]
@@ -793,7 +1207,7 @@ mod tests {
             .write_image(&[128, 200, 50], 1, 1, ExtendedColorType::Rgb8)
             .unwrap();
 
-        let decoded = decode_standard_image(&path).unwrap();
+        let decoded = decode_standard_image(&path, ImageFormat::Png).unwrap();
         fs::remove_file(&path).unwrap();
         assert!(matches!(
             decoded.embedded_color_profile,

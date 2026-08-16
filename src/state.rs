@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use toml::Value as TomlValue;
 use vt100::Parser;
 
@@ -262,12 +262,18 @@ pub enum FullPendingState {
 pub type FullImageTile = (u32, u32, u32, u32, TilePixelFormat, Vec<u8>);
 
 #[derive(Debug)]
+pub struct FullImageFrame {
+    pub delay: Duration,
+    pub tiles: Vec<FullImageTile>,
+}
+
+#[derive(Debug)]
 pub enum FullImageMessage {
     Loaded {
         index: usize,
         full_w: u32,
         full_h: u32,
-        tiles: Vec<FullImageTile>,
+        frames: Vec<FullImageFrame>,
     },
     Failed {
         index: usize,
@@ -295,15 +301,94 @@ pub struct Tile {
 }
 
 #[derive(Debug)]
-pub struct TiledTexture {
-    pub full_w: u32,
-    pub full_h: u32,
+pub struct TiledFrame {
+    pub delay: Duration,
     pub tiles: Vec<Tile>,
 }
 
+#[derive(Debug)]
+pub struct TiledTexture {
+    pub full_w: u32,
+    pub full_h: u32,
+    pub frames: Vec<TiledFrame>,
+    current_frame: usize,
+    next_frame_at: Option<Instant>,
+}
+
 impl TiledTexture {
+    const MIN_FRAME_DELAY: Duration = Duration::from_millis(10);
+
     pub fn size(&self) -> [u32; 2] {
         [self.full_w, self.full_h]
+    }
+
+    pub fn new(full_w: u32, full_h: u32, frames: Vec<TiledFrame>) -> Self {
+        debug_assert!(!frames.is_empty());
+        Self {
+            full_w,
+            full_h,
+            frames,
+            current_frame: 0,
+            next_frame_at: None,
+        }
+    }
+
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub fn current_frame_index(&self) -> usize {
+        self.current_frame
+    }
+
+    pub fn current_tiles(&self) -> &[Tile] {
+        &self.frames[self.current_frame].tiles
+    }
+
+    pub fn current_tiles_mut(&mut self) -> &mut [Tile] {
+        &mut self.frames[self.current_frame].tiles
+    }
+
+    fn current_delay(&self) -> Duration {
+        self.frames[self.current_frame]
+            .delay
+            .max(Self::MIN_FRAME_DELAY)
+    }
+
+    pub fn restart_animation(&mut self, now: Instant) {
+        self.current_frame = 0;
+        self.next_frame_at = (self.frames.len() > 1).then(|| now + self.current_delay());
+    }
+
+    pub fn next_animation_frame_at(&self) -> Option<Instant> {
+        self.next_frame_at
+    }
+
+    /// Advance to the frame that should be visible at `now`.
+    ///
+    /// At most one complete cycle is traversed after a long suspension. This keeps resuming an
+    /// animation bounded even for GIFs with very short frame delays.
+    pub fn advance_animation(&mut self, now: Instant) -> bool {
+        let Some(mut deadline) = self.next_frame_at else {
+            return false;
+        };
+        if now < deadline || self.frames.len() < 2 {
+            return false;
+        }
+
+        for _ in 0..self.frames.len() {
+            self.current_frame = (self.current_frame + 1) % self.frames.len();
+            deadline += self.current_delay();
+            if now < deadline {
+                self.next_frame_at = Some(deadline);
+                return true;
+            }
+        }
+
+        // The application was asleep for at least a complete cycle. Resume from the current
+        // frame instead of walking an unbounded number of missed frames.
+        self.next_frame_at = Some(now + self.current_delay());
+        true
     }
 }
 
@@ -409,4 +494,57 @@ pub struct ThumbnailTexture {
     pub texture: GpuTexture,
     pub center: Vec2,
     pub size: [u32; 2],
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn animated_texture(delays: &[Duration]) -> TiledTexture {
+        TiledTexture::new(
+            1,
+            1,
+            delays
+                .iter()
+                .copied()
+                .map(|delay| TiledFrame {
+                    delay,
+                    tiles: Vec::new(),
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn animated_texture_advances_using_each_frames_delay() {
+        let start = Instant::now();
+        let mut texture = animated_texture(&[Duration::from_millis(40), Duration::from_millis(70)]);
+        texture.restart_animation(start);
+
+        assert_eq!(
+            texture.next_animation_frame_at(),
+            Some(start + Duration::from_millis(40))
+        );
+        assert!(!texture.advance_animation(start + Duration::from_millis(39)));
+        assert!(texture.advance_animation(start + Duration::from_millis(40)));
+        assert_eq!(texture.current_frame_index(), 1);
+        assert_eq!(
+            texture.next_animation_frame_at(),
+            Some(start + Duration::from_millis(110))
+        );
+        assert!(texture.advance_animation(start + Duration::from_millis(110)));
+        assert_eq!(texture.current_frame_index(), 0);
+    }
+
+    #[test]
+    fn zero_length_animation_delays_are_clamped() {
+        let start = Instant::now();
+        let mut texture = animated_texture(&[Duration::ZERO, Duration::ZERO]);
+        texture.restart_animation(start);
+
+        assert_eq!(
+            texture.next_animation_frame_at(),
+            Some(start + Duration::from_millis(10))
+        );
+    }
 }

@@ -45,3 +45,6 @@ tokenizers = { version = "0.21.0", default-features = false, features = ["fancy-
 num_cpus = "1.17"
 portable-pty = "0.9.0"
 vt100 = "0.16.2"
+
+[dev-dependencies]
+png = "0.18.1"

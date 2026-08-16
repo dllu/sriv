@@ -28,7 +28,7 @@ use crate::renderer::Renderer;
 use crate::state::{
     parse_bindings, parse_ui_font_path, CommandEvent, FullImageMessage, FullPendingState, Mode,
     Model, SearchState, TerminalState, ThumbRequestQueue, ThumbnailEntry, ThumbnailTexture,
-    ThumbnailUpdate, Tile, TiledTexture,
+    ThumbnailUpdate, Tile, TiledFrame, TiledTexture,
 };
 use crate::ui;
 
@@ -282,7 +282,7 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
                     image_paths.push(path.canonicalize().unwrap());
                 }
             }
-        } else if pb.is_file() {
+        } else if pb.is_file() && image_io::is_supported_image_path(&pb) {
             image_paths.push(pb.canonicalize().unwrap());
         }
     }
@@ -412,13 +412,13 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
                 while let Ok(idx) = req_rx.recv() {
                     if let Some(path) = paths.get(idx) {
                         match image_io::load_full_image_tiles(path, output_color_space) {
-                            Ok((full_w, full_h, tiles_data)) => {
+                            Ok((full_w, full_h, frames)) => {
                                 if resp_tx
                                     .send(FullImageMessage::Loaded {
                                         index: idx,
                                         full_w,
                                         full_h,
-                                        tiles: tiles_data,
+                                        frames,
                                     })
                                     .is_ok()
                                 {
@@ -570,6 +570,16 @@ impl ApplicationState {
                 self.model.full_pending.get(&self.model.current)
             {
                 next = next.min(*last_error_at + FULL_PENDING_RETRY);
+            }
+        }
+        if matches!(self.model.mode, Mode::Single) {
+            if let Some(next_frame_at) = self
+                .model
+                .full_textures
+                .get(&self.model.current)
+                .and_then(TiledTexture::next_animation_frame_at)
+            {
+                next = next.min(next_frame_at);
             }
         }
         next
@@ -784,7 +794,8 @@ fn navigate_to(app: &App, model: &mut Model, new_idx: usize) {
         request_full_texture(model, new_idx + 1);
     }
     // Apply fit if already loaded
-    if model.full_textures.contains_key(&new_idx) {
+    if let Some(texture) = model.full_textures.get_mut(&new_idx) {
+        texture.restart_animation(Instant::now());
         apply_fit(app, model);
     }
 }
@@ -1339,6 +1350,9 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                         }
                         // Enter single mode and fit image to window
                         model.mode = Mode::Single;
+                        if let Some(texture) = model.full_textures.get_mut(&idx) {
+                            texture.restart_animation(Instant::now());
+                        }
                         apply_fit(app, model);
                     }
                     Mode::Single => {
@@ -1554,27 +1568,34 @@ fn update(app: &App, model: &mut Model, renderer: &Renderer, check_files: bool) 
                 index: idx,
                 full_w,
                 full_h,
-                tiles,
+                frames,
             } => {
                 // Store raw pixel data for lazy texture creation
-                let mut prepared_tiles = Vec::new();
-
-                for (x_offset, y_offset, width, height, format, pixel_data) in tiles {
-                    prepared_tiles.push(Tile {
-                        x_offset,
-                        y_offset,
-                        width,
-                        height,
-                        format,
-                        pixel_data,
-                        texture: None,
-                    });
+                let prepared_frames = frames
+                    .into_iter()
+                    .map(|frame| TiledFrame {
+                        delay: frame.delay,
+                        tiles: frame
+                            .tiles
+                            .into_iter()
+                            .map(
+                                |(x_offset, y_offset, width, height, format, pixel_data)| Tile {
+                                    x_offset,
+                                    y_offset,
+                                    width,
+                                    height,
+                                    format,
+                                    pixel_data,
+                                    texture: None,
+                                },
+                            )
+                            .collect(),
+                    })
+                    .collect();
+                let mut tiled = TiledTexture::new(full_w, full_h, prepared_frames);
+                if idx == model.current && matches!(model.mode, Mode::Single) {
+                    tiled.restart_animation(Instant::now());
                 }
-                let tiled = TiledTexture {
-                    full_w,
-                    full_h,
-                    tiles: prepared_tiles,
-                };
                 // Insert into cache and update LRU
                 model.full_textures.insert(idx, tiled);
                 touch_full_texture(model, idx);
@@ -1608,6 +1629,11 @@ fn update(app: &App, model: &mut Model, renderer: &Renderer, check_files: bool) 
                     model.full_usage.remove(pos);
                 }
             }
+        }
+    }
+    if matches!(model.mode, Mode::Single) {
+        if let Some(texture) = model.full_textures.get_mut(&model.current) {
+            redraw_needed |= texture.advance_animation(Instant::now());
         }
     }
     // Handle window resize: update view parameters and re-apply fit if in fit mode
