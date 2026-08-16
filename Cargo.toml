@@ -22,6 +22,7 @@ image = { version = "0.25.10", default-features = false, features = [
     "tiff",
     "webp",
 ] }
+jxl-oxide = { version = "0.12.6", default-features = false, features = ["moxcms", "rayon"] }
 moxcms = { version = "0.8.1", features = ["in_place"] }
 libheif-rs = { version = "2.7.0", default-features = false, features = ["v1_17"] }
 anyhow = "1.0.71"

@@ -5,6 +5,7 @@ use image::{
     imageops::FilterType, AnimationDecoder, DynamicImage, Frames, ImageDecoder, ImageFormat,
     ImageReader, RgbImage, RgbaImage,
 };
+use jxl_oxide::{EnumColourEncoding, JxlImage, Render, RenderingIntent};
 use libheif_rs::{ColorSpace as HeifColorSpace, HeifContext, LibHeif, Plane, RgbChroma};
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -29,7 +30,11 @@ const FORMAT_DETECTION_BYTES: u64 = 4096;
 enum DetectedImageFormat {
     Standard(ImageFormat),
     Heif,
+    Jxl,
 }
+
+const JXL_CODESTREAM_SIGNATURE: &[u8] = b"\xff\x0a";
+const JXL_CONTAINER_SIGNATURE: &[u8] = b"\x00\x00\x00\x0cJXL \x0d\x0a\x87\x0a";
 
 /// List of recognized raw file extensions for detecting XMP sidecars.
 const RAW_EXTENSIONS: &[&str] = &[
@@ -90,6 +95,9 @@ fn has_heif_file_type_box(bytes: &[u8]) -> bool {
 }
 
 fn detect_supported_image_format_bytes(bytes: &[u8]) -> Option<DetectedImageFormat> {
+    if bytes.starts_with(JXL_CODESTREAM_SIGNATURE) || bytes.starts_with(JXL_CONTAINER_SIGNATURE) {
+        return Some(DetectedImageFormat::Jxl);
+    }
     if has_heif_file_type_box(bytes) {
         return Some(DetectedImageFormat::Heif);
     }
@@ -319,7 +327,7 @@ where
     Container: std::ops::Deref<Target = [P::Subpixel]>,
 {
     image_rs::ImageBuffer::from_raw(width, height, buf)
-        .ok_or_else(|| anyhow!("decoded HEIF {format_name} data has the wrong length"))
+        .ok_or_else(|| anyhow!("decoded {format_name} data has the wrong length"))
 }
 
 fn decode_heif_image(path: &Path) -> Result<DecodedImage> {
@@ -400,6 +408,171 @@ fn decode_standard_image(path: &Path, format: ImageFormat) -> Result<DecodedImag
     })
 }
 
+fn open_jxl_image(path: &Path, output_color_space: OutputColorSpace) -> Result<JxlImage> {
+    let mut image = JxlImage::builder()
+        .open(path)
+        .map_err(|error| anyhow!("failed to decode JPEG XL image: {error}"))?;
+    let rendering_intent = RenderingIntent::Relative;
+    let encoding = if image.image_header().metadata.grayscale() {
+        EnumColourEncoding::gray_srgb(rendering_intent)
+    } else {
+        match output_color_space {
+            OutputColorSpace::Srgb => EnumColourEncoding::srgb(rendering_intent),
+            OutputColorSpace::DisplayP3 => EnumColourEncoding::display_p3(rendering_intent),
+        }
+    };
+    image.request_color_encoding(encoding);
+    Ok(image)
+}
+
+fn jxl_needs_16_bit(image: &JxlImage) -> bool {
+    let metadata = &image.image_header().metadata;
+    metadata.bit_depth.bits_per_sample() > 8
+        || metadata
+            .ec_info
+            .iter()
+            .any(|channel| channel.bit_depth.bits_per_sample() > 8)
+}
+
+fn jxl_has_associated_alpha(image: &JxlImage) -> bool {
+    image
+        .image_header()
+        .metadata
+        .ec_info
+        .iter()
+        .find_map(|channel| channel.alpha_associated())
+        .unwrap_or(false)
+}
+
+fn unpremultiply_u8(samples: &mut [u8], channels: usize) {
+    for pixel in samples.chunks_exact_mut(channels) {
+        let alpha = u16::from(pixel[channels - 1]);
+        if alpha == 0 {
+            continue;
+        }
+        for sample in &mut pixel[..channels - 1] {
+            *sample = ((u16::from(*sample) * u16::from(u8::MAX) + alpha / 2) / alpha)
+                .min(u16::from(u8::MAX)) as u8;
+        }
+    }
+}
+
+fn unpremultiply_u16(samples: &mut [u16], channels: usize) {
+    for pixel in samples.chunks_exact_mut(channels) {
+        let alpha = u32::from(pixel[channels - 1]);
+        if alpha == 0 {
+            continue;
+        }
+        for sample in &mut pixel[..channels - 1] {
+            *sample = ((u32::from(*sample) * u32::from(u16::MAX) + alpha / 2) / alpha)
+                .min(u32::from(u16::MAX)) as u16;
+        }
+    }
+}
+
+fn jxl_render_to_dynamic_image(
+    render: &Render,
+    high_bit_depth: bool,
+    associated_alpha: bool,
+) -> Result<DynamicImage> {
+    let mut stream = render.stream();
+    let width = stream.width();
+    let height = stream.height();
+    let channels = stream.channels() as usize;
+    if !(1..=4).contains(&channels) {
+        return Err(anyhow!(
+            "unsupported decoded JPEG XL pixel format with {channels} channels"
+        ));
+    }
+    let sample_count = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(channels))
+        .ok_or_else(|| anyhow!("decoded JPEG XL dimensions overflow usize"))?;
+
+    if high_bit_depth {
+        let mut samples = vec![0_u16; sample_count];
+        if stream.write_to_buffer(&mut samples) != sample_count {
+            return Err(anyhow!("JPEG XL decoder returned too few pixel samples"));
+        }
+        if associated_alpha && matches!(channels, 2 | 4) {
+            unpremultiply_u16(&mut samples, channels);
+        }
+        return Ok(match channels {
+            1 => DynamicImage::ImageLuma16(image_buffer_from_raw(
+                width,
+                height,
+                samples,
+                "JPEG XL L16",
+            )?),
+            2 => DynamicImage::ImageLumaA16(image_buffer_from_raw(
+                width,
+                height,
+                samples,
+                "JPEG XL LA16",
+            )?),
+            3 => DynamicImage::ImageRgb16(image_buffer_from_raw(
+                width,
+                height,
+                samples,
+                "JPEG XL RGB16",
+            )?),
+            4 => DynamicImage::ImageRgba16(image_buffer_from_raw(
+                width,
+                height,
+                samples,
+                "JPEG XL RGBA16",
+            )?),
+            _ => unreachable!(),
+        });
+    }
+
+    let mut samples = vec![0_u8; sample_count];
+    if stream.write_to_buffer(&mut samples) != sample_count {
+        return Err(anyhow!("JPEG XL decoder returned too few pixel samples"));
+    }
+    if associated_alpha && matches!(channels, 2 | 4) {
+        unpremultiply_u8(&mut samples, channels);
+    }
+    Ok(match channels {
+        1 => DynamicImage::ImageLuma8(image_buffer_from_raw(width, height, samples, "JPEG XL L8")?),
+        2 => DynamicImage::ImageLumaA8(image_buffer_from_raw(
+            width,
+            height,
+            samples,
+            "JPEG XL LA8",
+        )?),
+        3 => DynamicImage::ImageRgb8(image_buffer_from_raw(
+            width,
+            height,
+            samples,
+            "JPEG XL RGB8",
+        )?),
+        4 => DynamicImage::ImageRgba8(image_buffer_from_raw(
+            width,
+            height,
+            samples,
+            "JPEG XL RGBA8",
+        )?),
+        _ => unreachable!(),
+    })
+}
+
+fn decode_jxl_first_frame(
+    path: &Path,
+    output_color_space: OutputColorSpace,
+) -> Result<DynamicImage> {
+    let image = open_jxl_image(path, output_color_space)?;
+    if image.num_loaded_keyframes() == 0 {
+        return Err(anyhow!("JPEG XL image contains no displayable frames"));
+    }
+    let high_bit_depth = jxl_needs_16_bit(&image);
+    let associated_alpha = jxl_has_associated_alpha(&image);
+    let render = image
+        .render_frame(0)
+        .map_err(|error| anyhow!("failed to render JPEG XL frame: {error}"))?;
+    jxl_render_to_dynamic_image(&render, high_bit_depth, associated_alpha)
+}
+
 fn read_embedded_color_profile(
     path: &Path,
     decoder: &mut impl ImageDecoder,
@@ -476,6 +649,7 @@ fn decode_image_no_limits_as(
     let decoded = match format {
         DetectedImageFormat::Heif => decode_heif_image(path)?,
         DetectedImageFormat::Standard(format) => decode_standard_image(path, format)?,
+        DetectedImageFormat::Jxl => return decode_jxl_first_frame(path, output_color_space),
     };
     let image = convert_decoded_to_output(path, decoded, output_color_space);
     // libheif applies HEIF orientation transformations during decoding.
@@ -682,6 +856,43 @@ fn open_animation(path: &Path, format: DetectedImageFormat) -> Result<Option<Dec
     }
 }
 
+fn load_frame_sequence<I, F>(
+    expected_dimensions: (u32, u32),
+    decoded_frames: I,
+    mut prepare_image: F,
+) -> Result<(u32, u32, Vec<FullImageFrame>)>
+where
+    I: IntoIterator<Item = Result<(DynamicImage, Duration)>>,
+    F: FnMut(DynamicImage) -> DynamicImage,
+{
+    let mut full_dimensions = None;
+    let mut frames = Vec::new();
+    for frame in decoded_frames {
+        let (image, delay) = frame?;
+        if (image.width(), image.height()) != expected_dimensions {
+            return Err(anyhow!(
+                "decoded frame is {}x{}, expected {}x{}",
+                image.width(),
+                image.height(),
+                expected_dimensions.0,
+                expected_dimensions.1
+            ));
+        }
+        let image = prepare_image(image);
+        let (frame_w, frame_h, tiles) = tile_dynamic_image(image);
+        let dimensions = (frame_w, frame_h);
+        if full_dimensions.is_some_and(|expected| expected != dimensions) {
+            return Err(anyhow!("decoded frames have inconsistent dimensions"));
+        }
+        full_dimensions = Some(dimensions);
+        frames.push(FullImageFrame { delay, tiles });
+    }
+
+    let (full_w, full_h) =
+        full_dimensions.ok_or_else(|| anyhow!("image contains no animation frames"))?;
+    Ok((full_w, full_h, frames))
+}
+
 fn load_animated_image(
     path: &Path,
     output_color_space: OutputColorSpace,
@@ -693,42 +904,59 @@ fn load_animated_image(
         frames: decoded_frames,
     } = animation;
     let orientation = orientation_code(path);
-    let mut full_dimensions = None;
-    let mut frames = Vec::new();
-    for frame in decoded_frames {
+    let frames = decoded_frames.map(|frame| -> Result<_> {
         let frame = frame?;
         let delay = Duration::from(frame.delay());
-        let buffer = frame.into_buffer();
-        if buffer.dimensions() != expected_dimensions {
-            return Err(anyhow!(
-                "decoded animation frame is {}x{}, expected {}x{}",
-                buffer.width(),
-                buffer.height(),
-                expected_dimensions.0,
-                expected_dimensions.1
-            ));
-        }
+        Ok((DynamicImage::ImageRgba8(frame.into_buffer()), delay))
+    });
+    load_frame_sequence(expected_dimensions, frames, |image| {
         let image = convert_image_to_output(
             path,
-            DynamicImage::ImageRgba8(buffer),
+            image,
             embedded_color_profile.as_ref(),
             output_color_space,
         );
-        let image = apply_orientation(image, orientation);
-        let (frame_w, frame_h, tiles) = tile_dynamic_image(image);
-        let dimensions = (frame_w, frame_h);
-        if full_dimensions.is_some_and(|expected| expected != dimensions) {
-            return Err(anyhow!(
-                "oriented animation frames have inconsistent dimensions"
-            ));
-        }
-        full_dimensions = Some(dimensions);
-        frames.push(FullImageFrame { delay, tiles });
-    }
+        apply_orientation(image, orientation)
+    })
+}
 
-    let (full_w, full_h) =
-        full_dimensions.ok_or_else(|| anyhow!("image contains no animation frames"))?;
-    Ok((full_w, full_h, frames))
+fn jxl_frame_delay(ticks: u32, animation: Option<&jxl_oxide::image::AnimationHeader>) -> Duration {
+    let Some(animation) = animation else {
+        return Duration::ZERO;
+    };
+    if animation.tps_numerator == 0 {
+        return Duration::ZERO;
+    }
+    let nanos = u128::from(ticks) * u128::from(animation.tps_denominator) * 1_000_000_000_u128
+        / u128::from(animation.tps_numerator);
+    Duration::new(
+        (nanos / 1_000_000_000) as u64,
+        (nanos % 1_000_000_000) as u32,
+    )
+}
+
+fn load_jxl_image_frames(
+    path: &Path,
+    output_color_space: OutputColorSpace,
+) -> Result<(u32, u32, Vec<FullImageFrame>)> {
+    let image = open_jxl_image(path, output_color_space)?;
+    let frame_count = image.num_loaded_keyframes();
+    if frame_count == 0 {
+        return Err(anyhow!("JPEG XL image contains no displayable frames"));
+    }
+    let dimensions = (image.width(), image.height());
+    let high_bit_depth = jxl_needs_16_bit(&image);
+    let associated_alpha = jxl_has_associated_alpha(&image);
+    let animation = image.image_header().metadata.animation.as_ref();
+    let frames = (0..frame_count).map(|frame_index| -> Result<_> {
+        let render = image
+            .render_frame(frame_index)
+            .map_err(|error| anyhow!("failed to render JPEG XL frame: {error}"))?;
+        let delay = jxl_frame_delay(render.duration(), animation);
+        let image = jxl_render_to_dynamic_image(&render, high_bit_depth, associated_alpha)?;
+        Ok((image, delay))
+    });
+    load_frame_sequence(dimensions, frames, std::convert::identity)
 }
 
 pub(crate) fn load_full_image_tiles(
@@ -736,6 +964,9 @@ pub(crate) fn load_full_image_tiles(
     output_color_space: OutputColorSpace,
 ) -> Result<(u32, u32, Vec<FullImageFrame>)> {
     let format = detect_supported_image_format(path)?;
+    if format == DetectedImageFormat::Jxl {
+        return load_jxl_image_frames(path, output_color_space);
+    }
     if let Some(animation) = open_animation(path, format)? {
         return load_animated_image(path, output_color_space, animation);
     }
@@ -998,6 +1229,14 @@ mod tests {
             detect_supported_image_format_bytes(b"\0\0\0\x14ftypisom\0\0\0\0heix"),
             Some(DetectedImageFormat::Heif)
         );
+        assert_eq!(
+            detect_supported_image_format_bytes(b"\xff\x0aJPEG XL codestream"),
+            Some(DetectedImageFormat::Jxl)
+        );
+        assert_eq!(
+            detect_supported_image_format_bytes(b"\0\0\0\x0cJXL \r\n\x87\nrest"),
+            Some(DetectedImageFormat::Jxl)
+        );
         assert_eq!(detect_supported_image_format_bytes(b"plain text"), None);
     }
 
@@ -1156,6 +1395,83 @@ mod tests {
         fs::write(&path, encoded).unwrap();
 
         assert_test_animation(&path);
+    }
+
+    fn decode_hex_fixture(encoded: &str) -> Vec<u8> {
+        assert!(encoded.len().is_multiple_of(2));
+        encoded
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|digits| u8::from_str_radix(std::str::from_utf8(digits).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    fn wrap_jxl_container(codestream: &[u8]) -> Vec<u8> {
+        let mut container = JXL_CONTAINER_SIGNATURE.to_vec();
+        container.extend_from_slice(&20_u32.to_be_bytes());
+        container.extend_from_slice(b"ftypjxl \0\0\0\0jxl ");
+        container.extend_from_slice(&(codestream.len() as u32 + 8).to_be_bytes());
+        container.extend_from_slice(b"jxlc");
+        container.extend_from_slice(codestream);
+        container
+    }
+
+    #[test]
+    fn full_animated_jxl_loader_uses_shared_animation_path() {
+        // Lossless 2x1 RGBA animation generated with the libjxl reference encoder.
+        const ANIMATED_JXL: &str =
+            "ff0a00704100d60408082001000034004b188b15c249411e4084fefa030808e041000034004b188b15c249411e40a43ffa03";
+        let path = animation_test_path("jxl");
+        fs::write(&path, decode_hex_fixture(ANIMATED_JXL)).unwrap();
+
+        assert_test_animation(&path);
+    }
+
+    #[test]
+    fn non_animated_jxl_has_one_zero_delay_frame() {
+        const STILL_JXL: &str =
+            "ff0a305410090806010078004b38413cb63a51fe00471ea085b8271a4845841b714fa83e8e3003928401";
+        let path = animation_test_path("still-jxl-container");
+        let codestream = decode_hex_fixture(STILL_JXL);
+        fs::write(&path, wrap_jxl_container(&codestream)).unwrap();
+
+        let still = decode_image_no_limits(&path, OutputColorSpace::Srgb).unwrap();
+        assert_eq!((still.width(), still.height()), (240, 135));
+        assert_eq!(still.to_rgba8().get_pixel(0, 0).0, [6, 6, 6, 255]);
+
+        let (width, height, frames) = load_full_image_tiles(&path, OutputColorSpace::Srgb).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!((width, height), (240, 135));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].delay, Duration::ZERO);
+        assert_eq!(&frames[0].tiles[0].5[..4], &[6, 6, 6, 255]);
+    }
+
+    #[test]
+    fn jxl_preserves_high_bit_depth_pixels() {
+        // Lossless 1x1 RGBA16 image generated with the libjxl reference encoder.
+        const RGBA16_JXL: &str =
+            "0000000c4a584c200d0a870a00000014667479706a786c20000000006a786c20000000096a786c6c0a000000276a786c63ff0a0010fc087e80040808100040004b188b15428a8c021cc069fcff01e200";
+        let path = animation_test_path("rgba16-jxl");
+        fs::write(&path, decode_hex_fixture(RGBA16_JXL)).unwrap();
+
+        let (width, height, frames) = load_full_image_tiles(&path, OutputColorSpace::Srgb).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!((width, height), (1, 1));
+        assert_eq!(frames.len(), 1);
+        let (_, _, _, _, format, pixels) = &frames[0].tiles[0];
+        assert_eq!(*format, TilePixelFormat::Rgba16);
+        assert_eq!(
+            native_u16_samples(pixels),
+            [
+                srgb_u16_to_linear_u16(0),
+                srgb_u16_to_linear_u16(32_768),
+                srgb_u16_to_linear_u16(65_535),
+                40_000,
+            ]
+        );
     }
 
     #[test]
