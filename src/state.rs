@@ -2,7 +2,6 @@ use crate::clip::ClipEngine;
 use crate::geometry::{Rect, Vec2};
 use crate::input::Key;
 use crate::renderer::GpuTexture;
-use crate::FullImageMessage;
 use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender};
 use image::DynamicImage;
 use portable_pty::MasterPty;
@@ -260,9 +259,27 @@ pub enum FullPendingState {
     Failed { last_error_at: Instant },
 }
 
+pub type FullImageTile = (u32, u32, u32, u32, TilePixelFormat, Vec<u8>);
+
+#[derive(Debug)]
+pub enum FullImageMessage {
+    Loaded {
+        index: usize,
+        full_w: u32,
+        full_h: u32,
+        tiles: Vec<FullImageTile>,
+    },
+    Failed {
+        index: usize,
+        error: String,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TilePixelFormat {
+    /// Encoded with the output space's sRGB transfer function; sampled through an sRGB texture.
     Rgba8,
+    /// Linear-light output-space values; sampled through a linear 16-bit UNORM texture.
     Rgba16,
 }
 

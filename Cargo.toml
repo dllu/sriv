@@ -14,7 +14,15 @@ cuda = [
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-image = "0.24.6"
+image = { version = "0.25.10", default-features = false, features = [
+    "bmp",
+    "gif",
+    "jpeg",
+    "png",
+    "tiff",
+    "webp",
+] }
+moxcms = { version = "0.8.1", features = ["in_place"] }
 libheif-rs = { version = "2.7.0", default-features = false, features = ["v1_17"] }
 anyhow = "1.0.71"
 rayon = "1.7.0"

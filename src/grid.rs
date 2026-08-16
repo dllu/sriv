@@ -1,6 +1,8 @@
 use crate::geometry::{vec2, Rect, Vec2};
 use crate::state::Model;
-use crate::THUMB_PREFETCH_ROWS;
+
+/// Number of extra rows of thumbnails to keep warm beyond the viewport.
+const THUMB_PREFETCH_ROWS: usize = 1;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ThumbnailGrid {

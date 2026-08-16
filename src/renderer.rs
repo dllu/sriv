@@ -1,3 +1,4 @@
+use crate::color::{srgba_to_output_encoded, srgba_to_output_linear, OutputColorSpace};
 use crate::geometry::{Rect, Rgba, Vec2, WHITE};
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
@@ -338,12 +339,6 @@ impl TextureBuilder<'_, '_> {
         self.size = [width.max(0.0), height.max(0.0)];
         self
     }
-
-    #[allow(dead_code)]
-    pub fn color(mut self, color: Rgba) -> Self {
-        self.color = color;
-        self
-    }
 }
 
 impl Drop for TextureBuilder<'_, '_> {
@@ -417,6 +412,7 @@ pub struct Renderer {
     pub queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
+    output_color_space: OutputColorSpace,
     pipeline: wgpu::RenderPipeline,
     texture_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -463,6 +459,7 @@ impl Renderer {
             })
             .await
             .context("failed to create the graphics device")?;
+        let capabilities = surface.get_capabilities(&adapter);
         let mut surface_config = surface
             .get_default_config(
                 &adapter,
@@ -470,15 +467,16 @@ impl Renderer {
                 physical_size.height.max(1),
             )
             .context("the graphics adapter cannot present to this window")?;
-        if let Some(srgb) = surface
-            .get_capabilities(&adapter)
+        let fallback_format = capabilities
             .formats
             .iter()
             .copied()
             .find(wgpu::TextureFormat::is_srgb)
-        {
-            surface_config.format = srgb;
-        }
+            .unwrap_or(surface_config.format);
+        let (format, surface_color_space, output_color_space) =
+            choose_surface_output(&capabilities.format_capabilities, fallback_format);
+        surface_config.format = format;
+        surface_config.color_space = surface_color_space;
         surface.configure(&device, &surface_config);
 
         let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -574,6 +572,7 @@ impl Renderer {
             queue,
             surface,
             surface_config,
+            output_color_space,
             pipeline,
             texture_layout,
             sampler,
@@ -608,6 +607,10 @@ impl Renderer {
 
     pub fn supports_rgba16(&self) -> bool {
         self.supports_rgba16
+    }
+
+    pub fn output_color_space(&self) -> OutputColorSpace {
+        self.output_color_space
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -729,26 +732,27 @@ impl Renderer {
             let right = 2.0 * quad.rect.right() / logical_width;
             let top = 2.0 * quad.rect.top() / logical_height;
             let bottom = 2.0 * quad.rect.bottom() / logical_height;
+            let color = srgba_to_output_linear(quad.color, self.output_color_space);
             vertices.extend_from_slice(&[
                 Vertex {
                     position: [left, bottom],
                     tex_coords: [0.0, 1.0],
-                    color: quad.color,
+                    color,
                 },
                 Vertex {
                     position: [right, bottom],
                     tex_coords: [1.0, 1.0],
-                    color: quad.color,
+                    color,
                 },
                 Vertex {
                     position: [right, top],
                     tex_coords: [1.0, 0.0],
-                    color: quad.color,
+                    color,
                 },
                 Vertex {
                     position: [left, top],
                     tex_coords: [0.0, 0.0],
-                    color: quad.color,
+                    color,
                 },
             ]);
             let base = (quad_index * 4) as u32;
@@ -835,7 +839,7 @@ impl Renderer {
                         right: (left + command.size[0] * scale).ceil() as i32,
                         bottom: (bounds_top as f32 + command.size[1] * scale).ceil() as i32,
                     },
-                    default_color: rgba_to_text_color(command.color),
+                    default_color: rgba_to_text_color(command.color, self.output_color_space),
                     custom_glyphs: &[],
                 }
             });
@@ -851,10 +855,11 @@ impl Renderer {
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+            wgpu::CurrentSurfaceTexture::Timeout => {
                 self.window.request_redraw();
                 return Ok(());
             }
+            wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
                 self.surface.configure(&self.device, &self.surface_config);
                 self.window.request_redraw();
@@ -919,7 +924,85 @@ impl Renderer {
     }
 }
 
-fn rgba_to_text_color([red, green, blue, alpha]: Rgba) -> TextColor {
+fn choose_surface_output(
+    capabilities: &[wgpu::SurfaceFormatCapabilities],
+    fallback_format: wgpu::TextureFormat,
+) -> (
+    wgpu::TextureFormat,
+    wgpu::SurfaceColorSpace,
+    OutputColorSpace,
+) {
+    let find = |required: wgpu::SurfaceColorSpaces| {
+        capabilities.iter().find(|capability| {
+            capability.format.is_srgb() && capability.color_spaces.contains(required)
+        })
+    };
+    if let Some(capability) = find(wgpu::SurfaceColorSpaces::DISPLAY_P3) {
+        return (
+            capability.format,
+            wgpu::SurfaceColorSpace::DisplayP3,
+            OutputColorSpace::DisplayP3,
+        );
+    }
+    if let Some(capability) = find(wgpu::SurfaceColorSpaces::SRGB) {
+        return (
+            capability.format,
+            wgpu::SurfaceColorSpace::Srgb,
+            OutputColorSpace::Srgb,
+        );
+    }
+    (
+        fallback_format,
+        wgpu::SurfaceColorSpace::Auto,
+        OutputColorSpace::Srgb,
+    )
+}
+
+fn rgba_to_text_color(color: Rgba, output_color_space: OutputColorSpace) -> TextColor {
+    let [red, green, blue, alpha] = srgba_to_output_encoded(color, output_color_space);
     let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
     TextColor::rgba(channel(red), channel(green), channel(blue), channel(alpha))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn surface_selection_prefers_display_p3_on_srgb_formats() {
+        let capabilities = [
+            wgpu::SurfaceFormatCapabilities {
+                format: wgpu::TextureFormat::Bgra8UnormSrgb,
+                color_spaces: wgpu::SurfaceColorSpaces::SRGB | wgpu::SurfaceColorSpaces::DISPLAY_P3,
+            },
+            wgpu::SurfaceFormatCapabilities {
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                color_spaces: wgpu::SurfaceColorSpaces::SRGB,
+            },
+        ];
+        assert_eq!(
+            choose_surface_output(&capabilities, wgpu::TextureFormat::Bgra8UnormSrgb),
+            (
+                wgpu::TextureFormat::Bgra8UnormSrgb,
+                wgpu::SurfaceColorSpace::DisplayP3,
+                OutputColorSpace::DisplayP3,
+            )
+        );
+    }
+
+    #[test]
+    fn surface_selection_falls_back_to_srgb() {
+        let capabilities = [wgpu::SurfaceFormatCapabilities {
+            format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            color_spaces: wgpu::SurfaceColorSpaces::SRGB,
+        }];
+        assert_eq!(
+            choose_surface_output(&capabilities, wgpu::TextureFormat::Bgra8UnormSrgb),
+            (
+                wgpu::TextureFormat::Bgra8UnormSrgb,
+                wgpu::SurfaceColorSpace::Srgb,
+                OutputColorSpace::Srgb,
+            )
+        );
+    }
 }

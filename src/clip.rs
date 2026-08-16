@@ -16,6 +16,8 @@ use image::{imageops::FilterType, DynamicImage, RgbImage};
 use sha1::Sha1;
 use tokenizers::Tokenizer;
 
+use crate::app::AppProxy;
+
 const MAX_IMAGE_BATCH: usize = 16;
 
 /// Events emitted by the background CLIP worker.
@@ -87,10 +89,11 @@ struct ClipWorkerContext {
     config: clip::ClipConfig,
     result_tx: Sender<ClipEvent>,
     device_flag: Arc<AtomicBool>,
+    proxy: AppProxy,
 }
 
 impl ClipEngine {
-    pub fn new(cache_base: PathBuf) -> Result<Self> {
+    pub(crate) fn new(cache_base: PathBuf, proxy: AppProxy) -> Result<Self> {
         let (job_tx, job_rx) = unbounded::<ClipJob>();
         let (result_tx, result_rx) = unbounded::<ClipEvent>();
         let config = clip::ClipConfig::vit_base_patch32();
@@ -107,6 +110,7 @@ impl ClipEngine {
                 config: config.clone(),
                 result_tx: result_tx.clone(),
                 device_flag: using_cuda.clone(),
+                proxy: proxy.clone(),
             };
             let worker_rx = job_rx.clone();
             thread::Builder::new()
@@ -160,6 +164,7 @@ fn run_worker(ctx: ClipWorkerContext, job_rx: Receiver<ClipJob>, use_cuda: bool)
         config,
         result_tx,
         device_flag,
+        proxy,
     } = ctx;
     let device = if use_cuda {
         match Device::new_cuda(0) {
@@ -194,6 +199,22 @@ fn run_worker(ctx: ClipWorkerContext, job_rx: Receiver<ClipJob>, use_cuda: bool)
         VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&model_file), DType::F32, &device)?
     };
     let model = ClipModel::new(vb, &config)?;
+    let image_ctx = ImageBatchContext {
+        cache_base: &cache_base,
+        model: &model,
+        device: &device,
+        clip_image_size: config.image_size,
+        result_tx: &result_tx,
+        proxy: &proxy,
+    };
+    let text_ctx = TextJobContext {
+        model: &model,
+        tokenizer: &tokenizer,
+        pad_id,
+        device: &device,
+        result_tx: &result_tx,
+        proxy: &proxy,
+    };
     let mut channel_closed = false;
     while let Ok(job) = job_rx.recv() {
         match job {
@@ -222,24 +243,17 @@ fn run_worker(ctx: ClipWorkerContext, job_rx: Receiver<ClipJob>, use_cuda: bool)
                         }
                     }
                 }
-                let batch_ctx = ImageBatchContext {
-                    cache_base: &cache_base,
-                    model: &model,
-                    device: &device,
-                    clip_image_size: config.image_size,
-                    result_tx: &result_tx,
-                };
-                process_image_batch(batch, &batch_ctx);
+                process_image_batch(batch, &image_ctx);
                 if let Some(job) = deferred_job {
                     match job {
-                        ClipJob::Text { request_id, query } => handle_text_job(
-                            request_id, &query, &model, &tokenizer, pad_id, &device, &result_tx,
-                        ),
+                        ClipJob::Text { request_id, query } => {
+                            handle_text_job(request_id, &query, &text_ctx)
+                        }
                         ClipJob::Image {
                             index,
                             image_path,
                             thumbnail,
-                        } => process_image_batch(vec![(index, image_path, thumbnail)], &batch_ctx),
+                        } => process_image_batch(vec![(index, image_path, thumbnail)], &image_ctx),
                     }
                 }
                 if channel_closed {
@@ -247,36 +261,34 @@ fn run_worker(ctx: ClipWorkerContext, job_rx: Receiver<ClipJob>, use_cuda: bool)
                 }
             }
             ClipJob::Text { request_id, query } => {
-                handle_text_job(
-                    request_id, &query, &model, &tokenizer, pad_id, &device, &result_tx,
-                );
+                handle_text_job(request_id, &query, &text_ctx);
             }
         }
     }
     Ok(())
 }
 
-fn handle_text_job(
-    request_id: u64,
-    query: &str,
-    model: &ClipModel,
-    tokenizer: &Tokenizer,
-    pad_id: u32,
-    device: &Device,
-    result_tx: &Sender<ClipEvent>,
-) {
-    match process_text_job(query, model, tokenizer, pad_id, device) {
+fn handle_text_job(request_id: u64, query: &str, ctx: &TextJobContext<'_>) {
+    match process_text_job(query, ctx.model, ctx.tokenizer, ctx.pad_id, ctx.device) {
         Ok(embedding) => {
-            let _ = result_tx.send(ClipEvent::TextReady {
-                request_id,
-                embedding,
-            });
+            send_result(
+                ctx.result_tx,
+                ctx.proxy,
+                ClipEvent::TextReady {
+                    request_id,
+                    embedding,
+                },
+            );
         }
         Err(err) => {
-            let _ = result_tx.send(ClipEvent::TextError {
-                request_id,
-                error: format!("{}", err),
-            });
+            send_result(
+                ctx.result_tx,
+                ctx.proxy,
+                ClipEvent::TextError {
+                    request_id,
+                    error: format!("{}", err),
+                },
+            );
         }
     }
 }
@@ -294,10 +306,14 @@ fn process_image_batch(batch: Vec<(usize, PathBuf, RgbImage)>, ctx: &ImageBatchC
                 compute_tensors.push(tensor);
             }
             Err(err) => {
-                let _ = ctx.result_tx.send(ClipEvent::ImageError {
-                    index,
-                    error: format!("{}", err),
-                });
+                send_result(
+                    ctx.result_tx,
+                    ctx.proxy,
+                    ClipEvent::ImageError {
+                        index,
+                        error: format!("{}", err),
+                    },
+                );
             }
         }
     }
@@ -310,7 +326,7 @@ fn process_image_batch(batch: Vec<(usize, PathBuf, RgbImage)>, ctx: &ImageBatchC
     let stacked = match Tensor::stack(&tensor_refs, 0) {
         Ok(t) => t,
         Err(err) => {
-            report_batch_error(&compute_indices, ctx.result_tx, err);
+            report_batch_error(&compute_indices, ctx.result_tx, ctx.proxy, err);
             return;
         }
     };
@@ -318,7 +334,7 @@ fn process_image_batch(batch: Vec<(usize, PathBuf, RgbImage)>, ctx: &ImageBatchC
     let stacked = match stacked.to_device(ctx.device) {
         Ok(t) => t,
         Err(err) => {
-            report_batch_error(&compute_indices, ctx.result_tx, err);
+            report_batch_error(&compute_indices, ctx.result_tx, ctx.proxy, err);
             return;
         }
     };
@@ -333,32 +349,53 @@ fn process_image_batch(batch: Vec<(usize, PathBuf, RgbImage)>, ctx: &ImageBatchC
                 let embed_path = cache_file_path(ctx.cache_base, &path, "clip");
                 match write_embedding(&embed_path, &embedding) {
                     Ok(()) => {
-                        let _ = ctx
-                            .result_tx
-                            .send(ClipEvent::ImageReady { index, embedding });
+                        send_result(
+                            ctx.result_tx,
+                            ctx.proxy,
+                            ClipEvent::ImageReady { index, embedding },
+                        );
                     }
                     Err(err) => {
-                        let _ = ctx.result_tx.send(ClipEvent::ImageError {
-                            index,
-                            error: format!("{}", err),
-                        });
+                        send_result(
+                            ctx.result_tx,
+                            ctx.proxy,
+                            ClipEvent::ImageError {
+                                index,
+                                error: format!("{}", err),
+                            },
+                        );
                     }
                 }
             }
         }
         Err(err) => {
-            report_batch_error(&compute_indices, ctx.result_tx, err);
+            report_batch_error(&compute_indices, ctx.result_tx, ctx.proxy, err);
         }
     }
 }
 
-fn report_batch_error(indices: &[usize], result_tx: &Sender<ClipEvent>, err: impl fmt::Display) {
+fn send_result(result_tx: &Sender<ClipEvent>, proxy: &AppProxy, event: ClipEvent) {
+    if result_tx.send(event).is_ok() {
+        proxy.wakeup();
+    }
+}
+
+fn report_batch_error(
+    indices: &[usize],
+    result_tx: &Sender<ClipEvent>,
+    proxy: &AppProxy,
+    err: impl fmt::Display,
+) {
     let msg = format!("{}", err);
     for &idx in indices {
-        let _ = result_tx.send(ClipEvent::ImageError {
-            index: idx,
-            error: msg.clone(),
-        });
+        send_result(
+            result_tx,
+            proxy,
+            ClipEvent::ImageError {
+                index: idx,
+                error: msg.clone(),
+            },
+        );
     }
 }
 
@@ -368,6 +405,16 @@ struct ImageBatchContext<'a> {
     device: &'a Device,
     clip_image_size: usize,
     result_tx: &'a Sender<ClipEvent>,
+    proxy: &'a AppProxy,
+}
+
+struct TextJobContext<'a> {
+    model: &'a ClipModel,
+    tokenizer: &'a Tokenizer,
+    pad_id: u32,
+    device: &'a Device,
+    result_tx: &'a Sender<ClipEvent>,
+    proxy: &'a AppProxy,
 }
 
 fn process_text_job(
