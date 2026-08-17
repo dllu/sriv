@@ -255,7 +255,7 @@ pub struct SearchState {
 
 #[derive(Debug)]
 pub enum FullPendingState {
-    InFlight { _requested_at: Instant },
+    InFlight,
     Failed { last_error_at: Instant },
 }
 

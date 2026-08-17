@@ -52,7 +52,7 @@ sudo cargo install --path . --force --root /usr/local
 to clear and regenerate the thumbnail cache for all specified images, use the `--clear-cache` flag before the file or directory arguments:
 
 ```bash
-sriv-rs --clear-cache <image files or directories>
+sriv --clear-cache <image files or directories>
 ```
 
 ### clip semantic search

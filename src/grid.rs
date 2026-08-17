@@ -20,13 +20,9 @@ impl ThumbnailGrid {
     pub fn new(model: &Model, rect: Rect) -> Self {
         let thumb_size = model.thumb_size as f32;
         let cell = thumb_size + model.gap;
-        let mut cols = ((rect.w() + model.gap) / cell).floor() as isize;
-        if cols < 1 {
-            cols = 1;
-        }
-        let cols = cols as usize;
+        let cols = (((rect.w() + model.gap) / cell).floor() as isize).max(1) as usize;
         let total = model.image_paths.len();
-        let rows = if cols == 0 { 0 } else { total.div_ceil(cols) };
+        let rows = total.div_ceil(cols);
         let half_gap = model.gap / 2.0;
         Self {
             rect,
@@ -38,10 +34,6 @@ impl ThumbnailGrid {
             scroll: model.scroll_offset,
             total,
         }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.total == 0 || self.cols == 0
     }
 
     pub fn cols(&self) -> usize {
@@ -61,14 +53,14 @@ impl ThumbnailGrid {
     }
 
     pub fn visible_rows(&self) -> Option<(usize, usize)> {
-        if self.is_empty() || self.rows == 0 {
+        if self.total == 0 {
             return None;
         }
         let row_min_f = (self.scroll - self.thumb_size - self.half_gap) / self.cell;
         let row_max_f = (self.rect.h() + self.scroll - self.half_gap) / self.cell;
         let mut row_min = row_min_f.ceil() as isize - THUMB_PREFETCH_ROWS as isize;
         let mut row_max = row_max_f.floor() as isize + THUMB_PREFETCH_ROWS as isize;
-        let max_row = self.rows.saturating_sub(1) as isize;
+        let max_row = (self.rows - 1) as isize;
         if row_min < 0 {
             row_min = 0;
         }
@@ -99,7 +91,7 @@ impl ThumbnailGrid {
     }
 
     pub fn index_center(&self, idx: usize) -> Option<Vec2> {
-        if idx >= self.total || self.cols == 0 {
+        if idx >= self.total {
             return None;
         }
         let row = idx / self.cols;
@@ -109,7 +101,7 @@ impl ThumbnailGrid {
     }
 
     pub fn row_for_index(&self, idx: usize) -> Option<usize> {
-        if self.cols == 0 || idx >= self.total {
+        if idx >= self.total {
             None
         } else {
             Some(idx / self.cols)
@@ -129,16 +121,16 @@ impl ThumbnailGrid {
     }
 
     pub fn row_length(&self, row: usize) -> usize {
-        if self.cols == 0 || row >= self.rows {
+        if row >= self.rows {
             return 0;
         }
         let base = row * self.cols;
-        let remaining = self.total.saturating_sub(base);
+        let remaining = self.total - base;
         remaining.min(self.cols)
     }
 
     pub fn viewport_priority(&self, idx: usize) -> f32 {
-        if self.cols == 0 || idx >= self.total {
+        if idx >= self.total {
             return f32::MAX;
         }
         let row = idx / self.cols;

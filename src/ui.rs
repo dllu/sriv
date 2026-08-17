@@ -5,7 +5,7 @@ use std::process::Stdio;
 use std::thread;
 
 use crate::app::App;
-use crate::geometry::{srgba, vec2, Rect, Rgba, WHITE};
+use crate::geometry::{srgba, Rect, Rgba, WHITE};
 use crate::grid::ThumbnailGrid;
 use crate::image_io;
 use crate::renderer::{Renderer, Scene};
@@ -507,16 +507,9 @@ fn draw_terminal_panel(draw: &mut Scene<'_>, model: &Model, rect: Rect) {
             }
 
             if cell.underline() {
-                draw.line()
-                    .start(vec2(
-                        x - TERMINAL_CELL_WIDTH / 2.0,
-                        y - TERMINAL_CELL_HEIGHT / 2.6,
-                    ))
-                    .end(vec2(
-                        x + TERMINAL_CELL_WIDTH / 2.0,
-                        y - TERMINAL_CELL_HEIGHT / 2.6,
-                    ))
-                    .weight(1.0)
+                draw.rect()
+                    .x_y(x, y - TERMINAL_CELL_HEIGHT / 2.6)
+                    .w_h(TERMINAL_CELL_WIDTH, 1.0)
                     .color(fg);
             }
         }

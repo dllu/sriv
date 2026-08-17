@@ -136,16 +136,6 @@ impl<'a> Scene<'a> {
         }
     }
 
-    pub fn line(&mut self) -> LineBuilder<'_, 'a> {
-        LineBuilder {
-            scene: self,
-            start: Vec2::ZERO,
-            end: Vec2::ZERO,
-            weight: 1.0,
-            color: WHITE,
-        }
-    }
-
     pub fn text(&mut self, text: impl AsRef<str>) -> TextBuilder<'_, 'a> {
         let width = self.rect.w();
         TextBuilder {
@@ -165,7 +155,6 @@ impl<'a> Scene<'a> {
             texture,
             center: Vec2::ZERO,
             size: [texture.size[0] as f32, texture.size[1] as f32],
-            color: WHITE,
         }
     }
 
@@ -273,60 +262,11 @@ impl Drop for RectBuilder<'_, '_> {
     }
 }
 
-pub struct LineBuilder<'s, 'a> {
-    scene: &'s mut Scene<'a>,
-    start: Vec2,
-    end: Vec2,
-    weight: f32,
-    color: Rgba,
-}
-
-impl LineBuilder<'_, '_> {
-    pub fn start(mut self, start: Vec2) -> Self {
-        self.start = start;
-        self
-    }
-
-    pub fn end(mut self, end: Vec2) -> Self {
-        self.end = end;
-        self
-    }
-
-    pub fn weight(mut self, weight: f32) -> Self {
-        self.weight = weight;
-        self
-    }
-
-    pub fn color(mut self, color: Rgba) -> Self {
-        self.color = color;
-        self
-    }
-}
-
-impl Drop for LineBuilder<'_, '_> {
-    fn drop(&mut self) {
-        let midpoint = (self.start + self.end) / 2.0;
-        let delta = self.end - self.start;
-        // Every current call site draws horizontal underlines. Keeping the fallback
-        // axis-aligned also makes one-pixel UI lines remain crisp.
-        let (width, height) = if delta.x.abs() >= delta.y.abs() {
-            (delta.x.abs().max(1.0), self.weight.max(1.0))
-        } else {
-            (self.weight.max(1.0), delta.y.abs().max(1.0))
-        };
-        self.scene.push_solid_rect(
-            Rect::from_x_y_w_h(midpoint.x, midpoint.y, width, height),
-            self.color,
-        );
-    }
-}
-
 pub struct TextureBuilder<'s, 'a> {
     scene: &'s mut Scene<'a>,
     texture: &'a GpuTexture,
     center: Vec2,
     size: [f32; 2],
-    color: Rgba,
 }
 
 impl TextureBuilder<'_, '_> {
@@ -345,7 +285,7 @@ impl Drop for TextureBuilder<'_, '_> {
     fn drop(&mut self) {
         self.scene.quads.push(Quad {
             rect: Rect::from_x_y_w_h(self.center.x, self.center.y, self.size[0], self.size[1]),
-            color: self.color,
+            color: WHITE,
             image: QuadImage::Texture(self.texture),
         });
     }

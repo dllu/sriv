@@ -267,7 +267,7 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
         }
     }
     if args.is_empty() {
-        eprintln!("Usage: sriv-rs [--clear-cache] <image files or directories>...");
+        eprintln!("Usage: sriv [--clear-cache] <image files or directories>...");
         std::process::exit(1);
     }
     // Collect image file paths.
@@ -400,13 +400,11 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
     let (full_resp_tx, full_resp_rx) = unbounded::<FullImageMessage>();
     // Spawn a pool of loader threads for full images: load, crop, and convert to raw tile data off the main thread
     {
-        // Shared image paths for all workers
-        let paths = Arc::new(image_paths.clone());
         // Spawn worker threads matching thumbnail thread count
         for _ in 0..num_workers {
             let req_rx = full_req_rx.clone();
             let resp_tx = full_resp_tx.clone();
-            let paths = Arc::clone(&paths);
+            let paths = Arc::clone(&shared_paths);
             let proxy = worker_proxy.clone();
             thread::spawn(move || {
                 while let Ok(idx) = req_rx.recv() {
@@ -1109,9 +1107,6 @@ fn handle_arrow(app: &App, model: &mut Model, dir: ArrowDirection) -> bool {
             }
             let grid = ThumbnailGrid::new(model, rect);
             let cols = grid.cols();
-            if cols == 0 {
-                return false;
-            }
             let current = model.current.min(len - 1);
             let mut row = current / cols;
             let mut col = current % cols;
@@ -1682,8 +1677,7 @@ fn touch_full_texture(model: &mut Model, idx: usize) {
     model.full_usage.push_front(idx);
 }
 
-/// Ensure the full-resolution texture for `idx` is loaded and update LRU cache.
-/// Request loading of full-resolution image at `idx` in background.  Adds to pending set.
+/// Touch an already loaded texture in the LRU, or queue it for background loading.
 fn request_full_texture(model: &mut Model, idx: usize) {
     if model.full_textures.contains_key(&idx) {
         touch_full_texture(model, idx);
@@ -1692,15 +1686,13 @@ fn request_full_texture(model: &mut Model, idx: usize) {
     let now = Instant::now();
     let should_request = match model.full_pending.get(&idx) {
         None => true,
-        Some(FullPendingState::InFlight { .. }) => false,
+        Some(FullPendingState::InFlight) => false,
         Some(FullPendingState::Failed { last_error_at }) => {
             now.duration_since(*last_error_at) > FULL_PENDING_RETRY
         }
     };
     if should_request {
-        model
-            .full_pending
-            .insert(idx, FullPendingState::InFlight { _requested_at: now });
+        model.full_pending.insert(idx, FullPendingState::InFlight);
         if let Err(err) = model.full_req_tx.send(idx) {
             model
                 .full_pending
