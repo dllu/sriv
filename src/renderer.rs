@@ -872,6 +872,20 @@ fn choose_surface_output(
     wgpu::SurfaceColorSpace,
     OutputColorSpace,
 ) {
+    #[cfg(target_os = "macos")]
+    if let Some(capability) = capabilities.iter().find(|capability| {
+        capability.format == wgpu::TextureFormat::Rgba16Float
+            && capability
+                .color_spaces
+                .contains(wgpu::SurfaceColorSpaces::EXTENDED_SRGB_LINEAR)
+    }) {
+        return (
+            capability.format,
+            wgpu::SurfaceColorSpace::ExtendedSrgbLinear,
+            OutputColorSpace::ExtendedSrgbLinear,
+        );
+    }
+
     let find = |required: wgpu::SurfaceColorSpaces| {
         capabilities.iter().find(|capability| {
             capability.format.is_srgb() && capability.color_spaces.contains(required)
@@ -942,6 +956,29 @@ mod tests {
                 wgpu::TextureFormat::Bgra8UnormSrgb,
                 wgpu::SurfaceColorSpace::Srgb,
                 OutputColorSpace::Srgb,
+            )
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn surface_selection_prefers_float_edr_on_macos() {
+        let capabilities = [
+            wgpu::SurfaceFormatCapabilities {
+                format: wgpu::TextureFormat::Bgra8UnormSrgb,
+                color_spaces: wgpu::SurfaceColorSpaces::DISPLAY_P3,
+            },
+            wgpu::SurfaceFormatCapabilities {
+                format: wgpu::TextureFormat::Rgba16Float,
+                color_spaces: wgpu::SurfaceColorSpaces::EXTENDED_SRGB_LINEAR,
+            },
+        ];
+        assert_eq!(
+            choose_surface_output(&capabilities, wgpu::TextureFormat::Bgra8UnormSrgb),
+            (
+                wgpu::TextureFormat::Rgba16Float,
+                wgpu::SurfaceColorSpace::ExtendedSrgbLinear,
+                OutputColorSpace::ExtendedSrgbLinear,
             )
         );
     }

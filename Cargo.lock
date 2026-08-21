@@ -3944,6 +3944,7 @@ dependencies = [
  "crossbeam-channel",
  "glam",
  "glyphon",
+ "half",
  "hf-hub",
  "image",
  "jxl-oxide",

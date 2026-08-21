@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use half::f16;
 use image as image_rs;
 use image::codecs::{gif::GifDecoder, png::PngDecoder, webp::WebPDecoder};
 use image::{
@@ -426,11 +427,19 @@ fn open_jxl_image(path: &Path, output_color_space: OutputColorSpace) -> Result<J
         .open(path)
         .map_err(|error| anyhow!("failed to decode JPEG XL image: {error}"))?;
     let rendering_intent = RenderingIntent::Relative;
-    let encoding = if image.image_header().metadata.grayscale() {
+    let encoding = if output_color_space == OutputColorSpace::ExtendedSrgbLinear
+        && image.hdr_type().is_some()
+    {
+        // Preserve the absolute HDR signal. It is converted from BT.2100/PQ to
+        // linear scRGB after rendering, ready for a macOS EDR surface.
+        EnumColourEncoding::bt2100_pq(rendering_intent)
+    } else if image.image_header().metadata.grayscale() {
         EnumColourEncoding::gray_srgb(rendering_intent)
     } else {
         match output_color_space {
-            OutputColorSpace::Srgb => EnumColourEncoding::srgb(rendering_intent),
+            OutputColorSpace::Srgb | OutputColorSpace::ExtendedSrgbLinear => {
+                EnumColourEncoding::srgb(rendering_intent)
+            }
             OutputColorSpace::DisplayP3 => EnumColourEncoding::display_p3(rendering_intent),
         }
     };
@@ -483,10 +492,55 @@ fn unpremultiply_u16(samples: &mut [u16], channels: usize) {
     }
 }
 
+fn unpremultiply_f32(samples: &mut [f32], channels: usize) {
+    for pixel in samples.chunks_exact_mut(channels) {
+        let alpha = pixel[channels - 1];
+        if alpha <= 0.0 {
+            continue;
+        }
+        for sample in &mut pixel[..channels - 1] {
+            *sample /= alpha;
+        }
+    }
+}
+
+/// Decode an ST 2084 value to linear light, relative to a 203-nit SDR white.
+fn pq_to_scrgb(value: f32) -> f32 {
+    const M1: f32 = 2610.0 / 16384.0;
+    const M2: f32 = 2523.0 / 32.0;
+    const C1: f32 = 3424.0 / 4096.0;
+    const C2: f32 = 2413.0 / 128.0;
+    const C3: f32 = 2392.0 / 128.0;
+    const PQ_PEAK_NITS: f32 = 10_000.0;
+    const SDR_WHITE_NITS: f32 = 203.0;
+
+    let encoded = value.max(0.0).powf(1.0 / M2);
+    let denominator = (C2 - C3 * encoded).max(f32::MIN_POSITIVE);
+    let linear = ((encoded - C1).max(0.0) / denominator).powf(1.0 / M1);
+    linear * (PQ_PEAK_NITS / SDR_WHITE_NITS)
+}
+
+fn bt2100_pq_to_linear_scrgb(samples: &mut [f32], channels: usize) {
+    for pixel in samples.chunks_exact_mut(channels) {
+        if channels < 3 {
+            pixel[0] = pq_to_scrgb(pixel[0]);
+            continue;
+        }
+        let r = pq_to_scrgb(pixel[0]);
+        let g = pq_to_scrgb(pixel[1]);
+        let b = pq_to_scrgb(pixel[2]);
+        // Linear BT.2020 to linear sRGB/BT.709, both D65.
+        pixel[0] = 1.660_491 * r - 0.587_641 * g - 0.072_850 * b;
+        pixel[1] = -0.124_550 * r + 1.132_900 * g - 0.008_349 * b;
+        pixel[2] = -0.018_151 * r - 0.100_579 * g + 1.118_730 * b;
+    }
+}
+
 fn jxl_render_to_dynamic_image(
     render: &Render,
     high_bit_depth: bool,
     associated_alpha: bool,
+    hdr_sc_rgb: bool,
 ) -> Result<DynamicImage> {
     let mut stream = render.stream();
     let width = stream.width();
@@ -501,6 +555,47 @@ fn jxl_render_to_dynamic_image(
         .checked_mul(height as usize)
         .and_then(|pixels| pixels.checked_mul(channels))
         .ok_or_else(|| anyhow!("decoded JPEG XL dimensions overflow usize"))?;
+
+    if hdr_sc_rgb {
+        let mut samples = vec![0_f32; sample_count];
+        if stream.write_to_buffer(&mut samples) != sample_count {
+            return Err(anyhow!("JPEG XL decoder returned too few pixel samples"));
+        }
+        if associated_alpha && matches!(channels, 2 | 4) {
+            unpremultiply_f32(&mut samples, channels);
+        }
+        bt2100_pq_to_linear_scrgb(&mut samples, channels);
+        return Ok(match channels {
+            1 => DynamicImage::ImageRgb32F(image_buffer_from_raw(
+                width,
+                height,
+                samples.into_iter().flat_map(|l| [l, l, l]).collect(),
+                "JPEG XL HDR RGB32F",
+            )?),
+            2 => DynamicImage::ImageRgba32F(image_buffer_from_raw(
+                width,
+                height,
+                samples
+                    .chunks_exact(2)
+                    .flat_map(|pixel| [pixel[0], pixel[0], pixel[0], pixel[1]])
+                    .collect(),
+                "JPEG XL HDR RGBA32F",
+            )?),
+            3 => DynamicImage::ImageRgb32F(image_buffer_from_raw(
+                width,
+                height,
+                samples,
+                "JPEG XL HDR RGB32F",
+            )?),
+            4 => DynamicImage::ImageRgba32F(image_buffer_from_raw(
+                width,
+                height,
+                samples,
+                "JPEG XL HDR RGBA32F",
+            )?),
+            _ => unreachable!(),
+        });
+    }
 
     if high_bit_depth {
         let mut samples = vec![0_u16; sample_count];
@@ -579,11 +674,13 @@ fn decode_jxl_first_frame(
         return Err(anyhow!("JPEG XL image contains no displayable frames"));
     }
     let high_bit_depth = jxl_needs_16_bit(&image);
+    let hdr_sc_rgb =
+        output_color_space == OutputColorSpace::ExtendedSrgbLinear && image.hdr_type().is_some();
     let associated_alpha = jxl_has_associated_alpha(&image);
     let render = image
         .render_frame(0)
         .map_err(|error| anyhow!("failed to render JPEG XL frame: {error}"))?;
-    jxl_render_to_dynamic_image(&render, high_bit_depth, associated_alpha)
+    jxl_render_to_dynamic_image(&render, high_bit_depth, associated_alpha, hdr_sc_rgb)
 }
 
 fn read_embedded_color_profile(
@@ -802,6 +899,29 @@ fn tile_dynamic_image(img: DynamicImage) -> (u32, u32, Vec<FullImageTile>) {
                 );
             },
         ),
+        image_rs::DynamicImage::ImageRgb32F(buf) => collect_tiled_pixels(
+            full_w,
+            full_h,
+            TilePixelFormat::Rgba16Float,
+            8,
+            |px, py, pixel_data| {
+                let [r, g, b] = buf.get_pixel(px, py).0;
+                for channel in [r, g, b, 1.0] {
+                    pixel_data.extend_from_slice(&f16::from_f32(channel).to_bits().to_ne_bytes());
+                }
+            },
+        ),
+        image_rs::DynamicImage::ImageRgba32F(buf) => collect_tiled_pixels(
+            full_w,
+            full_h,
+            TilePixelFormat::Rgba16Float,
+            8,
+            |px, py, pixel_data| {
+                for channel in buf.get_pixel(px, py).0 {
+                    pixel_data.extend_from_slice(&f16::from_f32(channel).to_bits().to_ne_bytes());
+                }
+            },
+        ),
         other => {
             let rgba = other.to_rgba8();
             collect_tiled_pixels(
@@ -959,6 +1079,8 @@ fn load_jxl_image_frames(
     }
     let dimensions = (image.width(), image.height());
     let high_bit_depth = jxl_needs_16_bit(&image);
+    let hdr_sc_rgb =
+        output_color_space == OutputColorSpace::ExtendedSrgbLinear && image.hdr_type().is_some();
     let associated_alpha = jxl_has_associated_alpha(&image);
     let animation = image.image_header().metadata.animation.as_ref();
     let frames = (0..frame_count).map(|frame_index| -> Result<_> {
@@ -966,7 +1088,8 @@ fn load_jxl_image_frames(
             .render_frame(frame_index)
             .map_err(|error| anyhow!("failed to render JPEG XL frame: {error}"))?;
         let delay = jxl_frame_delay(render.duration(), animation);
-        let image = jxl_render_to_dynamic_image(&render, high_bit_depth, associated_alpha)?;
+        let image =
+            jxl_render_to_dynamic_image(&render, high_bit_depth, associated_alpha, hdr_sc_rgb)?;
         Ok((image, delay))
     });
     load_frame_sequence(dimensions, frames, std::convert::identity)
@@ -1015,23 +1138,40 @@ pub(crate) fn load_thumbnail(
         }
     }
 
-    let Ok(image) = decode_image_no_limits(image_path, output_color_space) else {
+    // Thumbnail caches are SDR presentation assets even when the full-size window
+    // uses EDR. Decoding directly to SDR lets jxl-oxide apply the file's tone-map
+    // metadata before the result is quantized to eight bits.
+    let thumbnail_output = if output_color_space == OutputColorSpace::ExtendedSrgbLinear {
+        OutputColorSpace::Srgb
+    } else {
+        output_color_space
+    };
+    let Ok(image) = decode_image_no_limits(image_path, thumbnail_output) else {
         return fallback_thumbnail();
     };
-    let mut thumbnail = image.thumbnail(size, size);
-    let (width, height) = (thumbnail.width(), thumbnail.height());
-    if width == 0 || height == 0 {
+    let Some(thumbnail) = make_thumbnail(image, size) else {
         return fallback_thumbnail();
-    }
-    if width < 2 || height < 2 {
-        thumbnail = thumbnail.resize_exact(width.max(2), height.max(2), FilterType::Nearest);
-    }
-    let thumbnail = DynamicImage::ImageRgba8(thumbnail.to_rgba8());
+    };
     if let Some(parent) = cache_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
     let _ = thumbnail.save(cache_path);
     thumbnail
+}
+
+fn make_thumbnail(image: DynamicImage, size: u32) -> Option<DynamicImage> {
+    // image's high-bit-depth convolution path produces severe channel artifacts
+    // for extremely wide 16-bit images. Quantize the already tone-mapped pixels
+    // first; cached thumbnails are eight-bit PNGs in any case.
+    let mut thumbnail = DynamicImage::ImageRgba8(image.to_rgba8()).thumbnail(size, size);
+    let (width, height) = (thumbnail.width(), thumbnail.height());
+    if width == 0 || height == 0 {
+        return None;
+    }
+    if width < 2 || height < 2 {
+        thumbnail = thumbnail.resize_exact(width.max(2), height.max(2), FilterType::Nearest);
+    }
+    Some(DynamicImage::ImageRgba8(thumbnail.to_rgba8()))
 }
 
 pub(crate) fn thumbnail_for_clip(
@@ -1134,6 +1274,12 @@ mod tests {
     use moxcms::ColorProfile;
     use std::time::SystemTime;
 
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    }
+
     #[test]
     fn orientation_from_urational_rounds_down() {
         let value = rexif::TagValue::URational(vec![rexif::URational {
@@ -1218,6 +1364,70 @@ mod tests {
         ]
         .concat();
         assert_eq!(linear_rgba16_bytes_to_srgba8(&bytes), vec![0, 1, 128, 255]);
+    }
+
+    #[test]
+    fn pq_white_maps_above_sdr_white() {
+        assert_eq!(pq_to_scrgb(0.0), 0.0);
+        let peak = pq_to_scrgb(1.0);
+        assert!((peak - 10_000.0 / 203.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn float_tiles_preserve_extended_range() {
+        let image = DynamicImage::ImageRgb32F(image_rs::Rgb32FImage::from_pixel(
+            1,
+            1,
+            image_rs::Rgb([2.0, 1.0, 0.5]),
+        ));
+        let (_, _, tiles) = tile_dynamic_image(image);
+        let (_, _, _, _, format, pixels) = &tiles[0];
+        assert_eq!(*format, TilePixelFormat::Rgba16Float);
+        let channel = |index: usize| {
+            let offset = index * 2;
+            f16::from_bits(u16::from_ne_bytes([pixels[offset], pixels[offset + 1]])).to_f32()
+        };
+        assert_eq!(channel(0), 2.0);
+        assert_eq!(channel(1), 1.0);
+        assert_eq!(channel(2), 0.5);
+        assert_eq!(channel(3), 1.0);
+    }
+
+    #[test]
+    fn hdr_fixture_thumbnail_matches_its_sdr_tonemap() {
+        let hdr =
+            decode_image_no_limits(&fixture("train_hdr_pq.jxl"), OutputColorSpace::Srgb).unwrap();
+        let sdr =
+            decode_image_no_limits(&fixture("train_sdr.jxl"), OutputColorSpace::Srgb).unwrap();
+        let hdr = make_thumbnail(hdr, 256).unwrap().to_rgb8();
+        let sdr = make_thumbnail(sdr, 256).unwrap().to_rgb8();
+        assert_eq!(hdr.dimensions(), (256, 64));
+        assert_eq!(sdr.dimensions(), hdr.dimensions());
+
+        let absolute_error: u64 = hdr
+            .as_raw()
+            .iter()
+            .zip(sdr.as_raw())
+            .map(|(&hdr, &sdr)| u64::from(hdr.abs_diff(sdr)))
+            .sum();
+        let mean_error = absolute_error as f64 / hdr.as_raw().len() as f64;
+        assert!(mean_error < 32.0, "thumbnail mean error was {mean_error}");
+    }
+
+    #[test]
+    fn hdr_fixture_preserves_edr_highlights_in_float_tiles() {
+        let (_, _, frames) = load_full_image_tiles(
+            &fixture("train_hdr_pq.jxl"),
+            OutputColorSpace::ExtendedSrgbLinear,
+        )
+        .unwrap();
+        assert!(frames[0].tiles.iter().any(|tile| {
+            tile.4 == TilePixelFormat::Rgba16Float
+                && tile.5.chunks_exact(2).enumerate().any(|(index, bytes)| {
+                    index % 4 != 3
+                        && f16::from_bits(u16::from_ne_bytes([bytes[0], bytes[1]])).to_f32() > 1.0
+                })
+        }));
     }
 
     #[test]

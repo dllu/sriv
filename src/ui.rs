@@ -560,6 +560,11 @@ fn prepare_current_full_textures(renderer: &Renderer, model: &mut Model) {
                 4 * tile.width,
                 std::borrow::Cow::Owned(image_io::linear_rgba16_bytes_to_srgba8(&tile.pixel_data)),
             ),
+            TilePixelFormat::Rgba16Float => (
+                wgpu::TextureFormat::Rgba16Float,
+                8 * tile.width,
+                std::borrow::Cow::Borrowed(&tile.pixel_data),
+            ),
         };
         tile.texture = Some(renderer.create_texture(
             "sriv full-resolution tile",

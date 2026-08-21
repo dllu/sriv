@@ -28,6 +28,7 @@ anyhow = "1.0.71"
 rayon = "1.7.0"
 toml = "0.5"
 bytemuck = { version = "1", features = ["derive"] }
+half = { version = "2", features = ["bytemuck"] }
 glam = "0.32"
 glyphon = "0.12"
 pollster = "0.4"

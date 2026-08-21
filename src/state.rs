@@ -287,6 +287,8 @@ pub enum TilePixelFormat {
     Rgba8,
     /// Linear-light output-space values; sampled through a linear 16-bit UNORM texture.
     Rgba16,
+    /// Linear-light scRGB values stored as IEEE 754 binary16 samples.
+    Rgba16Float,
 }
 
 #[derive(Debug)]

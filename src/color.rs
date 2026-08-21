@@ -10,6 +10,8 @@ use moxcms::{
 pub enum OutputColorSpace {
     Srgb,
     DisplayP3,
+    /// Linear extended-range sRGB (scRGB), used by macOS EDR surfaces.
+    ExtendedSrgbLinear,
 }
 
 impl OutputColorSpace {
@@ -17,6 +19,7 @@ impl OutputColorSpace {
         match self {
             Self::Srgb => ColorProfile::new_srgb(),
             Self::DisplayP3 => ColorProfile::new_display_p3(),
+            Self::ExtendedSrgbLinear => ColorProfile::new_srgb(),
         }
     }
 
@@ -24,6 +27,9 @@ impl OutputColorSpace {
         match self {
             Self::Srgb => "srgb-v1",
             Self::DisplayP3 => "display-p3-v1",
+            // Thumbnails are deliberately SDR, but keep this separate so a stale
+            // cache from an older HDR implementation cannot be reused.
+            Self::ExtendedSrgbLinear => "extended-srgb-linear-v1",
         }
     }
 }
@@ -257,7 +263,7 @@ pub fn srgba_to_output_linear(
         srgb_to_linear(blue),
     ];
     let [red, green, blue] = match output_color_space {
-        OutputColorSpace::Srgb => linear_srgb,
+        OutputColorSpace::Srgb | OutputColorSpace::ExtendedSrgbLinear => linear_srgb,
         OutputColorSpace::DisplayP3 => {
             // Linear-light sRGB to linear-light Display P3, both with a D65 white point.
             let [red, green, blue] = linear_srgb;
@@ -273,7 +279,10 @@ pub fn srgba_to_output_linear(
 
 /// Convert an sRGB UI color to encoded values in the surface's output gamut.
 pub fn srgba_to_output_encoded(color: [f32; 4], output_color_space: OutputColorSpace) -> [f32; 4] {
-    if output_color_space == OutputColorSpace::Srgb {
+    if matches!(
+        output_color_space,
+        OutputColorSpace::Srgb | OutputColorSpace::ExtendedSrgbLinear
+    ) {
         return color;
     }
     let [red, green, blue, alpha] = srgba_to_output_linear(color, output_color_space);
