@@ -22,9 +22,12 @@ mostly vibe coded with AI tbh.
 
 # build and installation
 
-to build and install the program system-wide on Linux, use one of the following methods:
+to build and install the program, use one of the following methods.
 
-HEIF/HEIC support requires the libheif development package, for example:
+On macOS, HEIF/HEIC decoding uses the system ImageIO framework, so no separate
+HEIF library is required.
+
+On Linux, HEIF/HEIC support requires the libheif development package, for example:
 
 ```bash
 sudo apt install libheif-dev

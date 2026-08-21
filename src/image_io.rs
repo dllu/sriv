@@ -6,6 +6,7 @@ use image::{
     ImageReader, RgbImage, RgbaImage,
 };
 use jxl_oxide::{EnumColourEncoding, JxlImage, Render, RenderingIntent};
+#[cfg(not(target_os = "macos"))]
 use libheif_rs::{ColorSpace as HeifColorSpace, HeifContext, LibHeif, Plane, RgbChroma};
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -18,6 +19,9 @@ use std::time::Duration;
 use crate::clip;
 use crate::color::{self, EmbeddedColorProfile, OutputColorSpace};
 use crate::state::{FullImageFrame, FullImageTile, TilePixelFormat};
+
+#[cfg(target_os = "macos")]
+mod macos_heif;
 
 struct DecodedImage {
     image: DynamicImage,
@@ -258,11 +262,13 @@ pub(crate) fn linear_rgba16_bytes_to_srgba8(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+#[cfg(not(target_os = "macos"))]
 fn libheif() -> &'static LibHeif {
     static LIBHEIF: OnceLock<LibHeif> = OnceLock::new();
     LIBHEIF.get_or_init(LibHeif::new)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn heif_target_color_space(has_alpha: bool, high_bit_depth: bool) -> HeifColorSpace {
     match (has_alpha, high_bit_depth, cfg!(target_endian = "little")) {
         (false, false, _) => HeifColorSpace::Rgb(RgbChroma::Rgb),
@@ -274,12 +280,14 @@ fn heif_target_color_space(has_alpha: bool, high_bit_depth: bool) -> HeifColorSp
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn heif_bytes_per_pixel(has_alpha: bool, high_bit_depth: bool) -> usize {
     let channels = if has_alpha { 4 } else { 3 };
     let bytes_per_channel = if high_bit_depth { 2 } else { 1 };
     channels * bytes_per_channel
 }
 
+#[cfg(not(target_os = "macos"))]
 fn copy_heif_interleaved_plane(plane: &Plane<&[u8]>, bytes_per_pixel: usize) -> Result<Vec<u8>> {
     if plane.stride == 0 {
         return Err(anyhow!("HEIF row stride is zero"));
@@ -309,6 +317,7 @@ fn copy_heif_interleaved_plane(plane: &Plane<&[u8]>, bytes_per_pixel: usize) -> 
     Ok(pixels)
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn native_u16_samples(bytes: &[u8]) -> Vec<u16> {
     bytes
         .chunks_exact(2)
@@ -330,6 +339,7 @@ where
         .ok_or_else(|| anyhow!("decoded {format_name} data has the wrong length"))
 }
 
+#[cfg(not(target_os = "macos"))]
 fn decode_heif_image(path: &Path) -> Result<DecodedImage> {
     let lib_heif = libheif();
     let bytes = fs::read(path)?;
@@ -395,6 +405,9 @@ fn decode_heif_image(path: &Path) -> Result<DecodedImage> {
         embedded_color_profile,
     })
 }
+
+#[cfg(target_os = "macos")]
+use macos_heif::decode_heif_image;
 
 fn decode_standard_image(path: &Path, format: ImageFormat) -> Result<DecodedImage> {
     let mut reader = ImageReader::open(path)?;
@@ -1532,6 +1545,7 @@ mod tests {
         assert_eq!(decoded.image.to_rgb8().get_pixel(0, 0).0, [128, 200, 50]);
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn copy_heif_interleaved_plane_removes_row_padding() {
         let data = [1_u8, 2, 3, 4, 5, 6, 99, 99, 7, 8, 9, 10, 11, 12, 88, 88];

@@ -34,6 +34,7 @@ pub enum EmbeddedColorProfile {
     /// A complete ICC profile, as embedded in JPEG, PNG, TIFF, WebP, or HEIF.
     Icc(Vec<u8>),
     /// HEIF commonly stores CICP/NCLX identifiers instead of a full ICC profile.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     Cicp {
         color_primaries: u8,
         transfer_characteristics: u8,

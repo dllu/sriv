@@ -24,7 +24,6 @@ image = { version = "0.25.10", default-features = false, features = [
 ] }
 jxl-oxide = { version = "0.12.6", default-features = false, features = ["moxcms", "rayon"] }
 moxcms = { version = "0.8.1", features = ["in_place"] }
-libheif-rs = { version = "2.7.0", default-features = false, features = ["v1_17"] }
 anyhow = "1.0.71"
 rayon = "1.7.0"
 toml = "0.5"
@@ -45,6 +44,14 @@ tokenizers = { version = "0.21.0", default-features = false, features = ["fancy-
 num_cpus = "1.17"
 portable-pty = "0.9.0"
 vt100 = "0.16.2"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+libheif-rs = { version = "2.7.0", default-features = false, features = ["v1_17"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFData", "CFCGTypes"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "bitflags", "CGBitmapContext", "CGColorSpace", "CGContext", "CGImage"] }
+objc2-image-io = { version = "0.3.2", default-features = false, features = ["std", "CGImageSource", "objc2-core-graphics"] }
 
 [dev-dependencies]
 png = "0.18.1"

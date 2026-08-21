@@ -15,6 +15,7 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{ModifiersState, PhysicalKey};
+#[cfg(target_os = "linux")]
 use winit::platform::wayland::WindowAttributesExtWayland;
 use winit::window::{Fullscreen, Window};
 
@@ -602,8 +603,9 @@ impl ApplicationHandler<UserEvent> for SrivApplication {
         }
         let attributes = Window::default_attributes()
             .with_title("sriv")
-            .with_name("sriv", "sriv")
             .with_inner_size(LogicalSize::new(800.0, 600.0));
+        #[cfg(target_os = "linux")]
+        let attributes = attributes.with_name("sriv", "sriv");
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
