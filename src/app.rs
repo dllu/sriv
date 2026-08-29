@@ -769,7 +769,12 @@ impl ApplicationHandler<UserEvent> for SrivApplication {
                     }
                 }
                 state.handle_exit_request(event_loop);
-                state.refresh_and_redraw();
+                // Keep input handling cheap. `update` can drain background queues and create GPU
+                // textures, so running it for every key press makes a burst of input wait behind
+                // unrelated image work. Redraw requests are coalesced by winit; background work
+                // wakes the event loop separately, and thumbnail selection schedules its own
+                // deferred preload.
+                state.app.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
                 if let Err(error) = ui::render(&state.app, &mut state.model, &mut state.renderer) {
@@ -1887,6 +1892,24 @@ mod tests {
     use winit::keyboard::KeyCode;
 
     const Q_KEY: PhysicalKey = PhysicalKey::Code(KeyCode::KeyQ);
+
+    #[test]
+    fn rapid_key_presses_are_all_handled() {
+        let mut keys = Keys::default();
+        let keys_in_order = [
+            PhysicalKey::Code(KeyCode::KeyH),
+            PhysicalKey::Code(KeyCode::KeyJ),
+            PhysicalKey::Code(KeyCode::KeyK),
+            PhysicalKey::Code(KeyCode::KeyL),
+        ];
+
+        for _ in 0..100 {
+            for physical_key in keys_in_order {
+                assert!(keys.should_handle(physical_key, ElementState::Pressed, false, false));
+                assert!(!keys.should_handle(physical_key, ElementState::Released, false, false));
+            }
+        }
+    }
 
     #[test]
     fn key_held_before_focus_is_ignored_until_released() {
