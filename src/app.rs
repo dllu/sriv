@@ -1414,7 +1414,7 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             && app.keys.mods.super_key() == binding.super_key
         {
             commands_to_launch.push((
-                binding.command.replace("{file}", &current_file),
+                expand_binding_command(&binding.command, &current_file),
                 binding.use_terminal,
             ));
         }
@@ -1436,6 +1436,12 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
         model.selection_changed_at = Instant::now();
         model.selection_pending = false;
     }
+}
+
+fn expand_binding_command(command: &str, file: &str) -> String {
+    // {file} is a shell argument: quote it, including any literal apostrophes.
+    let quoted_file = format!("'{}'", file.replace('\'', "'\\''"));
+    command.replace("{file}", &quoted_file)
 }
 
 fn is_unmodified_q_key_down(
@@ -1892,6 +1898,27 @@ mod tests {
     use winit::keyboard::KeyCode;
 
     const Q_KEY: PhysicalKey = PhysicalKey::Code(KeyCode::KeyQ);
+
+    #[test]
+    fn binding_paths_remain_literal_shell_arguments() {
+        for file in [
+            "/photos/Michelin Challenge Design 2008/side.jpg",
+            "/photos/it's a \"car\".jpg",
+            "/photos/$(printf injected)`printf injected`;$HOME*?[a]\\\n車.jpg",
+            "/photos/{file}.jpg",
+        ] {
+            let command = expand_binding_command("true && printf '%s\\0' {file} 3840 {file}", file);
+            let output = std::process::Command::new("sh")
+                .args(["-c", &command])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                output.stdout,
+                format!("{file}\x003840\0{file}\0").as_bytes()
+            );
+        }
+    }
 
     #[test]
     fn rapid_key_presses_are_all_handled() {

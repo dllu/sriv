@@ -77,6 +77,9 @@ The status area shows how many embeddings are still pending and whether the GPU 
 you can put custom keybindings in `~/.config/sriv/bindings.toml` to execute custom commands.
 Just put whatever modifiers (`ctrl`, `shift`, `alt`) if you want and `+` and then the letter or number of the key.
 
+`{file}` is automatically shell-quoted, so paths containing spaces or special characters
+are passed as one argument. Leave `{file}` unquoted in your commands.
+
 ```
 # open the current image in the default viewer
 "ctrl+o" = "xdg-open {file}"

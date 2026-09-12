@@ -11,6 +11,7 @@ use crate::image_io;
 use crate::renderer::{Renderer, Scene};
 use crate::state::{CommandEvent, Mode, Model, TerminalSession, TilePixelFormat};
 
+const INFO_BAR_HEIGHT: f32 = 20.0;
 const TERMINAL_PANEL_FRACTION: f32 = 0.42;
 const TERMINAL_PANEL_MIN_HEIGHT: f32 = 180.0;
 const TERMINAL_TAB_HEIGHT: f32 = 28.0;
@@ -25,12 +26,17 @@ const TERMINAL_NOMINAL_ROWS: u16 = 240;
 fn terminal_panel_height(rect: Rect) -> f32 {
     (rect.h() * TERMINAL_PANEL_FRACTION)
         .max(TERMINAL_PANEL_MIN_HEIGHT)
-        .min(rect.h() - 40.0)
+        .min((rect.h() - INFO_BAR_HEIGHT - 40.0).max(0.0))
 }
 
 fn terminal_panel_rect(rect: Rect) -> Rect {
     let height = terminal_panel_height(rect);
-    Rect::from_x_y_w_h(0.0, rect.bottom() + height / 2.0, rect.w(), height)
+    Rect::from_x_y_w_h(
+        0.0,
+        rect.bottom() + INFO_BAR_HEIGHT + height / 2.0,
+        rect.w(),
+        height,
+    )
 }
 
 fn terminal_body_rect(panel_rect: Rect) -> Rect {
@@ -648,7 +654,7 @@ pub(crate) fn render(app: &App, model: &mut Model, renderer: &mut Renderer) -> R
                 }
             }
             // Bottom info bar in thumbnail mode: filename and index/total
-            let bar_h = 20.0;
+            let bar_h = INFO_BAR_HEIGHT;
             let bar_y = -rect.h() / 2.0 + bar_h / 2.0;
             // Background
             draw.rect()
@@ -694,7 +700,7 @@ pub(crate) fn render(app: &App, model: &mut Model, renderer: &mut Renderer) -> R
                         );
                 }
                 // Draw bottom info bar with full path, dimensions, and zoom
-                let bar_h = 20.0;
+                let bar_h = INFO_BAR_HEIGHT;
                 let bar_y = -rect.h() / 2.0 + bar_h / 2.0;
                 // Background
                 draw.rect()
@@ -734,7 +740,7 @@ pub(crate) fn render(app: &App, model: &mut Model, renderer: &mut Renderer) -> R
                     .color(WHITE)
                     .x_y(0.0, 0.0);
                 // Draw bottom info bar with full path, dimensions, and zoom
-                let bar_h = 20.0;
+                let bar_h = INFO_BAR_HEIGHT;
                 let bar_y = -rect.h() / 2.0 + bar_h / 2.0;
                 // Background
                 draw.rect()
