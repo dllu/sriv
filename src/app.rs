@@ -259,16 +259,19 @@ fn mouse_wheel(app: &App, model: &mut Model, delta: MouseScrollDelta, _phase: To
 fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
     // Parse command-line arguments: files or directories.
     let mut regen_cache = false;
+    let mut private = false;
     let mut args: Vec<String> = Vec::new();
     for arg in std::env::args().skip(1) {
         if arg == "--clear-cache" || arg == "--regen-cache" {
             regen_cache = true;
+        } else if arg == "--private" {
+            private = true;
         } else {
             args.push(arg);
         }
     }
     if args.is_empty() {
-        eprintln!("Usage: sriv [--clear-cache] <image files or directories>...");
+        eprintln!("Usage: sriv [--clear-cache] [--private] <image files or directories>...");
         std::process::exit(1);
     }
     // Collect image file paths.
@@ -317,6 +320,7 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
             }
         }
     }
+    let cache_dir = (!private).then_some(cache_base);
     let mut file_mod_times = Vec::with_capacity(image_paths.len());
     for path in &image_paths {
         file_mod_times.push(current_mod_time(path));
@@ -329,14 +333,14 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
     let shared_paths = Arc::new(image_paths.clone());
     let worker_proxy = app.create_proxy();
     let clip_engine =
-        ClipEngine::new(cache_base.clone(), worker_proxy.clone()).unwrap_or_else(|err| {
+        ClipEngine::new(cache_dir.clone(), worker_proxy.clone()).unwrap_or_else(|err| {
             eprintln!("Failed to initialize CLIP: {err}");
             std::process::exit(1);
         });
     let clip_sender = clip_engine.request_sender();
     for _ in 0..num_workers {
         let paths = Arc::clone(&shared_paths);
-        let cache_base = cache_base.clone();
+        let cache_dir = cache_dir.clone();
         let tx = thumb_tx.clone();
         let thumb_queue = thumb_queue.clone();
         let clip_sender = clip_sender.clone();
@@ -344,10 +348,18 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
         thread::spawn(move || {
             while let Some(i) = thumb_queue.pop() {
                 if let Some(p) = paths.get(i) {
-                    let image =
-                        image_io::load_thumbnail(&cache_base, p, thumb_size, output_color_space);
-                    let clip_embedding = match clip::load_cached_embedding(&cache_base, p) {
-                        Ok(value) => value,
+                    let image = image_io::load_thumbnail(
+                        cache_dir.as_deref(),
+                        p,
+                        thumb_size,
+                        output_color_space,
+                    );
+                    let clip_embedding = match cache_dir
+                        .as_deref()
+                        .map(|dir| clip::load_cached_embedding(dir, p))
+                        .transpose()
+                    {
+                        Ok(value) => value.flatten(),
                         Err(err) => {
                             eprintln!(
                                 "Failed to load cached CLIP embedding for {}: {}",

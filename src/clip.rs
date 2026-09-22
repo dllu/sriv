@@ -85,7 +85,7 @@ impl ClipRequestSender {
 
 #[derive(Clone)]
 struct ClipWorkerContext {
-    cache_base: PathBuf,
+    cache_base: Option<PathBuf>,
     config: clip::ClipConfig,
     result_tx: Sender<ClipEvent>,
     device_flag: Arc<AtomicBool>,
@@ -93,7 +93,7 @@ struct ClipWorkerContext {
 }
 
 impl ClipEngine {
-    pub(crate) fn new(cache_base: PathBuf, proxy: AppProxy) -> Result<Self> {
+    pub(crate) fn new(cache_base: Option<PathBuf>, proxy: AppProxy) -> Result<Self> {
         let (job_tx, job_rx) = unbounded::<ClipJob>();
         let (result_tx, result_rx) = unbounded::<ClipEvent>();
         let config = clip::ClipConfig::vit_base_patch32();
@@ -200,7 +200,7 @@ fn run_worker(ctx: ClipWorkerContext, job_rx: Receiver<ClipJob>, use_cuda: bool)
     };
     let model = ClipModel::new(vb, &config)?;
     let image_ctx = ImageBatchContext {
-        cache_base: &cache_base,
+        cache_base: cache_base.as_deref(),
         model: &model,
         device: &device,
         clip_image_size: config.image_size,
@@ -346,8 +346,7 @@ fn process_image_batch(batch: Vec<(usize, PathBuf, RgbImage)>, ctx: &ImageBatchC
                 .zip(compute_paths)
                 .zip(embeddings)
             {
-                let embed_path = cache_file_path(ctx.cache_base, &path, "clip");
-                match write_embedding(&embed_path, &embedding) {
+                match cache_embedding(ctx.cache_base, &path, &embedding) {
                     Ok(()) => {
                         send_result(
                             ctx.result_tx,
@@ -400,7 +399,7 @@ fn report_batch_error(
 }
 
 struct ImageBatchContext<'a> {
-    cache_base: &'a Path,
+    cache_base: Option<&'a Path>,
     model: &'a ClipModel,
     device: &'a Device,
     clip_image_size: usize,
@@ -491,6 +490,13 @@ fn write_embedding(path: &Path, embedding: &[f32]) -> Result<()> {
     Ok(())
 }
 
+fn cache_embedding(cache_base: Option<&Path>, image_path: &Path, embedding: &[f32]) -> Result<()> {
+    if let Some(base) = cache_base {
+        write_embedding(&cache_file_path(base, image_path, "clip"), embedding)?;
+    }
+    Ok(())
+}
+
 pub fn load_cached_embedding(cache_base: &Path, image_path: &Path) -> Result<Option<Vec<f32>>> {
     let embed_path = cache_file_path(cache_base, image_path, "clip");
     let embed_meta = match fs::metadata(&embed_path) {
@@ -527,4 +533,32 @@ pub fn cache_file_path(cache_base: &Path, image_path: &Path, extension: &str) ->
     let shard = &hex[..3];
     let name = &hex[3..];
     cache_base.join(shard).join(format!("{name}.{extension}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn private_embedding_skips_disk_cache() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("sriv-private-clip-{}-{unique}", std::process::id()));
+        let image_path = dir.join("image.png");
+        let embedding = [0.1, 0.2];
+        cache_embedding(None, &image_path, &embedding).unwrap();
+        assert!(!dir.exists());
+
+        let cache_base = dir.join("cache");
+        cache_embedding(Some(&cache_base), &image_path, &embedding).unwrap();
+        assert_eq!(
+            load_cached_embedding(&cache_base, &image_path).unwrap(),
+            Some(embedding.to_vec())
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

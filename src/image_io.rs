@@ -1121,19 +1121,21 @@ pub(crate) fn load_full_image_tiles(
 
 /// Load a display-ready thumbnail from the output-space-specific cache, or generate it.
 pub(crate) fn load_thumbnail(
-    cache_base: &Path,
+    cache_base: Option<&Path>,
     image_path: &Path,
     size: u32,
     output_color_space: OutputColorSpace,
 ) -> DynamicImage {
-    let cache_path = thumbnail_cache_path(cache_base, image_path, output_color_space);
-    if let (Ok(source), Ok(cached)) = (fs::metadata(image_path), fs::metadata(&cache_path)) {
-        if matches!(
-            (source.modified(), cached.modified()),
-            (Ok(source_time), Ok(cache_time)) if cache_time >= source_time
-        ) {
-            if let Ok(image) = image_rs::open(&cache_path) {
-                return DynamicImage::ImageRgba8(image.to_rgba8());
+    if let Some(cache_base) = cache_base {
+        let cache_path = thumbnail_cache_path(cache_base, image_path, output_color_space);
+        if let (Ok(source), Ok(cached)) = (fs::metadata(image_path), fs::metadata(&cache_path)) {
+            if matches!(
+                (source.modified(), cached.modified()),
+                (Ok(source_time), Ok(cache_time)) if cache_time >= source_time
+            ) {
+                if let Ok(image) = image_rs::open(&cache_path) {
+                    return DynamicImage::ImageRgba8(image.to_rgba8());
+                }
             }
         }
     }
@@ -1152,10 +1154,13 @@ pub(crate) fn load_thumbnail(
     let Some(thumbnail) = make_thumbnail(image, size) else {
         return fallback_thumbnail();
     };
-    if let Some(parent) = cache_path.parent() {
-        let _ = fs::create_dir_all(parent);
+    if let Some(cache_base) = cache_base {
+        let cache_path = thumbnail_cache_path(cache_base, image_path, output_color_space);
+        if let Some(parent) = cache_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = thumbnail.save(cache_path);
     }
-    let _ = thumbnail.save(cache_path);
     thumbnail
 }
 
@@ -1278,6 +1283,40 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
             .join(name)
+    }
+
+    #[test]
+    fn private_thumbnail_skips_disk_cache() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "sriv-private-thumb-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.png");
+        let cache_base = dir.join("cache");
+        DynamicImage::ImageRgba8(RgbaImage::from_pixel(8, 8, Rgba([200, 0, 0, 255])))
+            .save(&source)
+            .unwrap();
+
+        let image = load_thumbnail(None, &source, 8, OutputColorSpace::Srgb);
+        assert_eq!(image.to_rgba8().get_pixel(0, 0).0, [200, 0, 0, 255]);
+        assert!(!cache_base.exists());
+
+        let cache_path = thumbnail_cache_path(&cache_base, &source, OutputColorSpace::Srgb);
+        fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        DynamicImage::ImageRgba8(RgbaImage::from_pixel(8, 8, Rgba([0, 0, 200, 255])))
+            .save(&cache_path)
+            .unwrap();
+        let normal = load_thumbnail(Some(&cache_base), &source, 8, OutputColorSpace::Srgb);
+        assert_eq!(normal.to_rgba8().get_pixel(0, 0).0, [0, 0, 200, 255]);
+        let private = load_thumbnail(None, &source, 8, OutputColorSpace::Srgb);
+        assert_eq!(private.to_rgba8().get_pixel(0, 0).0, [200, 0, 0, 255]);
+
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

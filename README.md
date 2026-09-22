@@ -58,6 +58,12 @@ to clear and regenerate the thumbnail cache for all specified images, use the `-
 sriv --clear-cache <image files or directories>
 ```
 
+Use `--private` to generate thumbnails and CLIP image embeddings only in memory for the current session. This skips reading and writing sriv's disk cache; it does not delete files cached by earlier runs. Combine it with `--clear-cache` to remove those existing files. CLIP model weights and tokenizer are still managed by the Hugging Face cache.
+
+```bash
+sriv --private <image files or directories>
+```
+
 ### clip semantic search
 
 sriv can index your images with [OpenAI CLIP (ViT-B/32)](https://github.com/openai/CLIP) via the [Hugging Face Candle](https://github.com/huggingface/candle) runtime.
