@@ -15,6 +15,9 @@ use wgpu::util::DeviceExt;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
 
+#[cfg(all(test, target_os = "linux"))]
+mod wayland_tests;
+
 const QUAD_SHADER: &str = r#"
 struct VertexInput {
     @location(0) position: vec2<f32>,
@@ -352,6 +355,7 @@ pub struct Renderer {
     pub queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
+    surface_needs_configure: bool,
     output_color_space: OutputColorSpace,
     pipeline: wgpu::RenderPipeline,
     texture_layout: wgpu::BindGroupLayout,
@@ -417,7 +421,10 @@ impl Renderer {
             choose_surface_output(&capabilities.format_capabilities, fallback_format);
         surface_config.format = format;
         surface_config.color_space = surface_color_space;
-        surface.configure(&device, &surface_config);
+        // Configure on the first draw, after the compositor's initial size/scale events.
+        // Keep zero sizes so drawing can be suspended until the window has an extent.
+        surface_config.width = physical_size.width;
+        surface_config.height = physical_size.height;
 
         let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("sriv texture layout"),
@@ -512,6 +519,7 @@ impl Renderer {
             queue,
             surface,
             surface_config,
+            surface_needs_configure: true,
             output_color_space,
             pipeline,
             texture_layout,
@@ -554,12 +562,59 @@ impl Renderer {
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
-            return;
+        if self.surface_config.width != width || self.surface_config.height != height {
+            self.surface_config.width = width;
+            self.surface_config.height = height;
+            self.surface_needs_configure = true;
         }
-        self.surface_config.width = width;
-        self.surface_config.height = height;
-        self.surface.configure(&self.device, &self.surface_config);
+    }
+
+    fn acquire_surface_frame(&mut self) -> Result<Option<wgpu::SurfaceTexture>> {
+        if self.surface_config.width == 0 || self.surface_config.height == 0 {
+            return Ok(None);
+        }
+        // All configuration happens before acquisition. In particular, Suboptimal owns a
+        // live frame, so reconfiguring in its match arm would panic (including on unwind).
+        if self.surface_needs_configure {
+            self.surface.configure(&self.device, &self.surface_config);
+            self.surface_needs_configure = false;
+        }
+        let current = self.surface.get_current_texture();
+        self.handle_surface_texture(current)
+    }
+
+    fn handle_surface_texture(
+        &mut self,
+        current: wgpu::CurrentSurfaceTexture,
+    ) -> Result<Option<wgpu::SurfaceTexture>> {
+        match current {
+            wgpu::CurrentSurfaceTexture::Success(frame) => Ok(Some(frame)),
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                // The frame is still usable. Present it to make progress even on drivers
+                // that repeatedly report Suboptimal, and reconfigure before the next draw.
+                self.surface_needs_configure = true;
+                Ok(Some(frame))
+            }
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                self.window.request_redraw();
+                Ok(None)
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => Ok(None),
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                self.surface_needs_configure = true;
+                self.window.request_redraw();
+                Ok(None)
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface_needs_configure = true;
+                self.surface = self.instance.create_surface(self.window.clone())?;
+                self.window.request_redraw();
+                Ok(None)
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                anyhow::bail!("surface validation failed while acquiring the next frame")
+            }
+        }
     }
 
     pub fn texture_from_image(&self, image: &DynamicImage) -> GpuTexture {
@@ -663,6 +718,9 @@ impl Renderer {
     }
 
     pub fn render(&mut self, scene: &Scene<'_>, scale_factor: f64) -> Result<()> {
+        let Some(frame) = self.acquire_surface_frame()? else {
+            return Ok(());
+        };
         let logical_width = scene.rect.w().max(1.0);
         let logical_height = scene.rect.h().max(1.0);
         let mut vertices = Vec::with_capacity(scene.quads.len() * 4);
@@ -793,28 +851,6 @@ impl Renderer {
             &mut self.swash_cache,
         )?;
 
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Timeout => {
-                self.window.request_redraw();
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
-                self.surface.configure(&self.device, &self.surface_config);
-                self.window.request_redraw();
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface = self.instance.create_surface(self.window.clone())?;
-                self.surface.configure(&self.device, &self.surface_config);
-                self.window.request_redraw();
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                anyhow::bail!("surface validation failed while acquiring the next frame")
-            }
-        };
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -858,6 +894,8 @@ impl Renderer {
                 .render(&self.atlas, &self.viewport, &mut pass)?;
         }
         self.queue.submit(Some(encoder.finish()));
+        // Wayland uses this to request a compositor frame callback for redraw pacing.
+        self.window.pre_present_notify();
         self.queue.present(frame);
         self.atlas.trim();
         Ok(())

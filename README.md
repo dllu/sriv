@@ -63,6 +63,21 @@ WebP, JPEG XL, and HEIF/HEIC images. It requires `xdg-mime` (from `xdg-utils`)
 and `update-desktop-database` (from `desktop-file-utils`). File managers and
 `xdg-open` will then open supported images in sriv.
 
+## Wayland regression test
+
+Run the surface lifecycle test in a disposable headless Sway session:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" python3 scripts/test-wayland.py
+```
+
+Sway and `swaymsg` must be installed together; use `--sway /path/to/sway` for a
+custom installation. The test disables Xwayland, checks native Wayland window
+creation, and exercises live suboptimal frames, zero sizes, surface recovery,
+fullscreen, resizing, and moves between outputs with different scales. It uses
+the graphics driver and does not change your desktop session. Ordinary
+`cargo test` skips this compositor-dependent test.
+
 ## usage
 
 to clear and regenerate the thumbnail cache for all specified images, use the `--clear-cache` flag before the file or directory arguments:
