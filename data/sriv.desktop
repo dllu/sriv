@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=sriv
+GenericName=Image Viewer
+Comment=View images and search them with CLIP
+Exec=sriv %F
+TryExec=sriv
+Icon=image-x-generic
+Terminal=false
+Categories=Graphics;Viewer;
+MimeType=image/jpeg;image/pjpeg;image/png;image/apng;image/x-png;image/gif;image/bmp;image/x-bmp;image/x-MS-bmp;image/x-ms-bmp;image/tiff;image/x-tiff;image/x-tiff-multipage;image/webp;image/jxl;image/heif;image/heic;image/heif-sequence;image/heic-sequence;

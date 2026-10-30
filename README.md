@@ -50,6 +50,19 @@ alternatively, install directly with Cargo:
 sudo cargo install --path . --force --root /usr/local
 ```
 
+On Linux, after installing `sriv` on your `PATH`, run this from the repository
+to make it the default image viewer for your user (without `sudo`):
+
+```bash
+./scripts/set-default-viewer.sh
+```
+
+This installs `data/sriv.desktop` into `${XDG_DATA_HOME:-~/.local/share}/applications`
+and uses `xdg-mime` to make sriv the default for JPEG, PNG/APNG, GIF, BMP, TIFF,
+WebP, JPEG XL, and HEIF/HEIC images. It requires `xdg-mime` (from `xdg-utils`)
+and `update-desktop-database` (from `desktop-file-utils`). File managers and
+`xdg-open` will then open supported images in sriv.
+
 ## usage
 
 to clear and regenerate the thumbnail cache for all specified images, use the `--clear-cache` flag before the file or directory arguments:

@@ -294,6 +294,7 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
         eprintln!("No image files found in arguments.");
         std::process::exit(1);
     }
+    let start_in_single_mode = image_paths.len() == 1;
     image_paths.sort();
     let thumb_has_xmp = image_io::detect_thumb_sidecars(&image_paths);
     // Prepare thumbnail size, gap, and cache base directory.
@@ -505,7 +506,11 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
         full_pending,
         full_textures,
         full_usage,
-        mode: Mode::Thumbnails,
+        mode: if start_in_single_mode {
+            Mode::Single
+        } else {
+            Mode::Thumbnails
+        },
         current: 0,
         thumb_size,
         gap: 10.0,
@@ -514,7 +519,7 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
         pan: vec2(0.0, 0.0),
         prev_window_rect: initial_rect,
         prev_scroll: 0.0,
-        fit_mode: false,
+        fit_mode: start_in_single_mode,
         selection_changed_at: Instant::now(),
         selection_pending: false,
         // Custom key bindings
