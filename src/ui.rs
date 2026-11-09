@@ -5,7 +5,7 @@ use std::process::Stdio;
 use std::thread;
 
 use crate::app::App;
-use crate::geometry::{srgba, Rect, Rgba, WHITE};
+use crate::geometry::{image_rect, srgba, vec2, Rect, Rgba, WHITE};
 use crate::grid::ThumbnailGrid;
 use crate::image_io;
 use crate::renderer::{Renderer, Scene};
@@ -589,7 +589,7 @@ pub(crate) fn render(app: &App, model: &mut Model, renderer: &mut Renderer) -> R
     let mut draw = Scene::new(rect);
     match model.mode {
         Mode::Thumbnails => {
-            let grid = ThumbnailGrid::new(model, rect);
+            let grid = ThumbnailGrid::new(model, rect, app.scale_factor());
             if let Some((row_min, row_max)) = grid.visible_rows() {
                 for row in row_min..=row_max {
                     for col in 0..grid.cols() {
@@ -601,11 +601,16 @@ pub(crate) fn render(app: &App, model: &mut Model, renderer: &mut Renderer) -> R
                             Some(c) => c,
                             None => continue,
                         };
+                        let size = model
+                            .thumb_visible
+                            .get(&i)
+                            .map_or([model.thumb_size; 2], |slot| slot.size);
+                        let bounds = image_rect(rect, center, size, 1.0, app.scale_factor());
+                        let center = vec2(bounds.x(), bounds.y());
+                        let w = bounds.w();
+                        let h = bounds.h();
 
                         if let Some(slot) = model.thumb_visible.get(&i) {
-                            let [tw, th] = slot.size;
-                            let w = tw as f32;
-                            let h = th as f32;
                             draw.texture(&slot.texture)
                                 .x_y(center.x, center.y)
                                 .w_h(w, h);
@@ -635,16 +640,14 @@ pub(crate) fn render(app: &App, model: &mut Model, renderer: &mut Renderer) -> R
                                     .stroke_weight(2.0);
                             }
                         } else {
-                            let thumb_w = model.thumb_size as f32;
-                            let thumb_h = model.thumb_size as f32;
                             draw.rect()
                                 .x_y(center.x, center.y)
-                                .w_h(thumb_w, thumb_h)
+                                .w_h(w, h)
                                 .color(srgba(0.5, 0.5, 0.5, 1.0));
                             if i == model.current {
                                 draw.rect()
                                     .x_y(center.x, center.y)
-                                    .w_h(thumb_w + 4.0, thumb_h + 4.0)
+                                    .w_h(w + 4.0, h + 4.0)
                                     .no_fill()
                                     .stroke(WHITE)
                                     .stroke_weight(2.0);
@@ -683,20 +686,21 @@ pub(crate) fn render(app: &App, model: &mut Model, renderer: &mut Renderer) -> R
             if let Some(tex) = model.full_textures.get(&model.current) {
                 // Draw each tile at the correct position, applying zoom and pan
                 let [full_w, full_h] = tex.size();
+                let bounds =
+                    image_rect(rect, model.pan, tex.size(), model.zoom, app.scale_factor());
+                let logical_zoom = model.zoom / app.scale_factor() as f32;
                 for tile in tex.current_tiles() {
-                    // Compute tile center relative to full image center
-                    let x_center =
-                        tile.x_offset as f32 - full_w as f32 / 2.0 + tile.width as f32 / 2.0;
-                    let y_center =
-                        full_h as f32 / 2.0 - tile.y_offset as f32 - tile.height as f32 / 2.0;
+                    // All tiles share the pixel-aligned origin of the whole image.
+                    let x_center = tile.x_offset as f32 + tile.width as f32 / 2.0;
+                    let y_center = tile.y_offset as f32 + tile.height as f32 / 2.0;
                     draw.texture(tile.texture.as_ref().unwrap())
                         .x_y(
-                            model.pan.x + x_center * model.zoom,
-                            model.pan.y + y_center * model.zoom,
+                            bounds.left() + x_center * logical_zoom,
+                            bounds.top() - y_center * logical_zoom,
                         )
                         .w_h(
-                            tile.width as f32 * model.zoom,
-                            tile.height as f32 * model.zoom,
+                            tile.width as f32 * logical_zoom,
+                            tile.height as f32 * logical_zoom,
                         );
                 }
                 // Draw bottom info bar with full path, dimensions, and zoom

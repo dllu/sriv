@@ -17,8 +17,9 @@ pub struct ThumbnailGrid {
 }
 
 impl ThumbnailGrid {
-    pub fn new(model: &Model, rect: Rect) -> Self {
-        let thumb_size = model.thumb_size as f32;
+    pub fn new(model: &Model, rect: Rect, scale_factor: f64) -> Self {
+        // Cached thumbnails stay at their physical pixel size; gaps are UI units.
+        let thumb_size = model.thumb_size as f32 / scale_factor as f32;
         let cell = thumb_size + model.gap;
         let cols = (((rect.w() + model.gap) / cell).floor() as isize).max(1) as usize;
         let total = model.image_paths.len();

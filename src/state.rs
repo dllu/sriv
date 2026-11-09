@@ -463,12 +463,16 @@ pub struct Model {
     pub full_usage: VecDeque<usize>,
     pub mode: Mode,
     pub current: usize,
+    /// Maximum thumbnail edge in physical pixels, also used for the disk cache.
     pub thumb_size: u32,
     pub gap: f32,
     pub scroll_offset: f32,
+    /// Physical screen pixels per image pixel, independent of the UI scale.
     pub zoom: f32,
+    /// Image center in logical UI coordinates.
     pub pan: Vec2,
     pub prev_window_rect: Rect,
+    pub prev_scale_factor: f64,
     pub prev_scroll: f32,
     pub fit_mode: bool,
     pub selection_changed_at: Instant,

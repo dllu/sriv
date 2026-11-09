@@ -21,7 +21,7 @@ use winit::window::{Fullscreen, Window};
 
 use crate::clip::{self, ClipEngine, ClipEvent};
 use crate::color::OutputColorSpace;
-use crate::geometry::{vec2, Rect, Vec2};
+use crate::geometry::{fit_image_zoom, image_rect, vec2, Rect, Vec2};
 use crate::grid::ThumbnailGrid;
 use crate::image_io;
 use crate::input::Key;
@@ -178,7 +178,7 @@ fn mouse_pressed(app: &App, model: &mut Model, button: MouseButton) {
         if button == MouseButton::Left {
             let pos = app.mouse.position();
             let rect = app.rect();
-            let grid = ThumbnailGrid::new(model, rect);
+            let grid = ThumbnailGrid::new(model, rect, app.scale_factor());
             if let Some((row_min, row_max)) = grid.visible_rows() {
                 for row in row_min..=row_max {
                     for col in 0..grid.cols() {
@@ -187,20 +187,17 @@ fn mouse_pressed(app: &App, model: &mut Model, button: MouseButton) {
                             break;
                         }
                         let center = grid.index_center(i).unwrap();
-                        let x = center.x;
-                        let y = center.y;
-                        let (width, height) = if let Some(slot) = model.thumb_visible.get(&i) {
-                            let [tw, th] = slot.size;
-                            (tw as f32, th as f32)
+                        let size = if let Some(slot) = model.thumb_visible.get(&i) {
+                            slot.size
                         } else {
-                            let size = model.thumb_size as f32;
-                            (size, size)
+                            [model.thumb_size; 2]
                         };
-                        let x_min = x - width / 2.0;
-                        let x_max = x + width / 2.0;
-                        let y_min = y - height / 2.0;
-                        let y_max = y + height / 2.0;
-                        if pos.x >= x_min && pos.x <= x_max && pos.y >= y_min && pos.y <= y_max {
+                        let bounds = image_rect(rect, center, size, 1.0, app.scale_factor());
+                        if pos.x >= bounds.left()
+                            && pos.x <= bounds.right()
+                            && pos.y >= bounds.bottom()
+                            && pos.y <= bounds.top()
+                        {
                             model.current = i;
                             model.selection_changed_at = Instant::now();
                             model.selection_pending = false;
@@ -235,7 +232,7 @@ fn mouse_wheel(app: &App, model: &mut Model, delta: MouseScrollDelta, _phase: To
             // Update scroll offset and clamp to content bounds
             model.scroll_offset += scroll_amount;
             let rect = app.rect();
-            let grid = ThumbnailGrid::new(model, rect);
+            let grid = ThumbnailGrid::new(model, rect, app.scale_factor());
             model.scroll_offset = model.scroll_offset.clamp(0.0, grid.max_scroll());
         }
         Mode::Single => {
@@ -251,6 +248,7 @@ fn mouse_wheel(app: &App, model: &mut Model, delta: MouseScrollDelta, _phase: To
             // Adjust pan so the point under cursor stays fixed
             model.pan = mouse_pos + (model.pan - mouse_pos) * (new_zoom / old_zoom);
             model.zoom = new_zoom;
+            model.fit_mode = false;
         }
     }
 }
@@ -518,6 +516,7 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
         zoom: 1.0,
         pan: vec2(0.0, 0.0),
         prev_window_rect: initial_rect,
+        prev_scale_factor: app.scale_factor(),
         prev_scroll: 0.0,
         fit_mode: start_in_single_mode,
         selection_changed_at: Instant::now(),
@@ -844,7 +843,7 @@ fn ensure_thumbnail_visible(app: &App, model: &mut Model, idx: usize) {
         return;
     }
     let rect = app.rect();
-    let grid = ThumbnailGrid::new(model, rect);
+    let grid = ThumbnailGrid::new(model, rect, app.scale_factor());
     if let Some(row) = grid.row_for_index(idx) {
         let view_height = grid.rect().h();
         let mut scroll = model.scroll_offset;
@@ -1129,7 +1128,7 @@ fn handle_arrow(app: &App, model: &mut Model, dir: ArrowDirection) -> bool {
             if len == 0 {
                 return false;
             }
-            let grid = ThumbnailGrid::new(model, rect);
+            let grid = ThumbnailGrid::new(model, rect, app.scale_factor());
             let cols = grid.cols();
             let current = model.current.min(len - 1);
             let mut row = current / cols;
@@ -1192,7 +1191,7 @@ fn handle_arrow(app: &App, model: &mut Model, dir: ArrowDirection) -> bool {
                 ArrowDirection::Left | ArrowDirection::Right => {
                     if let Some(tex) = model.full_textures.get(&model.current) {
                         let [tw, _] = tex.size();
-                        let disp_w = tw as f32 * model.zoom;
+                        let disp_w = tw as f32 * model.zoom / app.scale_factor() as f32;
                         if disp_w > rect.w() {
                             if let ArrowDirection::Left = dir {
                                 model.pan.x += pan_step;
@@ -1208,7 +1207,7 @@ fn handle_arrow(app: &App, model: &mut Model, dir: ArrowDirection) -> bool {
                 ArrowDirection::Up | ArrowDirection::Down => {
                     if let Some(tex) = model.full_textures.get(&model.current) {
                         let [_, th] = tex.size();
-                        let disp_h = th as f32 * model.zoom;
+                        let disp_h = th as f32 * model.zoom / app.scale_factor() as f32;
                         if disp_h > rect.h() {
                             if let ArrowDirection::Up = dir {
                                 model.pan.y -= pan_step;
@@ -1382,14 +1381,7 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             // Fit single image to window
             Key::W => {
                 if let Mode::Single = model.mode {
-                    let rect = app.rect();
-                    if let Some(tex) = model.full_textures.get(&model.current) {
-                        let [w, h] = tex.size();
-                        model.zoom = (rect.w() / w as f32).min(rect.h() / h as f32);
-                    } else {
-                        model.zoom = 1.0;
-                    }
-                    model.pan = vec2(0.0, 0.0);
+                    apply_fit(app, model);
                 }
             }
             // Toggle full screen
@@ -1401,9 +1393,10 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                 };
                 app.window.set_fullscreen(fullscreen);
             }
-            // Show at 100% scale
+            // Show one image pixel per physical screen pixel.
             Key::Equals => {
                 if let Mode::Single = model.mode {
+                    model.fit_mode = false;
                     model.zoom = 1.0;
                     model.pan = vec2(0.0, 0.0);
                 }
@@ -1663,8 +1656,11 @@ fn update(app: &App, model: &mut Model, renderer: &Renderer, check_files: bool) 
     }
     // Handle window resize: update view parameters and re-apply fit if in fit mode
     let rect = app.rect();
-    if rect != model.prev_window_rect {
+    let viewport_changed =
+        rect != model.prev_window_rect || app.scale_factor() != model.prev_scale_factor;
+    if viewport_changed {
         model.prev_window_rect = rect;
+        model.prev_scale_factor = app.scale_factor();
         redraw_needed = true;
         if let Mode::Single = model.mode {
             if model.fit_mode {
@@ -1683,7 +1679,7 @@ fn update(app: &App, model: &mut Model, renderer: &Renderer, check_files: bool) 
     }
     // Clamp thumbnail scrolling to content bounds
     if let Mode::Thumbnails = model.mode {
-        let grid = ThumbnailGrid::new(model, rect);
+        let grid = ThumbnailGrid::new(model, rect, app.scale_factor());
         let clamped = model.scroll_offset.clamp(0.0, grid.max_scroll());
         if clamped != model.scroll_offset {
             model.scroll_offset = clamped;
@@ -1693,7 +1689,7 @@ fn update(app: &App, model: &mut Model, renderer: &Renderer, check_files: bool) 
     if matches!(model.mode, Mode::Single) && !model.full_textures.contains_key(&model.current) {
         request_full_texture(model, model.current);
     }
-    update_thumbnail_requests(app, model, renderer);
+    update_thumbnail_requests(app, model, renderer, viewport_changed);
     redraw_needed
 }
 
@@ -1732,7 +1728,12 @@ fn request_full_texture(model: &mut Model, idx: usize) {
     }
 }
 
-fn update_thumbnail_requests(app: &App, model: &mut Model, renderer: &Renderer) {
+fn update_thumbnail_requests(
+    app: &App,
+    model: &mut Model,
+    renderer: &Renderer,
+    viewport_changed: bool,
+) {
     if !matches!(model.mode, Mode::Thumbnails) {
         return;
     }
@@ -1742,22 +1743,16 @@ fn update_thumbnail_requests(app: &App, model: &mut Model, renderer: &Renderer) 
         return;
     }
     let rect = app.rect();
-    let grid = ThumbnailGrid::new(model, rect);
+    let grid = ThumbnailGrid::new(model, rect, app.scale_factor());
     let visible = grid.visible_indices();
 
-    let window_changed = if rect != model.prev_window_rect {
-        model.prev_window_rect = rect;
-        true
-    } else {
-        false
-    };
     let scroll_changed = if (model.scroll_offset - model.prev_scroll).abs() > f32::EPSILON {
         model.prev_scroll = model.scroll_offset;
         true
     } else {
         false
     };
-    if window_changed || scroll_changed {
+    if viewport_changed || scroll_changed {
         model
             .thumb_queue
             .reprioritize(|idx| grid.viewport_priority(idx));
@@ -1834,7 +1829,7 @@ fn detect_file_changes(app: &App, model: &mut Model) -> bool {
     let mut candidates: HashSet<usize> = HashSet::new();
     candidates.insert(model.current);
     if matches!(model.mode, Mode::Thumbnails) {
-        for idx in ThumbnailGrid::new(model, app.rect()).visible_indices() {
+        for idx in ThumbnailGrid::new(model, app.rect(), app.scale_factor()).visible_indices() {
             candidates.insert(idx);
         }
     }
@@ -1899,10 +1894,8 @@ fn current_mod_time(path: &Path) -> Option<SystemTime> {
 /// Apply fit-to-window for current single-image view
 fn apply_fit(app: &App, model: &mut Model) {
     model.fit_mode = true;
-    let rect = app.rect();
     if let Some(tex) = model.full_textures.get(&model.current) {
-        let [w, h] = tex.size();
-        model.zoom = (rect.w() / w as f32).min(rect.h() / h as f32);
+        model.zoom = fit_image_zoom(app.rect(), tex.size(), app.scale_factor());
     } else {
         model.zoom = 1.0;
     }

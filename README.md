@@ -80,6 +80,13 @@ the graphics driver and does not change your desktop session. Ordinary
 
 ## usage
 
+In single-image mode, press `=` for one image pixel per physical screen pixel,
+or `w` to fit the image to the window. The zoom indicator uses this physical
+pixel ratio, independently of display scaling. Thumbnails also keep their cached
+size of up to 256 physical pixels per edge, so high-DPI displays show more
+thumbnails rather than enlarging them. Text, gaps, and UI controls follow the
+display's DPI setting. Existing thumbnail caches can be reused.
+
 to clear and regenerate the thumbnail cache for all specified images, use the `--clear-cache` flag before the file or directory arguments:
 
 ```bash
