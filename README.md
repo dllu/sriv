@@ -165,6 +165,49 @@ However, only the thumbnails visible in the viewport are loaded into textures on
 Also, a tiled texture strategy is used for displaying the full size image, to prevent crashes on certain GPUs or difficulty with allocating a contiguous giant texture.
 Full size images can be quite large and use a lot of memory, so an LRU cache keeps memory usage bounded.
 
+## state machines
+
+The app has several independent lifecycles. Keep independent concerns such as search
+focus and execution separate; use enums when states have different data or when
+several flags would allow contradictory combinations. The event loop owns UI state;
+workers send versioned results and never mutate it directly.
+
+| Lifecycle | States and transitions | Owner and invariant |
+| --- | --- | --- |
+| Application | Uninitialized → running → exiting; startup failure → exit | [`SrivApplication`](src/app.rs). Repeated resume events do not create another window or model. |
+| Worker wakeups | Idle → wake queued → drain channels → idle | [`AppProxy`](src/app.rs). Clear the wake flag before draining so work arriving during the drain can schedule another wake. |
+| Event scheduling | Waiting → deadline reached or worker/input event → update → waiting | [`ApplicationState`](src/app.rs). Wait for the earliest file poll, selection preload, load retry, or animation frame. Input redraws are coalesced. |
+| Physical keys | Released → pressed while focused → repeating → released; held across focus → ignored until release | [`Keys`](src/app.rs). Losing focus resets modifiers; synthetic presses and unfocused repeats cannot trigger shortcuts. |
+| Input routing | Search editing, terminal controls, viewer controls, custom bindings | [`window_event` and `key_pressed`](src/app.rs). Search gets first refusal; the event that opens search contributes no text. Custom bindings can still run after viewer actions. |
+| Viewing and zoom | Thumbnails ↔ single image; fitted ↔ manual zoom; windowed ↔ fullscreen | [`Mode`](src/state.rs) and navigation in [`app.rs`](src/app.rs). Navigating starts fitted even when decoding is pending. Manual zoom survives resizing until fit is requested again. |
+| Selection preload | `Waiting { deadline }` → `Requested`; thumbnail input or selected-file invalidation rearms the delay | [`SelectionPreload`](src/state/loading.rs). A stable selection schedules one preload after 200 ms. |
+| File watching | Observed revision → changed/deleted/reappeared → invalidate → reload | [`check_image_modification`](src/app.rs), [`ImageStates`](src/state/loading.rs). Increment the generation and invalidate thumbnails, embeddings, search scores, and full images together. Poll the current/visible files plus a rotating batch. |
+| Thumbnail queue | Open/empty ↔ queued → dispatched; open → closed/draining → exhausted | [`ThumbRequestQueue`](src/state.rs). One queued entry per index carries its latest generation; closing wakes waiters and rejects new work. |
+| Thumbnail residency | Requested → CPU image → visible GPU texture; leaving the viewport releases the texture | [`handle_thumbnail_update` and `update_thumbnail_requests`](src/app.rs). CPU thumbnails remain available; invalidated results cannot replace the current generation. Decode failure uses the existing fallback thumbnail. |
+| Disk caches | Missing/stale/unreadable → generate → optional write; valid → reuse | [`image_io.rs`](src/image_io.rs), [`clip.rs`](src/clip.rs). Existing mtime checks govern cache freshness. Private mode skips sriv cache reads/writes. A failed embedding-cache write does not discard a usable in-memory embedding. |
+| CLIP workers | Initialize model/tokenizer → CPU or GPU inference → wait/work → stopped | [`ClipEngine`](src/clip.rs). CUDA initialization can fall back to CPU. When all workers stop, pending work becomes a visible failure; thumbnail decoding and cached embeddings remain usable. |
+| CLIP job batching | Receive image → collect batch → infer → handle deferred text → receive again | [`run_worker`](src/clip.rs). Text encountered during batch collection is processed after that batch. Worker results may arrive out of order. |
+| Per-image embeddings | `WaitingForThumbnail` → `Pending` → `Ready` or `Failed`; cached thumbnail → `Ready`; invalidation → waiting | [`ImageStates` and `EmbeddingState`](src/state/loading.rs). An early CLIP completion cannot be undone by later thumbnail delivery. Progress counts update with transitions, so rendering does not scan the library. |
+| Search | Absent ↔ present; focused ↔ unfocused; `Draft` → `Pending` → `Ready` or `Failed`; edit → draft | [`SearchState`](src/state/search.rs). Only the pending request ID can complete. Results and their query embedding exist together. Live indexing preserves the selected image when rankings change; invalidation removes stale scores and preserves the navigation position until the selected image reloads or the user advances. |
+| Full-image loading | Absent → `InFlight` → `Ready` or `Failed`; failure deadline → retry; invalidation → absent | [`FullImageCache`](src/state/loading.rs). A result must match the outstanding generation. The five-second retry is eligible exactly at its deadline; errors are displayed instead of indefinite loading. |
+| Full-image residency | Cached → most/least recently used → evicted → absent | [`FullImageCache`](src/state/loading.rs). Load state, textures, and recency share one owner. At most four images are resident; late preloads cannot evict the selected image. |
+| Full-image GPU tiles | Raw pixels → texture uploaded on demand → released with eviction | [`Tile`](src/state.rs), [`prepare_current_full_textures`](src/ui.rs). Only prepared tiles are drawn; unsupported 16-bit formats use the existing fallback conversion. |
+| Playback | Unscheduled → restart on first frame → frame deadlines → next frame/cycle | [`TiledTexture`](src/state.rs). Still images have no deadline. Frame delays are clamped to 10 ms and catch-up after suspension traverses at most one cycle. Only single-image viewing schedules playback. |
+| GPU surface | Zero-sized/skipped → needs configuration → ready → frame acquired → presented; suboptimal/outdated/lost → deferred recovery | [`Renderer`](src/renderer.rs). Never configure a zero-sized surface or reconfigure while a live frame is owned. Timeout requests another draw; occlusion waits for window events. |
+| Terminal panel | Hidden ↔ visible; empty ↔ sessions with active tab; following output ↔ scrollback | [`TerminalState`](src/state.rs), [`ui.rs`](src/ui.rs). Active tabs are clamped after removal; closing the last tab hides the panel. Output is routed by session ID, so closed tabs ignore late events. |
+| Terminal commands | `Running` → `Exited`; startup/read/wait failure → `Failed`; PTY output closes independently | [`CommandStatus`](src/state.rs), [`start_command_workers`](src/ui.rs). Report process exit immediately and retain the master until output is drained, even if a descendant keeps the PTY open. Keep the first failure even if a later exit arrives. |
+| Detached commands | Spawn → run outside the panel → wait/reap | [`launch_detached_command`](src/ui.rs). Waiting happens on a background thread and leaves the UI responsive. |
+
+When changing a lifecycle, put its transition in its owning type and test event
+orderings, cancellation/invalidation, failure recovery, and deadline boundaries.
+Do not add independent flags for data that belongs to one phase. Simple binary
+states and state derived from window/channel APIs do not need a general FSM framework.
+
+Run the transition and image-format tests with `cargo test --locked`. On ARM hosts
+where Candle's GEMM dependency requires FP16 target features, use
+`RUSTFLAGS="-C target-cpu=native" cargo test --locked`. The separate Wayland test
+above exercises the surface lifecycle with real GPU frames and output-scale changes.
+
 # faq
 
 > why does it use so much cpu?

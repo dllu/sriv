@@ -17,6 +17,7 @@ use sha1::Sha1;
 use tokenizers::Tokenizer;
 
 use crate::app::AppProxy;
+use crate::state::ImageRequest;
 
 const MAX_IMAGE_BATCH: usize = 16;
 
@@ -24,11 +25,11 @@ const MAX_IMAGE_BATCH: usize = 16;
 #[derive(Debug)]
 pub enum ClipEvent {
     ImageReady {
-        index: usize,
+        request: ImageRequest,
         embedding: Vec<f32>,
     },
     ImageError {
-        index: usize,
+        request: ImageRequest,
         error: String,
     },
     TextReady {
@@ -43,7 +44,7 @@ pub enum ClipEvent {
 
 enum ClipJob {
     Image {
-        index: usize,
+        request: ImageRequest,
         image_path: PathBuf,
         thumbnail: RgbImage,
     },
@@ -69,13 +70,13 @@ pub struct ClipRequestSender {
 impl ClipRequestSender {
     pub fn queue_image(
         &self,
-        index: usize,
+        request: ImageRequest,
         image_path: PathBuf,
         thumbnail: RgbImage,
     ) -> Result<()> {
         self.job_tx
             .send(ClipJob::Image {
-                index,
+                request,
                 image_path,
                 thumbnail,
             })
@@ -116,9 +117,13 @@ impl ClipEngine {
             thread::Builder::new()
                 .name(format!("clip-worker-{worker_idx}"))
                 .spawn(move || {
+                    let proxy = worker_ctx.proxy.clone();
                     if let Err(err) = run_worker(worker_ctx, worker_rx, want_cuda) {
                         eprintln!("clip worker terminated: {err:#}");
                     }
+                    // The last worker dropping its sender disconnects result_rx. Wake the UI
+                    // so pending work becomes a visible failure even without further input.
+                    proxy.wakeup();
                 })
                 .context("failed to spawn clip worker thread")?;
         }
@@ -219,19 +224,19 @@ fn run_worker(ctx: ClipWorkerContext, job_rx: Receiver<ClipJob>, use_cuda: bool)
     while let Ok(job) = job_rx.recv() {
         match job {
             ClipJob::Image {
-                index,
+                request,
                 image_path,
                 thumbnail,
             } => {
-                let mut batch = vec![(index, image_path, thumbnail)];
+                let mut batch = vec![(request, image_path, thumbnail)];
                 let mut deferred_job: Option<ClipJob> = None;
                 while batch.len() < MAX_IMAGE_BATCH {
                     match job_rx.try_recv() {
                         Ok(ClipJob::Image {
-                            index,
+                            request,
                             image_path,
                             thumbnail,
-                        }) => batch.push((index, image_path, thumbnail)),
+                        }) => batch.push((request, image_path, thumbnail)),
                         Ok(other) => {
                             deferred_job = Some(other);
                             break;
@@ -250,10 +255,12 @@ fn run_worker(ctx: ClipWorkerContext, job_rx: Receiver<ClipJob>, use_cuda: bool)
                             handle_text_job(request_id, &query, &text_ctx)
                         }
                         ClipJob::Image {
-                            index,
+                            request,
                             image_path,
                             thumbnail,
-                        } => process_image_batch(vec![(index, image_path, thumbnail)], &image_ctx),
+                        } => {
+                            process_image_batch(vec![(request, image_path, thumbnail)], &image_ctx)
+                        }
                     }
                 }
                 if channel_closed {
@@ -293,15 +300,15 @@ fn handle_text_job(request_id: u64, query: &str, ctx: &TextJobContext<'_>) {
     }
 }
 
-fn process_image_batch(batch: Vec<(usize, PathBuf, RgbImage)>, ctx: &ImageBatchContext<'_>) {
+fn process_image_batch(batch: Vec<(ImageRequest, PathBuf, RgbImage)>, ctx: &ImageBatchContext<'_>) {
     let mut compute_indices = Vec::new();
     let mut compute_paths = Vec::new();
     let mut compute_tensors = Vec::new();
 
-    for (index, image_path, thumb) in batch {
+    for (request, image_path, thumb) in batch {
         match tensor_from_thumbnail(thumb, ctx.clip_image_size) {
             Ok(tensor) => {
-                compute_indices.push(index);
+                compute_indices.push(request);
                 compute_paths.push(image_path);
                 compute_tensors.push(tensor);
             }
@@ -310,7 +317,7 @@ fn process_image_batch(batch: Vec<(usize, PathBuf, RgbImage)>, ctx: &ImageBatchC
                     ctx.result_tx,
                     ctx.proxy,
                     ClipEvent::ImageError {
-                        index,
+                        request,
                         error: format!("{}", err),
                     },
                 );
@@ -341,30 +348,23 @@ fn process_image_batch(batch: Vec<(usize, PathBuf, RgbImage)>, ctx: &ImageBatchC
 
     match image_embeddings(ctx.model, stacked) {
         Ok(embeddings) => {
-            for ((index, path), embedding) in compute_indices
+            for ((request, path), embedding) in compute_indices
                 .into_iter()
                 .zip(compute_paths)
                 .zip(embeddings)
             {
-                match cache_embedding(ctx.cache_base, &path, &embedding) {
-                    Ok(()) => {
-                        send_result(
-                            ctx.result_tx,
-                            ctx.proxy,
-                            ClipEvent::ImageReady { index, embedding },
-                        );
-                    }
-                    Err(err) => {
-                        send_result(
-                            ctx.result_tx,
-                            ctx.proxy,
-                            ClipEvent::ImageError {
-                                index,
-                                error: format!("{}", err),
-                            },
-                        );
-                    }
+                if let Err(err) = cache_embedding(ctx.cache_base, &path, &embedding) {
+                    eprintln!(
+                        "Failed to cache CLIP embedding for {}: {err}",
+                        path.display()
+                    );
                 }
+                // A disk-cache failure must not discard a successfully computed embedding.
+                send_result(
+                    ctx.result_tx,
+                    ctx.proxy,
+                    ClipEvent::ImageReady { request, embedding },
+                );
             }
         }
         Err(err) => {
@@ -380,18 +380,18 @@ fn send_result(result_tx: &Sender<ClipEvent>, proxy: &AppProxy, event: ClipEvent
 }
 
 fn report_batch_error(
-    indices: &[usize],
+    indices: &[ImageRequest],
     result_tx: &Sender<ClipEvent>,
     proxy: &AppProxy,
     err: impl fmt::Display,
 ) {
     let msg = format!("{}", err);
-    for &idx in indices {
+    for &request in indices {
         send_result(
             result_tx,
             proxy,
             ClipEvent::ImageError {
-                index: idx,
+                request,
                 error: msg.clone(),
             },
         );

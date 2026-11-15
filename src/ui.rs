@@ -1,7 +1,8 @@
 use anyhow::Result;
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
 use std::io::Read;
 use std::process::Stdio;
+use std::sync::mpsc::Sender;
 use std::thread;
 
 use crate::app::App;
@@ -9,7 +10,9 @@ use crate::geometry::{image_rect, srgba, vec2, Rect, Rgba, WHITE};
 use crate::grid::ThumbnailGrid;
 use crate::image_io;
 use crate::renderer::{Renderer, Scene};
-use crate::state::{CommandEvent, Mode, Model, TerminalSession, TilePixelFormat};
+use crate::state::{
+    CommandEvent, CommandStatus, Mode, Model, SearchPhase, TerminalSession, TilePixelFormat,
+};
 
 const INFO_BAR_HEIGHT: f32 = 20.0;
 const TERMINAL_PANEL_FRACTION: f32 = 0.42;
@@ -172,53 +175,15 @@ pub(crate) fn launch_terminal_command(app: &App, model: &mut Model, command: Str
 
     let session = match pty_system.openpty(terminal_pty_size(rows, cols)) {
         Ok(pair) => match pair.master.try_clone_reader() {
-            Ok(mut reader) => {
+            Ok(reader) => {
                 let mut builder = CommandBuilder::new("sh");
                 builder.arg("-c");
                 builder.arg(&command);
 
                 match pair.slave.spawn_command(builder) {
-                    Ok(mut child) => {
-                        let reader_tx = tx.clone();
-                        let reader_proxy = proxy.clone();
-                        thread::spawn(move || {
-                            let mut buf = vec![0_u8; 8192];
-                            loop {
-                                match reader.read(&mut buf) {
-                                    Ok(0) => break,
-                                    Ok(n) => {
-                                        let _ = reader_tx.send(CommandEvent::Output {
-                                            session_id,
-                                            bytes: buf[..n].to_vec(),
-                                        });
-                                        reader_proxy.wakeup();
-                                    }
-                                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-                                    Err(err) => {
-                                        let _ = reader_tx.send(CommandEvent::Failed {
-                                            session_id,
-                                            error: format!("Terminal read failed: {err}"),
-                                        });
-                                        reader_proxy.wakeup();
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-                        thread::spawn(move || {
-                            let event = match child.wait() {
-                                Ok(status) => CommandEvent::Finished {
-                                    session_id,
-                                    exit_code: status.exit_code(),
-                                    signal: status.signal().map(str::to_string),
-                                },
-                                Err(err) => CommandEvent::Failed {
-                                    session_id,
-                                    error: format!("Failed to wait for command: {err}"),
-                                },
-                            };
-                            let _ = tx.send(event);
-                            proxy.wakeup();
+                    Ok(child) => {
+                        start_command_workers(session_id, reader, child, tx, move || {
+                            proxy.wakeup()
                         });
 
                         TerminalSession {
@@ -228,10 +193,7 @@ pub(crate) fn launch_terminal_command(app: &App, model: &mut Model, command: Str
                             parser,
                             master: Some(pair.master),
                             scrollback_offset: 0,
-                            running: true,
-                            exit_code: None,
-                            signal: None,
-                            error: None,
+                            status: CommandStatus::Running,
                         }
                     }
                     Err(error) => TerminalSession {
@@ -239,12 +201,9 @@ pub(crate) fn launch_terminal_command(app: &App, model: &mut Model, command: Str
                         title,
                         command,
                         parser,
-                        master: Some(pair.master),
+                        master: None,
                         scrollback_offset: 0,
-                        running: false,
-                        exit_code: None,
-                        signal: None,
-                        error: Some(format!("Failed to spawn command: {error}")),
+                        status: CommandStatus::Failed(format!("Failed to spawn command: {error}")),
                     },
                 }
             }
@@ -253,12 +212,9 @@ pub(crate) fn launch_terminal_command(app: &App, model: &mut Model, command: Str
                 title,
                 command,
                 parser,
-                master: Some(pair.master),
+                master: None,
                 scrollback_offset: 0,
-                running: false,
-                exit_code: None,
-                signal: None,
-                error: Some(format!("Failed to open PTY reader: {error}")),
+                status: CommandStatus::Failed(format!("Failed to open PTY reader: {error}")),
             },
         },
         Err(error) => {
@@ -270,16 +226,87 @@ pub(crate) fn launch_terminal_command(app: &App, model: &mut Model, command: Str
                 parser,
                 master: None,
                 scrollback_offset: 0,
-                running: false,
-                exit_code: None,
-                signal: None,
-                error: Some(format!("Failed to allocate PTY: {error}")),
+                status: CommandStatus::Failed(format!("Failed to allocate PTY: {error}")),
             }
         }
     };
 
     model.terminal.sessions.push(session);
     set_active_terminal(model, model.terminal.sessions.len() - 1);
+}
+
+/// Report process exit promptly, then drain PTY output before releasing the master.
+fn start_command_workers(
+    session_id: u64,
+    mut reader: Box<dyn Read + Send>,
+    mut child: Box<dyn Child + Send + Sync>,
+    tx: Sender<CommandEvent>,
+    wake: impl Fn() + Clone + Send + 'static,
+) -> thread::JoinHandle<()> {
+    let reader_tx = tx.clone();
+    let reader_wake = wake.clone();
+    let reader_thread = thread::spawn(move || {
+        let mut buf = vec![0_u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if reader_tx
+                        .send(CommandEvent::Output {
+                            session_id,
+                            bytes: buf[..n].to_vec(),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    reader_wake();
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => {
+                    let _ = reader_tx.send(CommandEvent::Failed {
+                        session_id,
+                        error: format!("Terminal read failed: {err}"),
+                    });
+                    reader_wake();
+                    break;
+                }
+            }
+        }
+    });
+    thread::spawn(move || {
+        let event = match child.wait() {
+            Ok(status) => CommandEvent::Finished {
+                session_id,
+                exit_code: status.exit_code(),
+                signal: status.signal().map(str::to_string),
+            },
+            Err(err) => {
+                // A failed wait may leave the process/PTY open. Report it immediately;
+                // waiting for EOF here could leave the session looking busy forever.
+                let _ = tx.send(CommandEvent::Failed {
+                    session_id,
+                    error: format!("Failed to wait for command: {err}"),
+                });
+                wake();
+                return;
+            }
+        };
+        let _ = tx.send(event);
+        wake();
+        // Descendants may keep the PTY open after the command exits. Their output
+        // must not delay the exit status or be cut off when the UI receives it.
+        let event = if reader_thread.join().is_err() {
+            CommandEvent::Failed {
+                session_id,
+                error: "Terminal reader panicked".to_string(),
+            }
+        } else {
+            CommandEvent::OutputClosed { session_id }
+        };
+        let _ = tx.send(event);
+        wake();
+    })
 }
 
 pub(crate) fn launch_detached_command(command: String) {
@@ -290,7 +317,7 @@ pub(crate) fn launch_detached_command(command: String) {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn();
+            .status();
         if let Err(err) = result {
             eprintln!("Failed to launch detached command: {err}");
         }
@@ -343,36 +370,29 @@ fn ansi_color(idx: u8, bold: bool) -> Rgba {
 }
 
 fn terminal_status_text(session: &TerminalSession) -> String {
-    if let Some(error) = &session.error {
-        return error.clone();
-    }
-    if session.running {
-        return "running".to_string();
-    }
-    if let Some(signal) = &session.signal {
-        return format!("terminated by {signal}");
-    }
-    match session.exit_code {
-        Some(0) => "completed".to_string(),
-        Some(code) => format!("exit {code}"),
-        None => "finished".to_string(),
+    match &session.status {
+        CommandStatus::Running => "running".to_string(),
+        CommandStatus::Failed(error) => error.clone(),
+        CommandStatus::Exited {
+            signal: Some(signal),
+            ..
+        } => format!("terminated by {signal}"),
+        CommandStatus::Exited { exit_code: 0, .. } => "completed".to_string(),
+        CommandStatus::Exited { exit_code, .. } => format!("exit {exit_code}"),
     }
 }
 
 fn terminal_tab_label(session: &TerminalSession) -> String {
-    if let Some(error) = &session.error {
-        return format!("{}  {}", session.title, error);
+    match &session.status {
+        CommandStatus::Running => format!("{}  running", session.title),
+        CommandStatus::Failed(error) => format!("{}  {}", session.title, error),
+        CommandStatus::Exited {
+            signal: Some(signal),
+            ..
+        } => format!("{}  {}", session.title, signal),
+        CommandStatus::Exited { exit_code: 0, .. } => session.title.clone(),
+        CommandStatus::Exited { exit_code, .. } => format!("{}  exit {}", session.title, exit_code),
     }
-    if session.running {
-        return format!("{}  running", session.title);
-    }
-    if let Some(signal) = &session.signal {
-        return format!("{}  {}", session.title, signal);
-    }
-    if matches!(session.exit_code, Some(0) | None) {
-        return session.title.clone();
-    }
-    format!("{}  exit {}", session.title, session.exit_code.unwrap())
 }
 
 fn terminal_row_start(screen: &vt100::Screen, visible_rows: u16, cols: u16) -> u16 {
@@ -446,11 +466,11 @@ fn draw_terminal_panel(draw: &mut Scene<'_>, model: &Model, rect: Rect) {
     for (idx, session) in model.terminal.sessions.iter().enumerate() {
         let x = tabs_start + idx as f32 * tab_width;
         let is_active = idx == model.terminal.active;
-        let tab_bg = if is_active && session.running {
+        let tab_bg = if is_active && session.status.is_running() {
             srgba(0.15, 0.38, 0.2, 0.82)
         } else if is_active {
             srgba(0.2, 0.24, 0.28, 0.82)
-        } else if session.running {
+        } else if session.status.is_running() {
             srgba(0.1, 0.2, 0.14, 0.7)
         } else {
             srgba(0.11, 0.12, 0.15, 0.7)
@@ -539,7 +559,7 @@ fn draw_terminal_panel(draw: &mut Scene<'_>, model: &Model, rect: Rect) {
 }
 
 fn prepare_current_full_textures(renderer: &Renderer, model: &mut Model) {
-    let Some(tiled) = model.full_textures.get_mut(&model.current) else {
+    let Some(tiled) = model.full_images.get_mut(&model.current) else {
         return;
     };
     for tile in tiled.current_tiles_mut() {
@@ -683,7 +703,7 @@ pub(crate) fn render(app: &App, model: &mut Model, renderer: &mut Renderer) -> R
         Mode::Single => {
             // Attempt to draw the full-resolution tiled texture if loaded;
             // otherwise display a loading message.
-            if let Some(tex) = model.full_textures.get(&model.current) {
+            if let Some(tex) = model.full_images.get(&model.current) {
                 // Draw each tile at the correct position, applying zoom and pan
                 let [full_w, full_h] = tex.size();
                 let bounds =
@@ -739,8 +759,16 @@ pub(crate) fn render(app: &App, model: &mut Model, renderer: &mut Renderer) -> R
                     .x_y(0.0, bar_y)
                     .right_justify();
             } else {
-                draw.text("Loading...")
+                let message = match model.full_images.error(model.current) {
+                    Some(error) => format!("{error} (retrying…)"),
+                    None => "Loading...".to_string(),
+                };
+                draw.text(&message)
                     .font_size(24)
+                    .w_h(
+                        (rect.w() - 40.0).max(1.0),
+                        (rect.h() - INFO_BAR_HEIGHT - 40.0).max(1.0),
+                    )
                     .color(WHITE)
                     .x_y(0.0, 0.0);
                 // Draw bottom info bar with full path, dimensions, and zoom
@@ -770,24 +798,32 @@ pub(crate) fn render(app: &App, model: &mut Model, renderer: &mut Renderer) -> R
             format!("/{}", search.input)
         };
         let mut status_parts = Vec::new();
-        if let Some(err) = &search.error {
-            status_parts.push(err.clone());
-        } else if search.pending_request.is_some() {
-            status_parts.push("searching…".to_string());
-        } else if !search.results.is_empty() {
-            status_parts.push(format!(
-                "match {}/{}",
-                search.current + 1,
-                search.results.len()
-            ));
+        let pending = model.image_states.pending();
+        let failed = model.image_states.failed();
+        match &search.phase {
+            SearchPhase::Failed(error) => status_parts.push(error.clone()),
+            SearchPhase::Pending { .. } => status_parts.push("searching…".to_string()),
+            SearchPhase::Ready(_) if !search.results().is_empty() => {
+                status_parts.push(match search.current() {
+                    Some(current) => format!("match {}/{}", current + 1, search.results().len()),
+                    None => format!("{} matches", search.results().len()),
+                });
+            }
+            SearchPhase::Ready(_) if pending > 0 => status_parts.push("indexing…".to_string()),
+            SearchPhase::Ready(_) => status_parts.push("No matches found".to_string()),
+            SearchPhase::Draft => {}
         }
-        let pending = model.clip_missing.len() + model.clip_inflight.len();
-        if pending > 0 {
+        if let Some(error) = &model.clip_error {
+            status_parts.push(error.clone());
+        } else if pending > 0 {
             status_parts.push(format!(
                 "pending embeddings: {} ({})",
                 pending,
                 model.clip_engine.device_kind()
             ));
+        }
+        if failed > 0 {
+            status_parts.push(format!("failed embeddings: {failed}"));
         }
         let status = status_parts.join(" | ");
         let bar_h = 28.0;
@@ -814,4 +850,112 @@ pub(crate) fn render(app: &App, model: &mut Model, renderer: &mut Renderer) -> R
 
     draw_terminal_panel(&mut draw, model, rect);
     renderer.render(&draw, app.scale_factor())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::{channel, Receiver};
+    use std::time::Duration;
+
+    #[test]
+    fn terminal_output_closes_after_all_bytes_even_for_a_fast_exit() {
+        let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+        let reader = pair.master.try_clone_reader().unwrap();
+        let mut command = CommandBuilder::new("sh");
+        command.arg("-c");
+        command
+            .arg("i=0; while [ $i -lt 4096 ]; do printf x; i=$((i+1)); done; printf final; exit 7");
+        let child = pair.slave.spawn_command(command).unwrap();
+        drop(pair.slave);
+        let (tx, rx) = channel();
+        let worker = start_command_workers(42, reader, child, tx, || {});
+        let mut output = Vec::new();
+        let mut finished = false;
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                CommandEvent::Output { session_id, bytes } => {
+                    assert_eq!(session_id, 42);
+                    output.extend(bytes);
+                }
+                CommandEvent::Finished {
+                    session_id,
+                    exit_code,
+                    signal,
+                } => {
+                    assert_eq!(session_id, 42);
+                    assert_eq!(exit_code, 7);
+                    assert_eq!(signal, None);
+                    finished = true;
+                }
+                CommandEvent::OutputClosed { session_id } => {
+                    assert_eq!(session_id, 42);
+                    assert!(finished);
+                    break;
+                }
+                CommandEvent::Failed { error, .. } => panic!("{error}"),
+            }
+        }
+        assert_eq!(output.len(), 4101);
+        assert!(output.ends_with(b"final"));
+        worker.join().unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Model a descendant holding the PTY open, without spawning an unbounded background job.
+    struct GatedReader {
+        reader: Box<dyn Read + Send>,
+        release: Option<Receiver<()>>,
+    }
+
+    impl Read for GatedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(release) = self.release.take() {
+                let _ = release.recv();
+            }
+            self.reader.read(buffer)
+        }
+    }
+
+    #[test]
+    fn terminal_exit_does_not_wait_for_output_eof() {
+        let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+        let (release_tx, release_rx) = channel();
+        let reader = Box::new(GatedReader {
+            reader: pair.master.try_clone_reader().unwrap(),
+            release: Some(release_rx),
+        });
+        let mut command = CommandBuilder::new("sh");
+        command.args(["-c", "printf final; exit 7"]);
+        let child = pair.slave.spawn_command(command).unwrap();
+        drop(pair.slave);
+        let (tx, rx) = channel();
+        let worker = start_command_workers(42, reader, child, tx, || {});
+
+        // Always release the reader before asserting so failure cannot strand the worker.
+        let exit = rx.recv_timeout(Duration::from_secs(5));
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(matches!(
+            exit.unwrap(),
+            CommandEvent::Finished {
+                session_id: 42,
+                exit_code: 7,
+                signal: None
+            }
+        ));
+
+        let mut output = Vec::new();
+        let mut closed = false;
+        for event in rx {
+            assert!(!closed, "output arrived after the PTY was closed");
+            match event {
+                CommandEvent::Output { bytes, .. } => output.extend(bytes),
+                CommandEvent::OutputClosed { session_id: 42 } => closed = true,
+                event => panic!("unexpected terminal event: {event:?}"),
+            }
+        }
+        assert_eq!(output, b"final");
+        assert!(closed);
+    }
 }

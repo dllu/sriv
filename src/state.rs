@@ -5,13 +5,18 @@ use crate::renderer::GpuTexture;
 use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender};
 use image::DynamicImage;
 use portable_pty::MasterPty;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use toml::Value as TomlValue;
 use vt100::Parser;
+
+mod loading;
+mod search;
+pub use loading::{EmbeddingState, FullImageCache, ImageRequest, ImageStates, SelectionPreload};
+pub use search::{SearchPhase, SearchState};
 
 #[derive(Debug)]
 pub enum Mode {
@@ -44,7 +49,7 @@ struct ThumbQueueInner {
 #[derive(Debug, Default)]
 struct ThumbQueueState {
     order: VecDeque<usize>,
-    members: HashSet<usize>,
+    members: HashMap<usize, u64>,
     closed: bool,
 }
 
@@ -58,22 +63,26 @@ impl ThumbRequestQueue {
         }
     }
 
-    pub fn enqueue(&self, index: usize) {
-        self.enqueue_batch(std::iter::once(index));
+    pub fn enqueue(&self, request: ImageRequest) {
+        self.enqueue_batch(std::iter::once(request));
     }
 
     pub fn enqueue_batch<I>(&self, indices: I)
     where
-        I: IntoIterator<Item = usize>,
+        I: IntoIterator<Item = ImageRequest>,
     {
         let mut state = self.inner.state.lock().unwrap();
         if state.closed {
             return;
         }
         let mut inserted = false;
-        for index in indices {
-            if state.members.insert(index) {
-                state.order.push_back(index);
+        for request in indices {
+            if state
+                .members
+                .insert(request.index, request.generation)
+                .is_none()
+            {
+                state.order.push_back(request.index);
                 inserted = true;
             }
         }
@@ -82,12 +91,15 @@ impl ThumbRequestQueue {
         }
     }
 
-    pub fn pop(&self) -> Option<usize> {
+    pub fn pop(&self) -> Option<ImageRequest> {
         let mut state = self.inner.state.lock().unwrap();
         loop {
             if let Some(idx) = state.order.pop_front() {
-                state.members.remove(&idx);
-                return Some(idx);
+                let generation = state.members.remove(&idx).unwrap();
+                return Some(ImageRequest {
+                    index: idx,
+                    generation,
+                });
             }
             if state.closed {
                 return None;
@@ -241,24 +253,6 @@ pub fn parse_ui_font_path(s: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-#[derive(Debug)]
-pub struct SearchState {
-    pub input: String,
-    pub focused: bool,
-    pub skip_next_char: bool,
-    pub results: Vec<(usize, f32)>,
-    pub current: usize,
-    pub pending_request: Option<u64>,
-    pub error: Option<String>,
-    pub last_embedding: Option<Vec<f32>>,
-}
-
-#[derive(Debug)]
-pub enum FullPendingState {
-    InFlight,
-    Failed { last_error_at: Instant },
-}
-
 pub type FullImageTile = (u32, u32, u32, u32, TilePixelFormat, Vec<u8>);
 
 #[derive(Debug)]
@@ -270,13 +264,13 @@ pub struct FullImageFrame {
 #[derive(Debug)]
 pub enum FullImageMessage {
     Loaded {
-        index: usize,
+        request: ImageRequest,
         full_w: u32,
         full_h: u32,
         frames: Vec<FullImageFrame>,
     },
     Failed {
-        index: usize,
+        request: ImageRequest,
         error: String,
     },
 }
@@ -397,14 +391,13 @@ impl TiledTexture {
 #[derive(Debug)]
 pub struct ThumbnailEntry {
     pub image: DynamicImage,
-    pub clip_embedding: Option<Vec<f32>>,
 }
 
 #[derive(Debug)]
 pub struct ThumbnailUpdate {
-    pub index: usize,
+    pub request: ImageRequest,
     pub image: DynamicImage,
-    pub clip_embedding: Option<Vec<f32>>,
+    pub embedding: EmbeddingState,
 }
 
 #[derive(Debug)]
@@ -412,6 +405,9 @@ pub enum CommandEvent {
     Output {
         session_id: u64,
         bytes: Vec<u8>,
+    },
+    OutputClosed {
+        session_id: u64,
     },
     Finished {
         session_id: u64,
@@ -431,10 +427,38 @@ pub struct TerminalSession {
     pub parser: Parser,
     pub master: Option<Box<dyn MasterPty + Send>>,
     pub scrollback_offset: usize,
-    pub running: bool,
-    pub exit_code: Option<u32>,
-    pub signal: Option<String>,
-    pub error: Option<String>,
+    pub status: CommandStatus,
+}
+
+#[derive(Debug)]
+pub enum CommandStatus {
+    Running,
+    Exited {
+        exit_code: u32,
+        signal: Option<String>,
+    },
+    Failed(String),
+}
+
+impl CommandStatus {
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running)
+    }
+
+    pub fn finish(&mut self, exit_code: u32, signal: Option<String>) {
+        if self.is_running() {
+            *self = Self::Exited { exit_code, signal };
+        }
+    }
+
+    /// Preserve the first diagnostic even if the reader and child waiter both fail.
+    pub fn fail(&mut self, error: String) -> bool {
+        if matches!(self, Self::Failed(_)) {
+            return false;
+        }
+        *self = Self::Failed(error);
+        true
+    }
 }
 
 pub struct TerminalState {
@@ -455,12 +479,11 @@ pub struct Model {
     pub thumb_rx: Receiver<ThumbnailUpdate>,
     pub thumb_queue: ThumbRequestQueue,
     pub file_mod_times: Vec<Option<SystemTime>>,
+    pub image_states: ImageStates,
     pub file_watch_cursor: usize,
-    pub full_req_tx: CbSender<usize>,
+    pub full_req_tx: CbSender<ImageRequest>,
     pub full_resp_rx: CbReceiver<FullImageMessage>,
-    pub full_pending: HashMap<usize, FullPendingState>,
-    pub full_textures: HashMap<usize, TiledTexture>,
-    pub full_usage: VecDeque<usize>,
+    pub full_images: FullImageCache,
     pub mode: Mode,
     pub current: usize,
     /// Maximum thumbnail edge in physical pixels, also used for the disk cache.
@@ -475,16 +498,13 @@ pub struct Model {
     pub prev_scale_factor: f64,
     pub prev_scroll: f32,
     pub fit_mode: bool,
-    pub selection_changed_at: Instant,
-    pub selection_pending: bool,
+    pub selection_preload: SelectionPreload,
     pub key_bindings: Vec<KeyBinding>,
     pub command_tx: Sender<CommandEvent>,
     pub command_rx: Receiver<CommandEvent>,
     pub terminal: TerminalState,
     pub clip_engine: ClipEngine,
-    pub clip_missing: HashSet<usize>,
-    pub clip_inflight: HashSet<usize>,
-    pub pending_clip_embeddings: HashMap<usize, Vec<f32>>,
+    pub clip_error: Option<String>,
     pub next_search_request_id: u64,
     pub search: Option<SearchState>,
 }
@@ -505,6 +525,74 @@ pub struct ThumbnailTexture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thumbnail_queue_keeps_the_latest_generation_and_drains_on_close() {
+        let queue = ThumbRequestQueue::new();
+        queue.enqueue_batch([
+            ImageRequest {
+                index: 0,
+                generation: 0,
+            },
+            ImageRequest {
+                index: 1,
+                generation: 0,
+            },
+        ]);
+        queue.enqueue(ImageRequest {
+            index: 0,
+            generation: 1,
+        });
+        queue.reprioritize(|index| -(index as f32));
+        queue.close();
+        queue.enqueue(ImageRequest {
+            index: 2,
+            generation: 0,
+        });
+        assert_eq!(
+            queue.pop(),
+            Some(ImageRequest {
+                index: 1,
+                generation: 0
+            })
+        );
+        assert_eq!(
+            queue.pop(),
+            Some(ImageRequest {
+                index: 0,
+                generation: 1
+            })
+        );
+        assert_eq!(queue.pop(), None);
+    }
+
+    #[test]
+    fn closing_an_empty_thumbnail_queue_releases_waiting_workers() {
+        let queue = ThumbRequestQueue::new();
+        let worker_queue = queue.clone();
+        let worker = std::thread::spawn(move || worker_queue.pop());
+        queue.close();
+        assert_eq!(worker.join().unwrap(), None);
+    }
+
+    #[test]
+    fn command_failure_remains_terminal_in_either_event_order() {
+        let mut before_exit = CommandStatus::Running;
+        assert!(before_exit.fail("read failed".into()));
+        before_exit.finish(0, None);
+        assert!(!before_exit.fail("wait failed".into()));
+        assert!(matches!(before_exit, CommandStatus::Failed(error) if error == "read failed"));
+
+        let mut after_exit = CommandStatus::Running;
+        after_exit.finish(7, Some("SIGTERM".into()));
+        after_exit.finish(0, None);
+        assert!(matches!(
+            after_exit,
+            CommandStatus::Exited { exit_code: 7, .. }
+        ));
+        assert!(after_exit.fail("read failed".into()));
+        assert!(matches!(after_exit, CommandStatus::Failed(_)));
+    }
 
     fn animated_texture(delays: &[Duration]) -> TiledTexture {
         TiledTexture::new(
