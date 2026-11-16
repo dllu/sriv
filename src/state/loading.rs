@@ -82,6 +82,14 @@ impl ImageStates {
         }
     }
 
+    pub fn add_images(&mut self, count: usize) {
+        self.entries.extend((0..count).map(|_| ImageState {
+            generation: 0,
+            embedding: EmbeddingState::WaitingForThumbnail,
+        }));
+        self.pending += count;
+    }
+
     pub fn is_current(&self, request: ImageRequest) -> bool {
         self.entries
             .get(request.index)
@@ -315,6 +323,21 @@ impl SelectionPreload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_can_append_images_without_resetting_loaded_generations_or_progress() {
+        let mut images = ImageStates::new(0);
+        images.add_images(1);
+        let first = images.invalidate(0);
+        images.image_ready(first, vec![1.0]);
+        images.add_images(2);
+        assert_eq!(images.request(0), first);
+        assert_eq!(images.embedding(0), Some([1.0].as_slice()));
+        assert_eq!((images.pending(), images.failed()), (2, 0));
+        images.image_failed(images.request(1), "failed".into());
+        images.thumbnail_ready(images.request(2), EmbeddingState::Ready(vec![2.0]), None);
+        assert_eq!((images.pending(), images.failed()), (0, 1));
+    }
 
     #[test]
     fn old_image_results_are_rejected_after_invalidation() {

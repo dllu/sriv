@@ -1,6 +1,7 @@
 use crate::clip::ClipEngine;
 use crate::geometry::{Rect, Vec2};
 use crate::input::Key;
+use crate::library::LibraryState;
 use crate::renderer::GpuTexture;
 use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender};
 use image::DynamicImage;
@@ -472,6 +473,7 @@ pub struct TerminalState {
 
 pub struct Model {
     pub image_paths: Vec<PathBuf>,
+    pub library: LibraryState,
     pub ui_font_path: Option<PathBuf>,
     pub thumb_visible: HashMap<usize, ThumbnailTexture>,
     pub thumb_data: HashMap<usize, ThumbnailEntry>,

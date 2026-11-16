@@ -153,6 +153,12 @@ if `ui_font_path` is unset or fails to load, sriv falls back to the system sans-
 
 The goal is to have a super fast, responsive image viewer that can handle tens of thousands of 100 megapixel photos and generate thumbnails/CLIP embeddings in parallel.
 
+The window opens before the library is scanned. A background worker lists and sorts
+candidate paths, checks their contents, and streams small batches to the thumbnail
+queue. Thumbnails appear while discovery continues; the image count shows when the
+scan is still in progress. Modification times arrive with each batch, and XMP
+sidecars are scanned afterward. Slow source-file reads never block the first frame.
+
 * there's a global queue of pending thumbnails, that gets sorted based on distance from viewport every time you scroll.
 * *thumb workers*: a bunch of workers each pop off the top of the queue to try to load cached thumbnails/CLIP embeddings in order. If a cached thumbnail isn't available, it generates the thumbnail from the full size image. Loading a cached thumbnail on an SSD takes perhaps a millisecond and loading a full size image to generate a thumbnail can take over a second; regardless, locking the queue to pop off the top is a negligible amount of time and does not lead to significant resource contention even with 16 threads. If CLIP embedding isn't available, it sends the thumbnail through the *pending clip* channel to the CLIP generation workers. It also sends the thumbnail and CLIP embedding (if available) through the *thumb channel* back to the main thread.
 * *clip workers*: a bunch of workers generate CLIP embeddings by listening on the *pending clip* channel and generate and cache CLIP embeddings. Once a CLIP embedding is computed, it sends it back to the main thread via the *clip channel*, where the main thread populates the thumbnail store.
@@ -175,6 +181,7 @@ workers send versioned results and never mutate it directly.
 | Lifecycle | States and transitions | Owner and invariant |
 | --- | --- | --- |
 | Application | Uninitialized → running → exiting; startup failure → exit | [`SrivApplication`](src/app.rs). Repeated resume events do not create another window or model. |
+| Library discovery | `Discovering` → batches of images and sidecars → `Ready` | [`LibraryState`](src/library.rs). Directory enumeration, content detection, initial modification times, cache clearing, and sidecar scans run off the event loop. Append stable indices and publish worker paths before queueing each batch; bound pending batches and yield to input and drawing. |
 | Worker wakeups | Idle → wake queued → drain channels → idle | [`AppProxy`](src/app.rs). Clear the wake flag before draining so work arriving during the drain can schedule another wake. |
 | Event scheduling | Waiting → deadline reached or worker/input event → update → waiting | [`ApplicationState`](src/app.rs). Wait for the earliest file poll, selection preload, load retry, or animation frame. Input redraws are coalesced. |
 | Physical keys | Released → pressed while focused → repeating → released; held across focus → ignored until release | [`Keys`](src/app.rs). Losing focus resets modifiers; synthetic presses and unfocused repeats cannot trigger shortcuts. |

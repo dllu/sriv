@@ -607,6 +607,10 @@ pub(crate) fn render(app: &App, model: &mut Model, renderer: &mut Renderer) -> R
     prepare_current_full_textures(renderer, model);
     let rect = app.rect();
     let mut draw = Scene::new(rect);
+    if model.image_paths.is_empty() {
+        draw.text("Discovering images…").font_size(24).color(WHITE);
+        return renderer.render(&draw, app.scale_factor());
+    }
     match model.mode {
         Mode::Thumbnails => {
             let grid = ThumbnailGrid::new(model, rect, app.scale_factor());
@@ -692,7 +696,16 @@ pub(crate) fn render(app: &App, model: &mut Model, renderer: &mut Renderer) -> R
                 .left_justify()
                 .color(WHITE);
             // Index of selected image
-            let count = format!("{}/{}", model.current + 1, model.image_paths.len());
+            let count = format!(
+                "{}/{}{}",
+                model.current + 1,
+                model.image_paths.len(),
+                if model.library.is_loading() {
+                    " (scanning…)"
+                } else {
+                    ""
+                }
+            );
             draw.text(&count)
                 .font_size(14)
                 .w_h(rect.w(), bar_h)

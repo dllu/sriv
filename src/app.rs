@@ -24,6 +24,7 @@ use crate::geometry::{fit_image_zoom, image_rect, vec2, Rect, Vec2};
 use crate::grid::ThumbnailGrid;
 use crate::image_io;
 use crate::input::Key;
+use crate::library::{LibraryState, LibraryUpdate};
 use crate::renderer::Renderer;
 use crate::state::{
     parse_bindings, parse_ui_font_path, CommandEvent, EmbeddingState, FullImageCache,
@@ -272,29 +273,6 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
         eprintln!("Usage: sriv [--clear-cache] [--private] <image files or directories>...");
         std::process::exit(1);
     }
-    // Collect image file paths.
-    let mut image_paths: Vec<PathBuf> = Vec::new();
-    for arg in args {
-        let pb = PathBuf::from(&arg);
-        if pb.is_dir() {
-            for entry in fs::read_dir(&pb).unwrap() {
-                let entry = entry.unwrap();
-                let path = entry.path();
-                if path.is_file() && image_io::is_supported_image_path(&path) {
-                    image_paths.push(path.canonicalize().unwrap());
-                }
-            }
-        } else if pb.is_file() && image_io::is_supported_image_path(&pb) {
-            image_paths.push(pb.canonicalize().unwrap());
-        }
-    }
-    if image_paths.is_empty() {
-        eprintln!("No image files found in arguments.");
-        std::process::exit(1);
-    }
-    let start_in_single_mode = image_paths.len() == 1;
-    image_paths.sort();
-    let thumb_has_xmp = image_io::detect_thumb_sidecars(&image_paths);
     // Prepare thumbnail size, gap, and cache base directory.
     let thumb_size: u32 = 256;
     let cache_home = std::env::var_os("XDG_CACHE_HOME")
@@ -308,30 +286,18 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
         })
         .unwrap_or_else(|| PathBuf::from("."));
     let cache_base = cache_home.join("sriv");
-    if regen_cache {
-        if let Err(e) = fs::remove_dir_all(&cache_base) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                eprintln!(
-                    "Failed to clear thumbnail cache {}: {}",
-                    cache_base.display(),
-                    e
-                );
-            }
-        }
-    }
+    let worker_proxy = app.create_proxy();
+    let discovery_proxy = worker_proxy.clone();
+    let (library, shared_paths) = LibraryState::start(
+        args.into_iter().map(PathBuf::from).collect(),
+        regen_cache.then(|| cache_base.clone()),
+        move || discovery_proxy.wakeup(),
+    );
     let cache_dir = (!private).then_some(cache_base);
-    let mut file_mod_times = Vec::with_capacity(image_paths.len());
-    for path in &image_paths {
-        file_mod_times.push(current_mod_time(path));
-    }
     // Channel for receiving thumbnails from background threads.
     let (thumb_tx, thumb_rx) = channel::<ThumbnailUpdate>();
     let thumb_queue = ThumbRequestQueue::new();
-    let image_states = ImageStates::new(image_paths.len());
-    thumb_queue.enqueue_batch((0..image_paths.len()).map(|index| image_states.request(index)));
     let num_workers = rayon::current_num_threads().clamp(1, 8);
-    let shared_paths = Arc::new(image_paths.clone());
-    let worker_proxy = app.create_proxy();
     let clip_engine =
         ClipEngine::new(cache_dir.clone(), worker_proxy.clone()).unwrap_or_else(|err| {
             eprintln!("Failed to initialize CLIP: {err}");
@@ -348,16 +314,17 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
         thread::spawn(move || {
             while let Some(request) = thumb_queue.pop() {
                 let i = request.index;
-                if let Some(p) = paths.get(i) {
+                let path = paths.read().unwrap().get(i).cloned();
+                if let Some(p) = path {
                     let image = image_io::load_thumbnail(
                         cache_dir.as_deref(),
-                        p,
+                        &p,
                         thumb_size,
                         output_color_space,
                     );
                     let clip_embedding = match cache_dir
                         .as_deref()
-                        .map(|dir| clip::load_cached_embedding(dir, p))
+                        .map(|dir| clip::load_cached_embedding(dir, &p))
                         .transpose()
                     {
                         Ok(value) => value.flatten(),
@@ -422,8 +389,9 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
             thread::spawn(move || {
                 while let Ok(request) = req_rx.recv() {
                     let idx = request.index;
-                    if let Some(path) = paths.get(idx) {
-                        match image_io::load_full_image_tiles(path, output_color_space) {
+                    let path = paths.read().unwrap().get(idx).cloned();
+                    if let Some(path) = path {
+                        match image_io::load_full_image_tiles(&path, output_color_space) {
                             Ok((full_w, full_h, frames)) => {
                                 if resp_tx
                                     .send(FullImageMessage::Loaded {
@@ -490,24 +458,21 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
     // Channel for receiving command terminal updates from custom commands
     let (command_tx, command_rx) = channel::<CommandEvent>();
     Model {
-        image_paths,
+        image_paths: Vec::new(),
+        library,
         ui_font_path,
         thumb_visible: HashMap::new(),
         thumb_data: HashMap::new(),
-        thumb_has_xmp,
+        thumb_has_xmp: Vec::new(),
         thumb_rx,
         thumb_queue: thumb_queue.clone(),
-        file_mod_times,
-        image_states,
+        file_mod_times: Vec::new(),
+        image_states: ImageStates::new(0),
         file_watch_cursor: 0,
         full_req_tx,
         full_resp_rx,
         full_images,
-        mode: if start_in_single_mode {
-            Mode::Single
-        } else {
-            Mode::Thumbnails
-        },
+        mode: Mode::Thumbnails,
         current: 0,
         thumb_size,
         gap: 10.0,
@@ -517,7 +482,7 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
         prev_window_rect: initial_rect,
         prev_scale_factor: app.scale_factor(),
         prev_scroll: 0.0,
-        fit_mode: start_in_single_mode,
+        fit_mode: false,
         selection_preload: SelectionPreload::after(Instant::now(), SELECTION_PRELOAD_DELAY),
         // Custom key bindings
         key_bindings,
@@ -571,7 +536,7 @@ impl ApplicationState {
 
     fn next_scheduled_update(&self) -> Instant {
         let mut next = self.next_file_watch;
-        if matches!(self.model.mode, Mode::Thumbnails) {
+        if matches!(self.model.mode, Mode::Thumbnails) && !self.model.image_paths.is_empty() {
             if let Some(deadline) = self.model.selection_preload.deadline() {
                 next = next.min(deadline);
             }
@@ -1128,6 +1093,9 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
     if handle_search_key(app, model, key) {
         return;
     }
+    if model.image_paths.is_empty() {
+        return;
+    }
 
     if app.keys.mods == ModifiersState::empty() {
         match key {
@@ -1341,7 +1309,7 @@ fn is_unmodified_q_key_down(
 
 /// Process queued work and scheduled maintenance, returning whether the scene changed.
 fn update(app: &App, model: &mut Model, renderer: &Renderer, check_files: bool) -> bool {
-    let mut redraw_needed = false;
+    let mut redraw_needed = receive_library_updates(app, model);
     ui::sync_terminal_viewport(app, model);
     if check_files && detect_file_changes(app, model) {
         redraw_needed = true;
@@ -1545,7 +1513,7 @@ fn update(app: &App, model: &mut Model, renderer: &Renderer, check_files: bool) 
         if model
             .selection_preload
             .deadline()
-            .is_some_and(|deadline| Instant::now() >= deadline)
+            .is_some_and(|deadline| !model.image_paths.is_empty() && Instant::now() >= deadline)
         {
             request_full_texture(model, model.current);
             model.selection_preload = SelectionPreload::Requested;
@@ -1567,12 +1535,57 @@ fn update(app: &App, model: &mut Model, renderer: &Renderer, check_files: bool) 
     redraw_needed
 }
 
+fn receive_library_updates(app: &App, model: &mut Model) -> bool {
+    let mut changed = false;
+    // Yield to drawing and input even when discovery can produce batches continuously.
+    for _ in 0..8 {
+        let Some(update) = model.library.try_recv() else {
+            return changed;
+        };
+        changed = true;
+        match update {
+            LibraryUpdate::Images(images) => {
+                let start = model.image_paths.len();
+                model.image_states.add_images(images.len());
+                for image in images {
+                    model.image_paths.push(image.path);
+                    model.file_mod_times.push(image.modified);
+                    model.thumb_has_xmp.push(false);
+                }
+                model.thumb_queue.enqueue_batch(
+                    (start..model.image_paths.len()).map(|index| model.image_states.request(index)),
+                );
+                if start == 0 {
+                    model.selection_preload =
+                        SelectionPreload::after(Instant::now(), SELECTION_PRELOAD_DELAY);
+                }
+            }
+            LibraryUpdate::Sidecars(flags) => model.thumb_has_xmp = flags,
+            LibraryUpdate::Finished => {
+                if model.image_paths.is_empty() {
+                    eprintln!("No image files found in arguments.");
+                    std::process::exit(1);
+                }
+                if model.image_paths.len() == 1 && matches!(model.mode, Mode::Thumbnails) {
+                    model.mode = Mode::Single;
+                    navigate_to(app, model, 0);
+                }
+            }
+        }
+    }
+    app.proxy.wakeup();
+    changed
+}
+
 fn accept_full_result(model: &Model, request: ImageRequest) -> bool {
     model.image_states.is_current(request) && model.full_images.is_pending(request)
 }
 
 /// Touch an already loaded texture in the LRU, or queue it for background loading.
 fn request_full_texture(model: &mut Model, idx: usize) {
+    if idx >= model.image_paths.len() {
+        return;
+    }
     let now = Instant::now();
     let request = model.image_states.request(idx);
     if model.full_images.request(request, now) {

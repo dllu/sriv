@@ -5,6 +5,7 @@ mod geometry;
 mod grid;
 mod image_io;
 mod input;
+mod library;
 mod renderer;
 mod state;
 mod ui;
