@@ -20,6 +20,7 @@ use std::time::Duration;
 use crate::clip;
 use crate::color::{self, EmbeddedColorProfile, OutputColorSpace};
 use crate::state::{FullImageFrame, FullImageTile, TilePixelFormat};
+use crate::thumbnails::EncodedThumbnail;
 
 #[cfg(target_os = "macos")]
 mod macos_heif;
@@ -139,11 +140,12 @@ fn thumbnail_cache_path(
     cache_base: &Path,
     image_path: &Path,
     output_color_space: OutputColorSpace,
+    size: u32,
 ) -> PathBuf {
     clip::cache_file_path(
         cache_base,
         image_path,
-        &format!("{}.png", output_color_space.cache_tag()),
+        &format!("{}.thumb-{size}-v2.png", output_color_space.cache_tag()),
     )
 }
 
@@ -1125,16 +1127,19 @@ pub(crate) fn load_thumbnail(
     image_path: &Path,
     size: u32,
     output_color_space: OutputColorSpace,
-) -> DynamicImage {
+) -> EncodedThumbnail {
     if let Some(cache_base) = cache_base {
-        let cache_path = thumbnail_cache_path(cache_base, image_path, output_color_space);
+        let cache_path = thumbnail_cache_path(cache_base, image_path, output_color_space, size);
         if let (Ok(source), Ok(cached)) = (fs::metadata(image_path), fs::metadata(&cache_path)) {
             if matches!(
                 (source.modified(), cached.modified()),
                 (Ok(source_time), Ok(cache_time)) if cache_time >= source_time
             ) {
-                if let Ok(image) = image_rs::open(&cache_path) {
-                    return DynamicImage::ImageRgba8(image.to_rgba8());
+                if let Ok(bytes) = fs::read(&cache_path) {
+                    if let Ok(mut image) = EncodedThumbnail::from_png(bytes) {
+                        image.cached_path = Some(std::sync::Arc::new(cache_path));
+                        return image;
+                    }
                 }
             }
         }
@@ -1148,18 +1153,23 @@ pub(crate) fn load_thumbnail(
     } else {
         output_color_space
     };
-    let Ok(image) = decode_image_no_limits(image_path, thumbnail_output) else {
-        return fallback_thumbnail();
-    };
-    let Some(thumbnail) = make_thumbnail(image, size) else {
-        return fallback_thumbnail();
-    };
+    let thumbnail = decode_image_no_limits(image_path, thumbnail_output)
+        .ok()
+        .and_then(|image| make_thumbnail(image, size))
+        .unwrap_or_else(fallback_thumbnail);
+    let thumbnail = EncodedThumbnail::encode(&thumbnail).unwrap_or_else(|error| {
+        eprintln!(
+            "Failed to encode thumbnail for {}: {error}",
+            image_path.display()
+        );
+        EncodedThumbnail::encode(&fallback_thumbnail()).expect("encode fallback thumbnail")
+    });
     if let Some(cache_base) = cache_base {
-        let cache_path = thumbnail_cache_path(cache_base, image_path, output_color_space);
+        let cache_path = thumbnail_cache_path(cache_base, image_path, output_color_space, size);
         if let Some(parent) = cache_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let _ = thumbnail.save(cache_path);
+        let _ = fs::write(cache_path, &thumbnail.bytes);
     }
     thumbnail
 }
@@ -1190,7 +1200,7 @@ pub(crate) fn thumbnail_for_clip(
     }
 }
 
-fn fallback_thumbnail() -> DynamicImage {
+pub(crate) fn fallback_thumbnail() -> DynamicImage {
     DynamicImage::ImageRgba8(RgbaImage::from_pixel(
         2,
         2,
@@ -1303,18 +1313,27 @@ mod tests {
             .unwrap();
 
         let image = load_thumbnail(None, &source, 8, OutputColorSpace::Srgb);
-        assert_eq!(image.to_rgba8().get_pixel(0, 0).0, [200, 0, 0, 255]);
+        assert_eq!(
+            image.decode().unwrap().to_rgba8().get_pixel(0, 0).0,
+            [200, 0, 0, 255]
+        );
         assert!(!cache_base.exists());
 
-        let cache_path = thumbnail_cache_path(&cache_base, &source, OutputColorSpace::Srgb);
+        let cache_path = thumbnail_cache_path(&cache_base, &source, OutputColorSpace::Srgb, 8);
         fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
         DynamicImage::ImageRgba8(RgbaImage::from_pixel(8, 8, Rgba([0, 0, 200, 255])))
             .save(&cache_path)
             .unwrap();
         let normal = load_thumbnail(Some(&cache_base), &source, 8, OutputColorSpace::Srgb);
-        assert_eq!(normal.to_rgba8().get_pixel(0, 0).0, [0, 0, 200, 255]);
+        assert_eq!(
+            normal.decode().unwrap().to_rgba8().get_pixel(0, 0).0,
+            [0, 0, 200, 255]
+        );
         let private = load_thumbnail(None, &source, 8, OutputColorSpace::Srgb);
-        assert_eq!(private.to_rgba8().get_pixel(0, 0).0, [200, 0, 0, 255]);
+        assert_eq!(
+            private.decode().unwrap().to_rgba8().get_pixel(0, 0).0,
+            [200, 0, 0, 255]
+        );
 
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1756,9 +1775,13 @@ mod tests {
     fn thumbnail_caches_are_separate_for_each_output_space() {
         let cache = Path::new("/tmp/sriv-test-cache");
         let image = Path::new("/photos/example.jpg");
-        let srgb = thumbnail_cache_path(cache, image, OutputColorSpace::Srgb);
-        let display_p3 = thumbnail_cache_path(cache, image, OutputColorSpace::DisplayP3);
+        let srgb = thumbnail_cache_path(cache, image, OutputColorSpace::Srgb, 512);
+        let display_p3 = thumbnail_cache_path(cache, image, OutputColorSpace::DisplayP3, 512);
         assert_ne!(srgb, display_p3);
+        assert_ne!(
+            srgb,
+            thumbnail_cache_path(cache, image, OutputColorSpace::Srgb, 256)
+        );
         assert_eq!(
             srgb.extension().and_then(|value| value.to_str()),
             Some("png")

@@ -3959,6 +3959,7 @@ dependencies = [
  "portable-pty",
  "rayon",
  "rexif",
+ "serde_json",
  "sha1",
  "tokenizers",
  "toml 0.5.11",

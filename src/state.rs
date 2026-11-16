@@ -3,8 +3,8 @@ use crate::geometry::{Rect, Vec2};
 use crate::input::Key;
 use crate::library::LibraryState;
 use crate::renderer::GpuTexture;
+use crate::thumbnails::{EncodedThumbnail, ThumbnailDecoder, ThumbnailStore};
 use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender};
-use image::DynamicImage;
 use portable_pty::MasterPty;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -390,14 +390,9 @@ impl TiledTexture {
 }
 
 #[derive(Debug)]
-pub struct ThumbnailEntry {
-    pub image: DynamicImage,
-}
-
-#[derive(Debug)]
 pub struct ThumbnailUpdate {
     pub request: ImageRequest,
-    pub image: DynamicImage,
+    pub image: EncodedThumbnail,
     pub embedding: EmbeddingState,
 }
 
@@ -476,7 +471,8 @@ pub struct Model {
     pub library: LibraryState,
     pub ui_font_path: Option<PathBuf>,
     pub thumb_visible: HashMap<usize, ThumbnailTexture>,
-    pub thumb_data: HashMap<usize, ThumbnailEntry>,
+    pub thumb_data: ThumbnailStore,
+    pub thumbnail_decoder: ThumbnailDecoder,
     pub thumb_has_xmp: Vec<bool>,
     pub thumb_rx: Receiver<ThumbnailUpdate>,
     pub thumb_queue: ThumbRequestQueue,

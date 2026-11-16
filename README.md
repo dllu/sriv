@@ -10,7 +10,7 @@ https://github.com/user-attachments/assets/734e3a02-e9ff-4f24-9c51-27585d53a806
 * color-managed ICC, HEIF/NCLX, and JPEG XL images, with Display P3 output when the surface supports it
 * parallel thumbnail generation
 * supports images more than 32768 or 65536 px wide or whatever arcane limit that imlib2 has
-* CLIP-powered semantic search across your library
+* SigLIP 2 semantic search across your library
 * works in Wayland natively with winit and wgpu
 
 built directly on [winit](https://github.com/rust-windowing/winit) and [wgpu](https://wgpu.rs/).
@@ -93,16 +93,16 @@ to clear and regenerate the thumbnail cache for all specified images, use the `-
 sriv --clear-cache <image files or directories>
 ```
 
-Use `--private` to generate thumbnails and CLIP image embeddings only in memory for the current session. This skips reading and writing sriv's disk cache; it does not delete files cached by earlier runs. Combine it with `--clear-cache` to remove those existing files. CLIP model weights and tokenizer are still managed by the Hugging Face cache.
+Use `--private` to generate thumbnails and SigLIP 2 image embeddings only in memory for the current session. This skips reading and writing sriv's disk cache; it does not delete files cached by earlier runs. Combine it with `--clear-cache` to remove those existing files. SigLIP 2 model weights and tokenizer are still managed by the Hugging Face cache.
 
 ```bash
 sriv --private <image files or directories>
 ```
 
-### clip semantic search
+### semantic search
 
-sriv can index your images with [OpenAI CLIP (ViT-B/32)](https://github.com/openai/CLIP) via the [Hugging Face Candle](https://github.com/huggingface/candle) runtime.
-The first launch downloads model weights and tokenizer from the Hugging Face Hub, after which embeddings are cached alongside your thumbnails in `${XDG_CACHE_HOME}/sriv/`.
+sriv indexes your images with [Google SigLIP 2 Base at 512 pixels](https://huggingface.co/google/siglip2-base-patch16-512) via the [Hugging Face Candle](https://github.com/huggingface/candle) runtime. The model revision and preprocessing are pinned; its 768-dimensional embeddings are normalized for cosine similarity.
+The first launch downloads approximately 1.5 GB of model weights plus the tokenizer from the Hugging Face Hub. Embeddings and 512-pixel PNG thumbnails are cached in `${XDG_CACHE_HOME}/sriv/`. Thumbnail cache names include their size and color space; embedding cache names include the model revision and preprocessing version. Older caches are ignored and regenerated without deleting them.
 
 - press `/` to focus the search bar and type a natural-language prompt. The bar glows purple when focused.
 - hit `Enter` to run the search; results are ranked by cosine similarity and highlighted at the top.
@@ -110,7 +110,7 @@ The first launch downloads model weights and tokenizer from the Hugging Face Hub
   search results intact.
 - press `/` again to refocus and refine the query, or `Esc`/`Backspace` on an empty field to clear the search.
 
-If built with CUDA support, embedding generation automatically uses CUDA when available; otherwise sriv fans out across your CPU cores.
+If built with CUDA support, embedding generation uses half-precision CUDA inference when available; otherwise sriv fans out across your CPU cores. CPU workers share one set of model weights. Text queries take priority between image batches, so indexing does not put a query behind the entire image queue.
 The status area shows how many embeddings are still pending and whether the GPU or CPU is in use.
 
 # configuration
@@ -151,7 +151,7 @@ if `ui_font_path` is unset or fails to load, sriv falls back to the system sans-
 
 # design
 
-The goal is to have a super fast, responsive image viewer that can handle tens of thousands of 100 megapixel photos and generate thumbnails/CLIP embeddings in parallel.
+The goal is to have a super fast, responsive image viewer that can handle tens of thousands of 100 megapixel photos and generate thumbnails and SigLIP 2 embeddings in parallel.
 
 The window opens before the library is scanned. A background worker lists and sorts
 candidate paths, checks their contents, and streams small batches to the thumbnail
@@ -160,13 +160,12 @@ scan is still in progress. Modification times arrive with each batch, and XMP
 sidecars are scanned afterward. Slow source-file reads never block the first frame.
 
 * there's a global queue of pending thumbnails, that gets sorted based on distance from viewport every time you scroll.
-* *thumb workers*: a bunch of workers each pop off the top of the queue to try to load cached thumbnails/CLIP embeddings in order. If a cached thumbnail isn't available, it generates the thumbnail from the full size image. Loading a cached thumbnail on an SSD takes perhaps a millisecond and loading a full size image to generate a thumbnail can take over a second; regardless, locking the queue to pop off the top is a negligible amount of time and does not lead to significant resource contention even with 16 threads. If CLIP embedding isn't available, it sends the thumbnail through the *pending clip* channel to the CLIP generation workers. It also sends the thumbnail and CLIP embedding (if available) through the *thumb channel* back to the main thread.
-* *clip workers*: a bunch of workers generate CLIP embeddings by listening on the *pending clip* channel and generate and cache CLIP embeddings. Once a CLIP embedding is computed, it sends it back to the main thread via the *clip channel*, where the main thread populates the thumbnail store.
+* *thumb workers*: load cached PNG bytes, or decode the original image once to generate a 512-pixel thumbnail. Send the compressed PNG and any cached embedding to the event loop. If an embedding is missing, send a shared reference to the same compressed bytes to the inference queue. Queued inference never retains a second library of raw pixels.
+* *thumbnail decode workers*: decode PNG bytes from RAM for the viewport and nearby rows. Scrolling replaces queued work with the latest viewport. A 128 MiB decoded-image LRU keeps recently viewed thumbnails available; GPU textures are retained only around the viewport. No thumbnail decompression runs on the event loop.
+* *search workers*: decode queued PNGs, convert their display color space to sRGB, resize the complete image to 512×512, and generate SigLIP 2 embeddings. CPU workers process one image at a time; CUDA batches up to four. Queries take priority between image batches. Versioned results return to the event loop.
 * *full size image worker*: Fetches full size images and caches them in the background into an LRU cache. When in thumbnail mode, it tries to fetch the full size version of the selected thumbnail, so that when you do decide to zoom in, you don't have to wait another second for it to load. Also, it fetches the next and previous images when in full size image mode.
 
-All thumbnails are loaded into memory. This is different from `sxiv`/`nsxiv`, which conserve computational resources by only generating thumbnails for images visible in the viewport, but lead to a laggy user experience when viewing lots of high resolution images, where you have to wait for thumbnails to be generated, one per second, whenever you scroll.
-
-However, only the thumbnails visible in the viewport are loaded into textures on the GPU. This is to conserve VRAM, and uploading a small handful of visible textures onto the GPU is very fast.
+All compressed thumbnails are loaded into RAM, so scrolling through a warmed library requires no thumbnail disk reads. Only thumbnails near the viewport and a small decoded LRU retain raw pixels. PNG compression is lossless, and cache generation encodes the PNG only once for both the disk and memory copies. `--private` keeps the compressed cache in RAM without writing it to disk.
 
 Also, a tiled texture strategy is used for displaying the full size image, to prevent crashes on certain GPUs or difficulty with allocating a contiguous giant texture.
 Full size images can be quite large and use a lot of memory, so an LRU cache keeps memory usage bounded.
@@ -190,11 +189,11 @@ workers send versioned results and never mutate it directly.
 | Selection preload | `Waiting { deadline }` → `Requested`; thumbnail input or selected-file invalidation rearms the delay | [`SelectionPreload`](src/state/loading.rs). A stable selection schedules one preload after 200 ms. |
 | File watching | Observed revision → changed/deleted/reappeared → invalidate → reload | [`check_image_modification`](src/app.rs), [`ImageStates`](src/state/loading.rs). Increment the generation and invalidate thumbnails, embeddings, search scores, and full images together. Poll the current/visible files plus a rotating batch. |
 | Thumbnail queue | Open/empty ↔ queued → dispatched; open → closed/draining → exhausted | [`ThumbRequestQueue`](src/state.rs). One queued entry per index carries its latest generation; closing wakes waiters and rejects new work. |
-| Thumbnail residency | Requested → CPU image → visible GPU texture; leaving the viewport releases the texture | [`handle_thumbnail_update` and `update_thumbnail_requests`](src/app.rs). CPU thumbnails remain available; invalidated results cannot replace the current generation. Decode failure uses the existing fallback thumbnail. |
+| Thumbnail residency | Requested → compressed PNG in RAM → decode queued/in flight → decoded LRU → visible GPU texture | [`ThumbnailStore` and `ThumbnailDecoder`](src/thumbnails.rs). Scrolling replaces queued decode work. The decoded LRU is bounded by bytes; leaving the viewport releases GPU textures. Results must match the current file generation. Corrupt disk PNGs are removed by workers and regenerated. |
 | Disk caches | Missing/stale/unreadable → generate → optional write; valid → reuse | [`image_io.rs`](src/image_io.rs), [`clip.rs`](src/clip.rs). Existing mtime checks govern cache freshness. Private mode skips sriv cache reads/writes. A failed embedding-cache write does not discard a usable in-memory embedding. |
-| CLIP workers | Initialize model/tokenizer → CPU or GPU inference → wait/work → stopped | [`ClipEngine`](src/clip.rs). CUDA initialization can fall back to CPU. When all workers stop, pending work becomes a visible failure; thumbnail decoding and cached embeddings remain usable. |
-| CLIP job batching | Receive image → collect batch → infer → handle deferred text → receive again | [`run_worker`](src/clip.rs). Text encountered during batch collection is processed after that batch. Worker results may arrive out of order. |
-| Per-image embeddings | `WaitingForThumbnail` → `Pending` → `Ready` or `Failed`; cached thumbnail → `Ready`; invalidation → waiting | [`ImageStates` and `EmbeddingState`](src/state/loading.rs). An early CLIP completion cannot be undone by later thumbnail delivery. Progress counts update with transitions, so rendering does not scan the library. |
+| Search workers | Initialize model/tokenizer → CPU or GPU inference → wait/work → stopped | [`ClipEngine`](src/clip.rs). CUDA initialization can fall back to CPU. When all workers stop, pending work becomes a visible failure; thumbnail decoding and cached embeddings remain usable. |
+| Search job batching | Receive prioritized text or image → infer text or image batch → receive again | [`run_worker`](src/clip.rs). Text queries use a separate priority queue and run between image batches. Worker results may arrive out of order. |
+| Per-image embeddings | `WaitingForThumbnail` → `Pending` → `Ready` or `Failed`; cached thumbnail → `Ready`; invalidation → waiting | [`ImageStates` and `EmbeddingState`](src/state/loading.rs). An early embedding completion cannot be undone by later thumbnail delivery. Progress counts update with transitions, so rendering does not scan the library. |
 | Search | Absent ↔ present; focused ↔ unfocused; `Draft` → `Pending` → `Ready` or `Failed`; edit → draft | [`SearchState`](src/state/search.rs). Only the pending request ID can complete. Results and their query embedding exist together. Live indexing preserves the selected image when rankings change; invalidation removes stale scores and preserves the navigation position until the selected image reloads or the user advances. |
 | Full-image loading | Absent → `InFlight` → `Ready` or `Failed`; failure deadline → retry; invalidation → absent | [`FullImageCache`](src/state/loading.rs). A result must match the outstanding generation. The five-second retry is eligible exactly at its deadline; errors are displayed instead of indefinite loading. |
 | Full-image residency | Cached → most/least recently used → evicted → absent | [`FullImageCache`](src/state/loading.rs). Load state, textures, and recency share one owner. At most four images are resident; late preloads cannot evict the selected image. |
@@ -227,4 +226,4 @@ in addition to generating thumbnails in parallel, it also stores a local cache o
 
 > why does it use so much gpu?
 
-it puts the textures on the gpu for a smoother viewing experience, and it may use a CUDA-capable GPU for CLIP embedding generation
+it puts the textures on the gpu for a smoother viewing experience, and it may use a CUDA-capable GPU for SigLIP 2 embedding generation

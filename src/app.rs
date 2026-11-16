@@ -29,9 +29,10 @@ use crate::renderer::Renderer;
 use crate::state::{
     parse_bindings, parse_ui_font_path, CommandEvent, EmbeddingState, FullImageCache,
     FullImageMessage, ImageRequest, ImageStates, Mode, Model, SearchPhase, SearchState,
-    SelectionPreload, TerminalState, ThumbRequestQueue, ThumbnailEntry, ThumbnailTexture,
-    ThumbnailUpdate, Tile, TiledFrame, TiledTexture,
+    SelectionPreload, TerminalState, ThumbRequestQueue, ThumbnailTexture, ThumbnailUpdate, Tile,
+    TiledFrame, TiledTexture,
 };
+use crate::thumbnails::{DecodeOutcome, ThumbnailDecoder, ThumbnailStore, THUMBNAIL_SIZE};
 use crate::ui;
 
 /// Maximum number of full-resolution images to cache in memory.
@@ -191,7 +192,7 @@ fn mouse_pressed(app: &App, model: &mut Model, button: MouseButton) {
                         let size = if let Some(slot) = model.thumb_visible.get(&i) {
                             slot.size
                         } else {
-                            [model.thumb_size; 2]
+                            model.thumb_data.size(i).unwrap_or([model.thumb_size; 2])
                         };
                         let bounds = image_rect(rect, center, size, 1.0, app.scale_factor());
                         if pos.x >= bounds.left()
@@ -274,7 +275,7 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
         std::process::exit(1);
     }
     // Prepare thumbnail size, gap, and cache base directory.
-    let thumb_size: u32 = 256;
+    let thumb_size = THUMBNAIL_SIZE;
     let cache_home = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| {
@@ -298,9 +299,9 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
     let (thumb_tx, thumb_rx) = channel::<ThumbnailUpdate>();
     let thumb_queue = ThumbRequestQueue::new();
     let num_workers = rayon::current_num_threads().clamp(1, 8);
-    let clip_engine =
-        ClipEngine::new(cache_dir.clone(), worker_proxy.clone()).unwrap_or_else(|err| {
-            eprintln!("Failed to initialize CLIP: {err}");
+    let clip_engine = ClipEngine::new(cache_dir.clone(), worker_proxy.clone(), output_color_space)
+        .unwrap_or_else(|err| {
+            eprintln!("Failed to initialize SigLIP 2: {err}");
             std::process::exit(1);
         });
     let clip_sender = clip_engine.request_sender();
@@ -330,7 +331,7 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
                         Ok(value) => value.flatten(),
                         Err(err) => {
                             eprintln!(
-                                "Failed to load cached CLIP embedding for {}: {}",
+                                "Failed to load cached SigLIP 2 embedding for {}: {}",
                                 p.display(),
                                 err
                             );
@@ -340,21 +341,10 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
                     let embedding = if let Some(embedding) = clip_embedding {
                         EmbeddingState::Ready(embedding)
                     } else {
-                        let clip_thumb =
-                            match image_io::thumbnail_for_clip(&image, output_color_space) {
-                                Ok(image) => image,
-                                Err(error) => {
-                                    eprintln!(
-                                    "Failed to prepare an sRGB CLIP thumbnail for {}: {error:#}",
-                                    p.display()
-                                );
-                                    image.to_rgb8()
-                                }
-                            };
-                        match clip_sender.queue_image(request, p.clone(), clip_thumb) {
+                        match clip_sender.queue_image(request, p.clone(), image.clone()) {
                             Ok(()) => EmbeddingState::Pending,
                             Err(err) => EmbeddingState::Failed(format!(
-                                "Failed to queue CLIP embedding: {err}"
+                                "Failed to queue SigLIP 2 embedding: {err}"
                             )),
                         }
                     };
@@ -462,7 +452,9 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
         library,
         ui_font_path,
         thumb_visible: HashMap::new(),
-        thumb_data: HashMap::new(),
+        thumb_data: ThumbnailStore::new(),
+        thumbnail_decoder: ThumbnailDecoder::new(worker_proxy.clone())
+            .unwrap_or_else(|error| panic!("failed to start thumbnail decoder: {error}")),
         thumb_has_xmp: Vec::new(),
         thumb_rx,
         thumb_queue: thumb_queue.clone(),
@@ -1319,6 +1311,21 @@ fn update(app: &App, model: &mut Model, renderer: &Renderer, check_files: bool) 
         handle_thumbnail_update(app, model, update);
         redraw_needed = true;
     }
+    while let Ok(update) = model.thumbnail_decoder.try_recv() {
+        if !model.image_states.is_current(update.request) {
+            continue;
+        }
+        match update.outcome {
+            DecodeOutcome::Ready(image) => {
+                redraw_needed |= model.thumb_data.complete(update.request, image);
+            }
+            DecodeOutcome::Regenerate(error) => {
+                eprintln!("Regenerating corrupt thumbnail: {error}");
+                regenerate_thumbnail(model, update.request.index);
+                redraw_needed = true;
+            }
+        }
+    }
     loop {
         match model.clip_engine.try_recv() {
             Ok(event) => {
@@ -1332,9 +1339,15 @@ fn update(app: &App, model: &mut Model, renderer: &Renderer, check_files: bool) 
                     ClipEvent::ImageError { request, error } => {
                         if model.image_states.image_failed(request, error.clone()) {
                             eprintln!(
-                                "Failed to compute CLIP embedding for {}: {error}",
+                                "Failed to compute SigLIP 2 embedding for {}: {error}",
                                 model.image_paths[request.index].display()
                             );
+                        }
+                    }
+                    ClipEvent::ThumbnailError { request, error } => {
+                        if model.image_states.is_current(request) {
+                            eprintln!("Regenerating corrupt search thumbnail: {error}");
+                            regenerate_thumbnail(model, request.index);
                         }
                     }
                     ClipEvent::TextReady {
@@ -1353,8 +1366,8 @@ fn update(app: &App, model: &mut Model, renderer: &Renderer, check_files: bool) 
             Err(crossbeam_channel::TryRecvError::Empty) => break,
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
                 if model.clip_error.is_none() {
-                    let error =
-                        "CLIP unavailable: all workers stopped; see stderr for details".to_string();
+                    let error = "SigLIP 2 unavailable: all workers stopped; see stderr for details"
+                        .to_string();
                     model.image_states.worker_stopped(&error);
                     if let Some(search) = &mut model.search {
                         if let SearchPhase::Pending { request_id } = search.phase {
@@ -1603,11 +1616,13 @@ fn update_thumbnail_requests(
     viewport_changed: bool,
 ) {
     if !matches!(model.mode, Mode::Thumbnails) {
+        model.thumbnail_decoder.request(Vec::new());
         return;
     }
     let total = model.image_paths.len();
     if total == 0 {
         model.thumb_visible.clear();
+        model.thumbnail_decoder.request(Vec::new());
         return;
     }
     let rect = app.rect();
@@ -1636,14 +1651,26 @@ fn update_thumbnail_requests(
         model.thumb_visible.remove(&idx);
     }
 
+    let mut decode_order = visible.clone();
+    decode_order.sort_by(|&a, &b| {
+        grid.viewport_priority(a)
+            .total_cmp(&grid.viewport_priority(b))
+    });
+    let jobs = model.thumb_data.decode_jobs(
+        decode_order
+            .into_iter()
+            .filter(|idx| !model.thumb_visible.contains_key(idx)),
+    );
+    model.thumbnail_decoder.request(jobs);
+
     for idx in visible {
         let center = grid.index_center(idx).unwrap_or(vec2(0.0, 0.0));
         if let Some(slot) = model.thumb_visible.get_mut(&idx) {
             slot.center = center;
             continue;
         }
-        if let Some(entry) = model.thumb_data.get(&idx) {
-            let texture = renderer.texture_from_image(&entry.image);
+        if let Some(image) = model.thumb_data.decoded(idx) {
+            let texture = renderer.texture_from_image(image);
             let size = texture.size();
             model.thumb_visible.insert(
                 idx,
@@ -1672,11 +1699,11 @@ fn handle_thumbnail_update(app: &App, model: &mut Model, update: ThumbnailUpdate
     let index = request.index;
     if let Some(error) = model.image_states.error(index) {
         eprintln!(
-            "CLIP embedding unavailable for {}: {error}",
+            "SigLIP 2 embedding unavailable for {}: {error}",
             model.image_paths[index].display()
         );
     }
-    model.thumb_data.insert(index, ThumbnailEntry { image });
+    model.thumb_data.insert(request, image);
     update_search_with_image_embedding(app, model, index);
 }
 
@@ -1727,15 +1754,18 @@ fn check_image_modification(model: &mut Model, idx: usize) -> bool {
     changed
 }
 
-fn handle_image_modified(model: &mut Model, idx: usize) {
-    model.thumb_data.remove(&idx);
+fn regenerate_thumbnail(model: &mut Model, idx: usize) {
+    model.thumb_data.remove(idx);
     let request = model.image_states.invalidate(idx);
     if let Some(search) = &mut model.search {
         search.invalidate_image(idx);
     }
     model.thumb_visible.remove(&idx);
     model.thumb_queue.enqueue(request);
+}
 
+fn handle_image_modified(model: &mut Model, idx: usize) {
+    regenerate_thumbnail(model, idx);
     model.full_images.invalidate(idx);
     if matches!(model.mode, Mode::Single) && idx == model.current {
         request_full_texture(model, idx);

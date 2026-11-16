@@ -4,24 +4,122 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use anyhow::{anyhow, Context, Result};
-use candle::{utils::cuda_is_available, DType, Device, Tensor};
+use candle::{utils::cuda_is_available, DType, Device, Module, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::clip::{self, ClipModel};
+use candle_transformers::models::{clip, siglip};
 use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
-use image::{imageops::FilterType, DynamicImage, RgbImage};
+use image::imageops::FilterType;
 use sha1::Sha1;
-use tokenizers::Tokenizer;
+use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 use crate::app::AppProxy;
+use crate::color::OutputColorSpace;
 use crate::state::ImageRequest;
+use crate::thumbnails::{decode_thumbnail, DecodeOutcome, EncodedThumbnail};
 
-const MAX_IMAGE_BATCH: usize = 16;
+const MAX_IMAGE_BATCH: usize = 4;
+const MODEL_ID: &str = "google/siglip2-base-patch16-512";
+const MODEL_REVISION: &str = "a89f5c5093f902bf39d3cd4d81d2c09867f0724b";
+const EMBEDDING_DIM: usize = 768;
+const EMBEDDING_CACHE_EXTENSION: &str =
+    "siglip2-b16-512-a89f5c5093f902bf39d3cd4d81d2c09867f0724b-prep1.embedding";
 
-/// Events emitted by the background CLIP worker.
+/// Load the two embedding towers without the unused classification logit parameters.
+struct EmbeddingModel {
+    vision: siglip::VisionModel,
+    text: siglip::TextModel,
+    dtype: DType,
+}
+
+impl EmbeddingModel {
+    fn new(config: &siglip::Config, vb: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            vision: siglip::VisionModel::new(&config.vision_config, true, vb.pp("vision_model"))?,
+            text: siglip::TextModel::new(&config.text_config, vb.pp("text_model"))?,
+            dtype: vb.dtype(),
+        })
+    }
+
+    fn get_image_features(&self, image: &Tensor) -> Result<Tensor> {
+        Ok(self
+            .vision
+            .forward(&image.to_dtype(self.dtype)?)?
+            .to_dtype(DType::F32)?)
+    }
+
+    fn get_text_features(&self, tokens: &Tensor) -> Result<Tensor> {
+        Ok(self.text.forward(tokens)?.to_dtype(DType::F32)?)
+    }
+}
+
+struct Inference {
+    model: EmbeddingModel,
+    tokenizer: Tokenizer,
+    device: Device,
+    image_size: usize,
+}
+
+impl Inference {
+    fn load(use_cuda: bool, device_flag: &AtomicBool) -> Result<Self> {
+        let device = if use_cuda {
+            match Device::new_cuda(0) {
+                Ok(device) => device,
+                Err(error) => {
+                    eprintln!("Failed to initialize CUDA: {error}. Falling back to CPU.");
+                    Device::Cpu
+                }
+            }
+        } else {
+            Device::Cpu
+        };
+        device_flag.store(device.is_cuda(), Ordering::Relaxed);
+        let api = hf_hub::api::sync::Api::new()?;
+        let repo = api.repo(hf_hub::Repo::with_revision(
+            MODEL_ID.to_string(),
+            hf_hub::RepoType::Model,
+            MODEL_REVISION.to_string(),
+        ));
+        let config: siglip::Config = serde_json::from_slice(&fs::read(repo.get("config.json")?)?)?;
+        let tokenizer = load_tokenizer(repo.get("tokenizer.json")?)?;
+        let weights = repo.get("model.safetensors")?;
+        let dtype = if device.is_cuda() {
+            DType::F16
+        } else {
+            DType::F32
+        };
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], dtype, &device)? };
+        let model = EmbeddingModel::new(&config, vb)?;
+        Ok(Self {
+            model,
+            tokenizer,
+            device,
+            image_size: config.vision_config.image_size,
+        })
+    }
+}
+
+fn load_tokenizer(path: PathBuf) -> Result<Tokenizer> {
+    let mut tokenizer = Tokenizer::from_file(path).map_err(anyhow::Error::msg)?;
+    tokenizer
+        .with_truncation(Some(TruncationParams {
+            max_length: 64,
+            ..Default::default()
+        }))
+        .map_err(anyhow::Error::msg)?;
+    tokenizer.with_padding(Some(PaddingParams {
+        strategy: PaddingStrategy::Fixed(64),
+        pad_id: 0,
+        pad_token: "<pad>".into(),
+        ..Default::default()
+    }));
+    Ok(tokenizer)
+}
+
+/// Events emitted by the background SigLIP 2 worker.
 #[derive(Debug)]
 pub enum ClipEvent {
     ImageReady {
@@ -29,6 +127,10 @@ pub enum ClipEvent {
         embedding: Vec<f32>,
     },
     ImageError {
+        request: ImageRequest,
+        error: String,
+    },
+    ThumbnailError {
         request: ImageRequest,
         error: String,
     },
@@ -42,29 +144,29 @@ pub enum ClipEvent {
     },
 }
 
-enum ClipJob {
-    Image {
-        request: ImageRequest,
-        image_path: PathBuf,
-        thumbnail: RgbImage,
-    },
-    Text {
-        request_id: u64,
-        query: String,
-    },
+struct ImageJob {
+    request: ImageRequest,
+    image_path: PathBuf,
+    thumbnail: EncodedThumbnail,
 }
 
-/// Manages CLIP inference in a background thread and caching of embeddings.
+struct TextJob {
+    request_id: u64,
+    query: String,
+}
+
+/// Manages SigLIP 2 inference in a background thread and caching of embeddings.
 #[derive(Debug)]
 pub struct ClipEngine {
-    job_tx: Sender<ClipJob>,
+    job_tx: Sender<ImageJob>,
+    text_tx: Sender<TextJob>,
     result_rx: Receiver<ClipEvent>,
     using_cuda: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
 pub struct ClipRequestSender {
-    job_tx: Sender<ClipJob>,
+    job_tx: Sender<ImageJob>,
 }
 
 impl ClipRequestSender {
@@ -72,10 +174,10 @@ impl ClipRequestSender {
         &self,
         request: ImageRequest,
         image_path: PathBuf,
-        thumbnail: RgbImage,
+        thumbnail: EncodedThumbnail,
     ) -> Result<()> {
         self.job_tx
-            .send(ClipJob::Image {
+            .send(ImageJob {
                 request,
                 image_path,
                 thumbnail,
@@ -87,17 +189,23 @@ impl ClipRequestSender {
 #[derive(Clone)]
 struct ClipWorkerContext {
     cache_base: Option<PathBuf>,
-    config: clip::ClipConfig,
+    inference: Arc<OnceLock<std::result::Result<Inference, String>>>,
+    output_color_space: OutputColorSpace,
     result_tx: Sender<ClipEvent>,
     device_flag: Arc<AtomicBool>,
     proxy: AppProxy,
 }
 
 impl ClipEngine {
-    pub(crate) fn new(cache_base: Option<PathBuf>, proxy: AppProxy) -> Result<Self> {
-        let (job_tx, job_rx) = unbounded::<ClipJob>();
+    pub(crate) fn new(
+        cache_base: Option<PathBuf>,
+        proxy: AppProxy,
+        output_color_space: OutputColorSpace,
+    ) -> Result<Self> {
+        let (job_tx, job_rx) = unbounded::<ImageJob>();
+        let (text_tx, text_rx) = unbounded::<TextJob>();
         let (result_tx, result_rx) = unbounded::<ClipEvent>();
-        let config = clip::ClipConfig::vit_base_patch32();
+        let inference = Arc::new(OnceLock::new());
         let want_cuda = cuda_is_available();
         let using_cuda = Arc::new(AtomicBool::new(false));
         let worker_count = if want_cuda {
@@ -108,17 +216,19 @@ impl ClipEngine {
         for worker_idx in 0..worker_count {
             let worker_ctx = ClipWorkerContext {
                 cache_base: cache_base.clone(),
-                config: config.clone(),
+                inference: Arc::clone(&inference),
+                output_color_space,
                 result_tx: result_tx.clone(),
                 device_flag: using_cuda.clone(),
                 proxy: proxy.clone(),
             };
             let worker_rx = job_rx.clone();
+            let worker_text_rx = text_rx.clone();
             thread::Builder::new()
                 .name(format!("clip-worker-{worker_idx}"))
                 .spawn(move || {
                     let proxy = worker_ctx.proxy.clone();
-                    if let Err(err) = run_worker(worker_ctx, worker_rx, want_cuda) {
+                    if let Err(err) = run_worker(worker_ctx, worker_rx, worker_text_rx, want_cuda) {
                         eprintln!("clip worker terminated: {err:#}");
                     }
                     // The last worker dropping its sender disconnects result_rx. Wake the UI
@@ -128,9 +238,11 @@ impl ClipEngine {
                 .context("failed to spawn clip worker thread")?;
         }
         drop(job_rx);
+        drop(text_rx);
         drop(result_tx);
         Ok(Self {
             job_tx,
+            text_tx,
             result_rx,
             using_cuda,
         })
@@ -144,8 +256,8 @@ impl ClipEngine {
 
     /// Requests a text embedding for the given query string.
     pub fn request_text(&self, request_id: u64, query: String) -> Result<()> {
-        self.job_tx
-            .send(ClipJob::Text { request_id, query })
+        self.text_tx
+            .send(TextJob { request_id, query })
             .map_err(|err| anyhow!("failed to queue clip text job: {err}"))
     }
 
@@ -163,112 +275,63 @@ impl ClipEngine {
     }
 }
 
-fn run_worker(ctx: ClipWorkerContext, job_rx: Receiver<ClipJob>, use_cuda: bool) -> Result<()> {
+fn run_worker(
+    ctx: ClipWorkerContext,
+    job_rx: Receiver<ImageJob>,
+    text_rx: Receiver<TextJob>,
+    use_cuda: bool,
+) -> Result<()> {
     let ClipWorkerContext {
         cache_base,
-        config,
+        inference,
+        output_color_space,
         result_tx,
         device_flag,
         proxy,
     } = ctx;
-    let device = if use_cuda {
-        match Device::new_cuda(0) {
-            Ok(device) => {
-                device_flag.store(true, Ordering::Relaxed);
-                device
-            }
-            Err(err) => {
-                eprintln!("Failed to initialize CUDA device: {err}. Falling back to CPU.");
-                device_flag.store(false, Ordering::Relaxed);
-                Device::Cpu
-            }
-        }
-    } else {
-        device_flag.store(false, Ordering::Relaxed);
-        Device::Cpu
-    };
-    let api = hf_hub::api::sync::Api::new()?;
-    let repo = api.repo(hf_hub::Repo::with_revision(
-        "openai/clip-vit-base-patch32".to_string(),
-        hf_hub::RepoType::Model,
-        "refs/pr/15".to_string(),
-    ));
-    let model_file = repo.get("model.safetensors")?;
-    let tokenizer_path = repo.get("tokenizer.json")?;
-    let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(anyhow::Error::msg)?;
-    let pad_id = *tokenizer
-        .get_vocab(true)
-        .get("<|endoftext|>")
-        .ok_or_else(|| anyhow!("tokenizer does not provide <|endoftext|> token"))?;
-    let vb = unsafe {
-        VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&model_file), DType::F32, &device)?
-    };
-    let model = ClipModel::new(vb, &config)?;
+    // CPU workers share the weights instead of each allocating another 1.5 GB model.
+    let inference = inference
+        .get_or_init(|| {
+            Inference::load(use_cuda, &device_flag).map_err(|error| format!("{error:#}"))
+        })
+        .as_ref()
+        .map_err(|error| anyhow!(error.clone()))?;
+    let model = &inference.model;
+    let device = &inference.device;
     let image_ctx = ImageBatchContext {
         cache_base: cache_base.as_deref(),
-        model: &model,
-        device: &device,
-        clip_image_size: config.image_size,
+        model,
+        device,
+        clip_image_size: inference.image_size,
+        output_color_space,
         result_tx: &result_tx,
         proxy: &proxy,
     };
     let text_ctx = TextJobContext {
-        model: &model,
-        tokenizer: &tokenizer,
-        pad_id,
-        device: &device,
+        model,
+        tokenizer: &inference.tokenizer,
+        device,
         result_tx: &result_tx,
         proxy: &proxy,
     };
-    let mut channel_closed = false;
-    while let Ok(job) = job_rx.recv() {
-        match job {
-            ClipJob::Image {
-                request,
-                image_path,
-                thumbnail,
-            } => {
-                let mut batch = vec![(request, image_path, thumbnail)];
-                let mut deferred_job: Option<ClipJob> = None;
-                while batch.len() < MAX_IMAGE_BATCH {
+    loop {
+        // Queries can run between image batches even while thousands of images await indexing.
+        crossbeam_channel::select_biased! {
+            recv(text_rx) -> job => {
+                let Ok(job) = job else { break; };
+                handle_text_job(job.request_id, &job.query, &text_ctx);
+            }
+            recv(job_rx) -> job => {
+                let Ok(job) = job else { break; };
+                let mut batch = vec![job];
+                let max_batch = if device.is_cuda() { MAX_IMAGE_BATCH } else { 1 };
+                while batch.len() < max_batch {
                     match job_rx.try_recv() {
-                        Ok(ClipJob::Image {
-                            request,
-                            image_path,
-                            thumbnail,
-                        }) => batch.push((request, image_path, thumbnail)),
-                        Ok(other) => {
-                            deferred_job = Some(other);
-                            break;
-                        }
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => {
-                            channel_closed = true;
-                            break;
-                        }
+                        Ok(job) => batch.push(job),
+                        Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
                     }
                 }
                 process_image_batch(batch, &image_ctx);
-                if let Some(job) = deferred_job {
-                    match job {
-                        ClipJob::Text { request_id, query } => {
-                            handle_text_job(request_id, &query, &text_ctx)
-                        }
-                        ClipJob::Image {
-                            request,
-                            image_path,
-                            thumbnail,
-                        } => {
-                            process_image_batch(vec![(request, image_path, thumbnail)], &image_ctx)
-                        }
-                    }
-                }
-                if channel_closed {
-                    break;
-                }
-            }
-            ClipJob::Text { request_id, query } => {
-                handle_text_job(request_id, &query, &text_ctx);
             }
         }
     }
@@ -276,7 +339,7 @@ fn run_worker(ctx: ClipWorkerContext, job_rx: Receiver<ClipJob>, use_cuda: bool)
 }
 
 fn handle_text_job(request_id: u64, query: &str, ctx: &TextJobContext<'_>) {
-    match process_text_job(query, ctx.model, ctx.tokenizer, ctx.pad_id, ctx.device) {
+    match process_text_job(query, ctx.model, ctx.tokenizer, ctx.device) {
         Ok(embedding) => {
             send_result(
                 ctx.result_tx,
@@ -300,13 +363,29 @@ fn handle_text_job(request_id: u64, query: &str, ctx: &TextJobContext<'_>) {
     }
 }
 
-fn process_image_batch(batch: Vec<(ImageRequest, PathBuf, RgbImage)>, ctx: &ImageBatchContext<'_>) {
+fn process_image_batch(batch: Vec<ImageJob>, ctx: &ImageBatchContext<'_>) {
     let mut compute_indices = Vec::new();
     let mut compute_paths = Vec::new();
     let mut compute_tensors = Vec::new();
 
-    for (request, image_path, thumb) in batch {
-        match tensor_from_thumbnail(thumb, ctx.clip_image_size) {
+    for ImageJob {
+        request,
+        image_path,
+        thumbnail: thumb,
+    } in batch
+    {
+        let decoded = match decode_thumbnail(&thumb) {
+            DecodeOutcome::Ready(image) => image,
+            DecodeOutcome::Regenerate(error) => {
+                send_result(
+                    ctx.result_tx,
+                    ctx.proxy,
+                    ClipEvent::ThumbnailError { request, error },
+                );
+                continue;
+            }
+        };
+        match tensor_from_image(&decoded, ctx.clip_image_size, ctx.output_color_space) {
             Ok(tensor) => {
                 compute_indices.push(request);
                 compute_paths.push(image_path);
@@ -355,7 +434,7 @@ fn process_image_batch(batch: Vec<(ImageRequest, PathBuf, RgbImage)>, ctx: &Imag
             {
                 if let Err(err) = cache_embedding(ctx.cache_base, &path, &embedding) {
                     eprintln!(
-                        "Failed to cache CLIP embedding for {}: {err}",
+                        "Failed to cache SigLIP 2 embedding for {}: {err}",
                         path.display()
                     );
                 }
@@ -400,17 +479,17 @@ fn report_batch_error(
 
 struct ImageBatchContext<'a> {
     cache_base: Option<&'a Path>,
-    model: &'a ClipModel,
+    model: &'a EmbeddingModel,
     device: &'a Device,
     clip_image_size: usize,
+    output_color_space: OutputColorSpace,
     result_tx: &'a Sender<ClipEvent>,
     proxy: &'a AppProxy,
 }
 
 struct TextJobContext<'a> {
-    model: &'a ClipModel,
+    model: &'a EmbeddingModel,
     tokenizer: &'a Tokenizer,
-    pad_id: u32,
     device: &'a Device,
     result_tx: &'a Sender<ClipEvent>,
     proxy: &'a AppProxy,
@@ -418,9 +497,8 @@ struct TextJobContext<'a> {
 
 fn process_text_job(
     query: &str,
-    model: &ClipModel,
+    model: &EmbeddingModel,
     tokenizer: &Tokenizer,
-    pad_id: u32,
     device: &Device,
 ) -> Result<Vec<f32>> {
     let ids = tokenizer
@@ -431,14 +509,7 @@ fn process_text_job(
     if ids.is_empty() {
         return Err(anyhow!("tokenizer produced empty sequence for query"));
     }
-    let max_len = ids.len();
-    let mut tokens = vec![ids];
-    for token_vec in tokens.iter_mut() {
-        if token_vec.len() < max_len {
-            token_vec.extend(std::iter::repeat_n(pad_id, max_len - token_vec.len()));
-        }
-    }
-    let input_ids = Tensor::new(tokens, device)?;
+    let input_ids = Tensor::new(vec![ids], device)?;
     let features = model.get_text_features(&input_ids)?;
     let features = clip::div_l2_norm(&features)?;
     let features = features.squeeze(0)?;
@@ -446,16 +517,29 @@ fn process_text_job(
     Ok(embedding)
 }
 
-fn tensor_from_thumbnail(thumb: RgbImage, clip_image_size: usize) -> Result<Tensor> {
-    let mut dyn_thumb = DynamicImage::ImageRgb8(thumb);
-    if dyn_thumb.width() != clip_image_size as u32 || dyn_thumb.height() != clip_image_size as u32 {
-        dyn_thumb = dyn_thumb.resize_to_fill(
-            clip_image_size as u32,
-            clip_image_size as u32,
-            FilterType::Triangle,
-        );
-    }
-    let resized = dyn_thumb.to_rgb8();
+#[cfg(test)]
+fn tensor_from_thumbnail(
+    thumb: &EncodedThumbnail,
+    image_size: usize,
+    output_color_space: OutputColorSpace,
+) -> Result<Tensor> {
+    let decoded = thumb.decode()?;
+    tensor_from_image(&decoded, image_size, output_color_space)
+}
+
+fn tensor_from_image(
+    decoded: &image::DynamicImage,
+    image_size: usize,
+    output_color_space: OutputColorSpace,
+) -> Result<Tensor> {
+    let srgb = crate::image_io::thumbnail_for_clip(decoded, output_color_space)?;
+    // Fixed-resolution SigLIP stretches the whole image, rather than center-cropping it.
+    let resized = image::imageops::resize(
+        &srgb,
+        image_size as u32,
+        image_size as u32,
+        FilterType::Triangle,
+    );
     let (height, width) = (resized.height() as usize, resized.width() as usize);
     let data = resized.into_raw();
     let tensor = Tensor::from_vec(data, (height, width, 3), &Device::Cpu)?
@@ -465,7 +549,7 @@ fn tensor_from_thumbnail(thumb: RgbImage, clip_image_size: usize) -> Result<Tens
     Ok(tensor)
 }
 
-fn image_embeddings(model: &ClipModel, tensor: Tensor) -> Result<Vec<Vec<f32>>> {
+fn image_embeddings(model: &EmbeddingModel, tensor: Tensor) -> Result<Vec<Vec<f32>>> {
     let features = model.get_image_features(&tensor)?;
     let features = clip::div_l2_norm(&features)?;
     Ok(features.to_vec2::<f32>()?)
@@ -492,13 +576,16 @@ fn write_embedding(path: &Path, embedding: &[f32]) -> Result<()> {
 
 fn cache_embedding(cache_base: Option<&Path>, image_path: &Path, embedding: &[f32]) -> Result<()> {
     if let Some(base) = cache_base {
-        write_embedding(&cache_file_path(base, image_path, "clip"), embedding)?;
+        write_embedding(
+            &cache_file_path(base, image_path, EMBEDDING_CACHE_EXTENSION),
+            embedding,
+        )?;
     }
     Ok(())
 }
 
 pub fn load_cached_embedding(cache_base: &Path, image_path: &Path) -> Result<Option<Vec<f32>>> {
-    let embed_path = cache_file_path(cache_base, image_path, "clip");
+    let embed_path = cache_file_path(cache_base, image_path, EMBEDDING_CACHE_EXTENSION);
     let embed_meta = match fs::metadata(&embed_path) {
         Ok(meta) => meta,
         Err(_) => return Ok(None),
@@ -515,11 +602,17 @@ pub fn load_cached_embedding(cache_base: &Path, image_path: &Path) -> Result<Opt
     let mut header = [0u8; 4];
     file.read_exact(&mut header)?;
     let len = u32::from_le_bytes(header) as usize;
+    if len != EMBEDDING_DIM {
+        return Ok(None);
+    }
     let mut buffer = vec![0u8; len * 4];
     file.read_exact(&mut buffer)?;
     let mut embedding = Vec::with_capacity(len);
     for chunk in buffer.chunks_exact(4) {
         embedding.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    if embedding.iter().any(|value| !value.is_finite()) {
+        return Ok(None);
     }
     Ok(Some(embedding))
 }
@@ -541,6 +634,135 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn siglip_preprocessing_preserves_both_edges_and_normalizes_rgb() {
+        let image = image::RgbImage::from_raw(2, 1, vec![255, 0, 0, 0, 0, 255]).unwrap();
+        let thumbnail = EncodedThumbnail::encode(&image::DynamicImage::ImageRgb8(image)).unwrap();
+        let tensor = tensor_from_thumbnail(&thumbnail, 2, OutputColorSpace::Srgb).unwrap();
+        assert_eq!(
+            tensor.to_vec3::<f32>().unwrap(),
+            vec![
+                vec![vec![1.0, -1.0], vec![1.0, -1.0]],
+                vec![vec![-1.0, -1.0], vec![-1.0, -1.0]],
+                vec![vec![-1.0, 1.0], vec![-1.0, 1.0]],
+            ]
+        );
+    }
+
+    /// Explicit integration check: downloads the pinned model and uses a photograph of cats.
+    #[test]
+    #[ignore = "downloads SigLIP 2 weights; set SRIV_SEARCH_TEST_IMAGE to a cat photograph"]
+    fn siglip2_inference_smoke() {
+        let started = std::time::Instant::now();
+        let inference = Inference::load(cuda_is_available(), &AtomicBool::new(false)).unwrap();
+        eprintln!(
+            "model loaded on {:?} in {:?}",
+            inference.device,
+            started.elapsed()
+        );
+        let path = std::env::var("SRIV_SEARCH_TEST_IMAGE").expect("set SRIV_SEARCH_TEST_IMAGE");
+        let image = image::load_from_memory(&std::fs::read(path).unwrap())
+            .unwrap()
+            .thumbnail(512, 512);
+        let thumbnail = EncodedThumbnail::encode(&image).unwrap();
+        let pixels = tensor_from_thumbnail(&thumbnail, 512, OutputColorSpace::Srgb)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap()
+            .to_device(&inference.device)
+            .unwrap();
+        if let Ok(directory) = std::env::var("SRIV_SEARCH_REFERENCE_DIR") {
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                Path::new(&directory).join("thumbnail.png"),
+                &thumbnail.bytes,
+            )
+            .unwrap();
+            pixels
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .write_npy(Path::new(&directory).join("pixels.npy"))
+                .unwrap();
+        }
+        let started = std::time::Instant::now();
+        let images = image_embeddings(&inference.model, pixels).unwrap();
+        eprintln!("512 px image encoded in {:?}", started.elapsed());
+        let pixels = tensor_from_thumbnail(&thumbnail, 512, OutputColorSpace::Srgb)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap()
+            .to_device(&inference.device)
+            .unwrap();
+        for batch_size in [1, MAX_IMAGE_BATCH] {
+            let batch = pixels.repeat((batch_size, 1, 1, 1)).unwrap();
+            let started = std::time::Instant::now();
+            let result = image_embeddings(&inference.model, batch).unwrap();
+            eprintln!(
+                "warm batch of {batch_size}: {:?} ({:.1} images/sec)",
+                started.elapsed(),
+                batch_size as f64 / started.elapsed().as_secs_f64()
+            );
+            for embedding in result {
+                assert!(
+                    embedding
+                        .iter()
+                        .zip(&images[0])
+                        .map(|(a, b)| a * b)
+                        .sum::<f32>()
+                        > 0.999
+                );
+            }
+        }
+        assert_eq!(images[0].len(), EMBEDDING_DIM);
+        assert!((images[0].iter().map(|v| v * v).sum::<f32>() - 1.0).abs() < 1e-4);
+        let mut scores = Vec::new();
+        for (index, query) in [
+            "two cats resting on a couch",
+            "a satellite photograph of a desert",
+            "an airplane flying in the sky",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let text = process_text_job(
+                query,
+                &inference.model,
+                &inference.tokenizer,
+                &inference.device,
+            )
+            .unwrap();
+            assert_eq!(text.len(), EMBEDDING_DIM);
+            assert!(text.iter().all(|v| v.is_finite()));
+            if let Ok(directory) = std::env::var("SRIV_SEARCH_REFERENCE_DIR") {
+                Tensor::new(text.as_slice(), &Device::Cpu)
+                    .unwrap()
+                    .write_npy(Path::new(&directory).join(format!("text-{index}.npy")))
+                    .unwrap();
+                let ids = inference.tokenizer.encode(query, true).unwrap();
+                fs::write(
+                    Path::new(&directory).join(format!("tokens-{index}.json")),
+                    serde_json::to_vec(ids.get_ids()).unwrap(),
+                )
+                .unwrap();
+            }
+            scores.push(images[0].iter().zip(text).map(|(a, b)| a * b).sum::<f32>());
+        }
+        let long = inference
+            .tokenizer
+            .encode("cat ".repeat(1000), true)
+            .unwrap();
+        assert_eq!(long.len(), 64);
+        assert_eq!(inference.tokenizer.encode("cat", true).unwrap().len(), 64);
+        eprintln!("cat / desert / airplane cosine similarities: {scores:?}");
+        assert!(scores[0] > scores[1] && scores[0] > scores[2]);
+        if let Ok(directory) = std::env::var("SRIV_SEARCH_REFERENCE_DIR") {
+            Tensor::new(images[0].as_slice(), &Device::Cpu)
+                .unwrap()
+                .write_npy(Path::new(&directory).join("image.npy"))
+                .unwrap();
+        }
+    }
+
+    #[test]
     fn private_embedding_skips_disk_cache() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -549,7 +771,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("sriv-private-clip-{}-{unique}", std::process::id()));
         let image_path = dir.join("image.png");
-        let embedding = [0.1, 0.2];
+        let embedding = [0.1; EMBEDDING_DIM];
         cache_embedding(None, &image_path, &embedding).unwrap();
         assert!(!dir.exists());
 
@@ -559,6 +781,21 @@ mod tests {
             load_cached_embedding(&cache_base, &image_path).unwrap(),
             Some(embedding.to_vec())
         );
+        // The original CLIP cache is never used, even if it is newer than the source.
+        let legacy = dir.join("legacy.png");
+        write_embedding(&cache_file_path(&cache_base, &legacy, "clip"), &embedding).unwrap();
+        assert!(load_cached_embedding(&cache_base, &legacy)
+            .unwrap()
+            .is_none());
+        let current = cache_file_path(&cache_base, &image_path, EMBEDDING_CACHE_EXTENSION);
+        write_embedding(&current, &[0.0; 512]).unwrap();
+        assert!(load_cached_embedding(&cache_base, &image_path)
+            .unwrap()
+            .is_none());
+        write_embedding(&current, &[f32::NAN; EMBEDDING_DIM]).unwrap();
+        assert!(load_cached_embedding(&cache_base, &image_path)
+            .unwrap()
+            .is_none());
         fs::remove_dir_all(dir).unwrap();
     }
 }

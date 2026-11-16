@@ -625,10 +625,10 @@ pub(crate) fn render(app: &App, model: &mut Model, renderer: &mut Renderer) -> R
                             Some(c) => c,
                             None => continue,
                         };
-                        let size = model
-                            .thumb_visible
-                            .get(&i)
-                            .map_or([model.thumb_size; 2], |slot| slot.size);
+                        let size = model.thumb_visible.get(&i).map_or_else(
+                            || model.thumb_data.size(i).unwrap_or([model.thumb_size; 2]),
+                            |slot| slot.size,
+                        );
                         let bounds = image_rect(rect, center, size, 1.0, app.scale_factor());
                         let center = vec2(bounds.x(), bounds.y());
                         let w = bounds.w();
