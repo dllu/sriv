@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use crate::clip;
 use crate::color::{self, EmbeddedColorProfile, OutputColorSpace};
+use crate::source::SourceVersion;
 use crate::state::{FullImageFrame, FullImageTile, TilePixelFormat};
 use crate::thumbnails::EncodedThumbnail;
 
@@ -42,7 +43,7 @@ enum DetectedImageFormat {
 const JXL_CODESTREAM_SIGNATURE: &[u8] = b"\xff\x0a";
 const JXL_CONTAINER_SIGNATURE: &[u8] = b"\x00\x00\x00\x0cJXL \x0d\x0a\x87\x0a";
 
-/// List of recognized raw file extensions for detecting XMP sidecars.
+/// Camera RAW extensions, excluded from decoding but recognized for XMP sidecars.
 const RAW_EXTENSIONS: &[&str] = &[
     "3fr", "ari", "arw", "bay", "cap", "cr2", "cr3", "crw", "cs1", "dcr", "dng", "erf", "fff",
     "iiq", "k25", "kdc", "mdc", "mef", "mos", "mrw", "nef", "nrw", "orf", "pef", "ptx", "pxn",
@@ -122,6 +123,19 @@ fn detect_supported_image_format_bytes(bytes: &[u8]) -> Option<DetectedImageForm
 }
 
 fn detect_supported_image_format(path: &Path) -> Result<DetectedImageFormat> {
+    // TIFF-based RAW files share TIFF's magic bytes, but need a dedicated RAW decoder.
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            RAW_EXTENSIONS
+                .iter()
+                .any(|raw| ext.eq_ignore_ascii_case(raw))
+        })
+    {
+        return Err(anyhow!("camera RAW images are not supported"));
+    }
+
     let mut header = Vec::with_capacity(FORMAT_DETECTION_BYTES as usize);
     fs::File::open(path)?
         .take(FORMAT_DETECTION_BYTES)
@@ -1127,19 +1141,21 @@ pub(crate) fn load_thumbnail(
     image_path: &Path,
     size: u32,
     output_color_space: OutputColorSpace,
-) -> EncodedThumbnail {
-    if let Some(cache_base) = cache_base {
-        let cache_path = thumbnail_cache_path(cache_base, image_path, output_color_space, size);
-        if let (Ok(source), Ok(cached)) = (fs::metadata(image_path), fs::metadata(&cache_path)) {
-            if matches!(
-                (source.modified(), cached.modified()),
-                (Ok(source_time), Ok(cache_time)) if cache_time >= source_time
-            ) {
-                if let Ok(bytes) = fs::read(&cache_path) {
-                    if let Ok(mut image) = EncodedThumbnail::from_png(bytes) {
-                        image.cached_path = Some(std::sync::Arc::new(cache_path));
-                        return image;
-                    }
+    version: SourceVersion,
+    read_cache: bool,
+) -> Result<EncodedThumbnail> {
+    let cache_path =
+        cache_base.map(|base| thumbnail_cache_path(base, image_path, output_color_space, size));
+    if read_cache {
+        if let Some(mut file) = cache_path
+            .as_deref()
+            .and_then(|path| version.open_cache(path))
+        {
+            let mut bytes = Vec::new();
+            if file.read_to_end(&mut bytes).is_ok() {
+                if let Ok(mut image) = EncodedThumbnail::from_png(bytes) {
+                    image.cached = true;
+                    return Ok(image);
                 }
             }
         }
@@ -1153,25 +1169,14 @@ pub(crate) fn load_thumbnail(
     } else {
         output_color_space
     };
-    let thumbnail = decode_image_no_limits(image_path, thumbnail_output)
-        .ok()
-        .and_then(|image| make_thumbnail(image, size))
-        .unwrap_or_else(fallback_thumbnail);
-    let thumbnail = EncodedThumbnail::encode(&thumbnail).unwrap_or_else(|error| {
-        eprintln!(
-            "Failed to encode thumbnail for {}: {error}",
-            image_path.display()
-        );
-        EncodedThumbnail::encode(&fallback_thumbnail()).expect("encode fallback thumbnail")
-    });
-    if let Some(cache_base) = cache_base {
-        let cache_path = thumbnail_cache_path(cache_base, image_path, output_color_space, size);
-        if let Some(parent) = cache_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let _ = fs::write(cache_path, &thumbnail.bytes);
+    let image = decode_image_no_limits(image_path, thumbnail_output)?;
+    let thumbnail =
+        make_thumbnail(image, size).ok_or_else(|| anyhow!("invalid thumbnail dimensions"))?;
+    let thumbnail = EncodedThumbnail::encode(&thumbnail)?;
+    if let Some(path) = cache_path {
+        let _ = version.write_cache(image_path, &path, &thumbnail.bytes);
     }
-    thumbnail
+    Ok(thumbnail)
 }
 
 fn make_thumbnail(image: DynamicImage, size: u32) -> Option<DynamicImage> {
@@ -1311,8 +1316,10 @@ mod tests {
         DynamicImage::ImageRgba8(RgbaImage::from_pixel(8, 8, Rgba([200, 0, 0, 255])))
             .save(&source)
             .unwrap();
+        let version = SourceVersion::read(&source).unwrap();
 
-        let image = load_thumbnail(None, &source, 8, OutputColorSpace::Srgb);
+        let image =
+            load_thumbnail(None, &source, 8, OutputColorSpace::Srgb, version, true).unwrap();
         assert_eq!(
             image.decode().unwrap().to_rgba8().get_pixel(0, 0).0,
             [200, 0, 0, 255]
@@ -1324,16 +1331,41 @@ mod tests {
         DynamicImage::ImageRgba8(RgbaImage::from_pixel(8, 8, Rgba([0, 0, 200, 255])))
             .save(&cache_path)
             .unwrap();
-        let normal = load_thumbnail(Some(&cache_base), &source, 8, OutputColorSpace::Srgb);
+        let normal = load_thumbnail(
+            Some(&cache_base),
+            &source,
+            8,
+            OutputColorSpace::Srgb,
+            version,
+            true,
+        )
+        .unwrap();
         assert_eq!(
             normal.decode().unwrap().to_rgba8().get_pixel(0, 0).0,
             [0, 0, 200, 255]
         );
-        let private = load_thumbnail(None, &source, 8, OutputColorSpace::Srgb);
+        let private =
+            load_thumbnail(None, &source, 8, OutputColorSpace::Srgb, version, true).unwrap();
         assert_eq!(
             private.decode().unwrap().to_rgba8().get_pixel(0, 0).0,
             [200, 0, 0, 255]
         );
+
+        // A newer but truncated source must not replace the last good cached pixels.
+        fs::write(&source, b"\x89PNG\r\n\x1a\n").unwrap();
+        let truncated = SourceVersion::read(&source).unwrap();
+        assert_ne!(version, truncated);
+        let cached_bytes = fs::read(&cache_path).unwrap();
+        assert!(load_thumbnail(
+            Some(&cache_base),
+            &source,
+            8,
+            OutputColorSpace::Srgb,
+            truncated,
+            false
+        )
+        .is_err());
+        assert_eq!(fs::read(&cache_path).unwrap(), cached_bytes);
 
         fs::remove_dir_all(dir).unwrap();
     }

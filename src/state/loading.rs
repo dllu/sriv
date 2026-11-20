@@ -9,6 +9,34 @@ pub struct ImageRequest {
     pub generation: u64,
 }
 
+pub struct FileReload {
+    pub ready_at: Option<Instant>,
+    failures: usize,
+}
+
+impl FileReload {
+    pub fn new(ready_at: Instant) -> Self {
+        Self {
+            ready_at: Some(ready_at),
+            failures: 0,
+        }
+    }
+
+    pub fn retry(&mut self, now: Instant) -> bool {
+        const BACKOFF: [Duration; 3] = [
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(4),
+        ];
+        let Some(&delay) = BACKOFF.get(self.failures) else {
+            return false;
+        };
+        self.failures += 1;
+        self.ready_at = Some(now + delay);
+        true
+    }
+}
+
 #[derive(Debug)]
 pub enum EmbeddingState {
     WaitingForThumbnail,
@@ -186,7 +214,10 @@ impl ImageStates {
 #[derive(Debug)]
 enum FullImageState {
     InFlight(ImageRequest),
-    Failed { retry_at: Instant, error: String },
+    Failed {
+        retry_at: Option<Instant>,
+        error: String,
+    },
     Ready(TiledTexture),
 }
 
@@ -229,7 +260,7 @@ impl FullImageCache {
 
     pub fn retry_at(&self, index: usize) -> Option<Instant> {
         match self.entries.get(&index) {
-            Some(FullImageState::Failed { retry_at, .. }) => Some(*retry_at),
+            Some(FullImageState::Failed { retry_at, .. }) => *retry_at,
             _ => None,
         }
     }
@@ -248,7 +279,11 @@ impl FullImageCache {
                 return false;
             }
             Some(FullImageState::InFlight(_)) => return false,
-            Some(FullImageState::Failed { retry_at, .. }) if now < *retry_at => return false,
+            Some(FullImageState::Failed { retry_at, .. })
+                if retry_at.is_none_or(|retry_at| now < retry_at) =>
+            {
+                return false;
+            }
             _ => {}
         }
         self.entries
@@ -281,11 +316,22 @@ impl FullImageCache {
             self.entries.insert(
                 request.index,
                 FullImageState::Failed {
-                    retry_at: now + self.retry_delay,
+                    retry_at: Some(now + self.retry_delay),
                     error,
                 },
             );
         }
+    }
+
+    pub fn unavailable(&mut self, index: usize, error: String) {
+        self.invalidate(index);
+        self.entries.insert(
+            index,
+            FullImageState::Failed {
+                retry_at: None,
+                error,
+            },
+        );
     }
 
     pub fn invalidate(&mut self, index: usize) {
@@ -323,6 +369,18 @@ impl SelectionPreload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_reload_retries_back_off_and_stop_until_a_new_change() {
+        let now = Instant::now();
+        let mut reload = FileReload::new(now);
+        for seconds in [1, 2, 4] {
+            assert!(reload.retry(now));
+            assert_eq!(reload.ready_at, Some(now + Duration::from_secs(seconds)));
+        }
+        assert!(!reload.retry(now));
+        assert!(FileReload::new(now).retry(now));
+    }
 
     #[test]
     fn discovery_can_append_images_without_resetting_loaded_generations_or_progress() {

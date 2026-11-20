@@ -80,6 +80,9 @@ the graphics driver and does not change your desktop session. Ordinary
 
 ## usage
 
+Camera RAW files (ARW, CR2, DNG, etc.) are skipped. View their JPEG previews
+instead. RAW files are still checked for XMP sidecars to show the thumbnail badge.
+
 In single-image mode, press `=` for one image pixel per physical screen pixel,
 or `w` to fit the image to the window. The zoom indicator uses this physical
 pixel ratio, independently of display scaling. Thumbnails also keep their cached
@@ -102,7 +105,7 @@ sriv --private <image files or directories>
 ### semantic search
 
 sriv indexes your images with [Google SigLIP 2 Base at 512 pixels](https://huggingface.co/google/siglip2-base-patch16-512) via the [Hugging Face Candle](https://github.com/huggingface/candle) runtime. The model revision and preprocessing are pinned; its 768-dimensional embeddings are normalized for cosine similarity.
-The first launch downloads approximately 1.5 GB of model weights plus the tokenizer from the Hugging Face Hub. Embeddings and 512-pixel PNG thumbnails are cached in `${XDG_CACHE_HOME}/sriv/`. Thumbnail cache names include their size and color space; embedding cache names include the model revision and preprocessing version. Older caches are ignored and regenerated without deleting them.
+The model loads when an image needs an embedding or when you open search. The first load downloads approximately 1.5 GB of model weights plus the tokenizer from the Hugging Face Hub. Embeddings and 512-pixel PNG thumbnails are cached in `${XDG_CACHE_HOME}/sriv/`. Thumbnail cache names include their size and color space; embedding cache names include the model revision and preprocessing version. Older caches are ignored and regenerated without deleting them.
 
 - press `/` to focus the search bar and type a natural-language prompt. The bar glows purple when focused.
 - hit `Enter` to run the search; results are ranked by cosine similarity and highlighted at the top.

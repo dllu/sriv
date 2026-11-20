@@ -1,16 +1,17 @@
 use crate::image_io;
+use crate::source::SourceVersion;
 use crossbeam_channel::{bounded, Receiver, TryRecvError};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 pub type SharedImagePaths = Arc<RwLock<Vec<PathBuf>>>;
 
 pub struct DiscoveredImage {
     pub path: PathBuf,
-    pub modified: Option<SystemTime>,
+    pub version: Option<SourceVersion>,
 }
 
 pub enum LibraryUpdate {
@@ -141,9 +142,9 @@ fn discover_images(inputs: &[PathBuf], mut emit: impl FnMut(LibraryUpdate) -> bo
         if !image_io::is_supported_image_path(&path) {
             continue;
         }
-        let modified = fs::metadata(&path).and_then(|meta| meta.modified()).ok();
+        let version = SourceVersion::read(&path);
         image_paths.push(path.clone());
-        batch.push(DiscoveredImage { path, modified });
+        batch.push(DiscoveredImage { path, version });
         if image_paths.len() == 1
             || batch.len() >= 64
             || last_batch.elapsed() >= Duration::from_millis(16)
@@ -172,6 +173,7 @@ mod tests {
     use image::{ImageFormat, Rgb, RgbImage};
     use std::path::Path;
     use std::sync::mpsc::channel;
+    use std::time::SystemTime;
 
     struct TestDirectory(PathBuf);
 
@@ -214,7 +216,7 @@ mod tests {
                 LibraryUpdate::Images(images) => {
                     assert_eq!(images.len(), 1);
                     assert_eq!(images[0].path, first);
-                    assert!(images[0].modified.is_some());
+                    assert!(images[0].version.is_some());
                     discovered.extend(images.into_iter().map(|image| image.path));
                     // This would be too late if discovery inspected every image before
                     // making the first batch available to the thumbnail workers.

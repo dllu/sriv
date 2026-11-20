@@ -773,7 +773,10 @@ pub(crate) fn render(app: &App, model: &mut Model, renderer: &mut Renderer) -> R
                     .right_justify();
             } else {
                 let message = match model.full_images.error(model.current) {
-                    Some(error) => format!("{error} (retrying…)"),
+                    Some(error) if model.full_images.retry_at(model.current).is_some() => {
+                        format!("{error} (retrying…)")
+                    }
+                    Some(error) => error.to_string(),
                     None => "Loading...".to_string(),
                 };
                 draw.text(&message)
@@ -829,11 +832,11 @@ pub(crate) fn render(app: &App, model: &mut Model, renderer: &mut Renderer) -> R
         if let Some(error) = &model.clip_error {
             status_parts.push(error.clone());
         } else if pending > 0 {
-            status_parts.push(format!(
-                "pending embeddings: {} ({})",
-                pending,
-                model.clip_engine.device_kind()
-            ));
+            let mut status = format!("pending embeddings: {pending}");
+            if let Some(device) = model.clip_engine.device_kind() {
+                status.push_str(&format!(" ({device})"));
+            }
+            status_parts.push(status);
         }
         if failed > 0 {
             status_parts.push(format!("failed embeddings: {failed}"));

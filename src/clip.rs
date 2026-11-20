@@ -1,25 +1,27 @@
 use std::convert::TryInto;
-use std::fmt;
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 use anyhow::{anyhow, Context, Result};
+use candle::safetensors::MmapedSafetensors;
 use candle::{utils::cuda_is_available, DType, Device, Module, Tensor};
+use candle_nn::var_builder::SimpleBackend;
 use candle_nn::VarBuilder;
 use candle_transformers::models::{clip, siglip};
-use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TryRecvError};
 use image::imageops::FilterType;
 use sha1::Sha1;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 use crate::app::AppProxy;
 use crate::color::OutputColorSpace;
+use crate::source::SourceVersion;
 use crate::state::ImageRequest;
-use crate::thumbnails::{decode_thumbnail, DecodeOutcome, EncodedThumbnail};
+use crate::thumbnails::EncodedThumbnail;
 
 const MAX_IMAGE_BATCH: usize = 4;
 const MODEL_ID: &str = "google/siglip2-base-patch16-512";
@@ -63,42 +65,119 @@ struct Inference {
     image_size: usize,
 }
 
+struct ModelFiles {
+    config: siglip::Config,
+    tokenizer: Tokenizer,
+    weights: PathBuf,
+}
+
+impl ModelFiles {
+    fn fetch() -> Result<Self> {
+        let api = hf_hub::api::sync::ApiBuilder::from_env().build()?;
+        let repo = api.repo(hf_hub::Repo::with_revision(
+            MODEL_ID.to_string(),
+            hf_hub::RepoType::Model,
+            MODEL_REVISION.to_string(),
+        ));
+        Ok(Self {
+            config: serde_json::from_slice(&fs::read(repo.get("config.json")?)?)?,
+            tokenizer: load_tokenizer(repo.get("tokenizer.json")?)?,
+            weights: repo.get("model.safetensors")?,
+        })
+    }
+}
+
+struct ModelWeights<'a> {
+    tensors: MmapedSafetensors,
+    stop_rx: &'a Receiver<()>,
+}
+
+impl SimpleBackend for ModelWeights<'_> {
+    fn get(
+        &self,
+        shape: candle::Shape,
+        name: &str,
+        hints: candle_nn::Init,
+        dtype: DType,
+        device: &Device,
+    ) -> candle::Result<Tensor> {
+        if is_stopping(self.stop_rx) {
+            candle::bail!("SigLIP 2 model loading cancelled");
+        }
+        SimpleBackend::get(&self.tensors, shape, name, hints, dtype, device)
+    }
+
+    fn get_unchecked(&self, name: &str, dtype: DType, device: &Device) -> candle::Result<Tensor> {
+        if is_stopping(self.stop_rx) {
+            candle::bail!("SigLIP 2 model loading cancelled");
+        }
+        SimpleBackend::get_unchecked(&self.tensors, name, dtype, device)
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        SimpleBackend::contains_tensor(&self.tensors, name)
+    }
+}
+
 impl Inference {
-    fn load(use_cuda: bool, device_flag: &AtomicBool) -> Result<Self> {
+    fn load(
+        files: ModelFiles,
+        use_cuda: bool,
+        device_flag: &AtomicBool,
+        stop_rx: &Receiver<()>,
+    ) -> Result<Option<Self>> {
+        if is_stopping(stop_rx) {
+            return Ok(None);
+        }
         let device = if use_cuda {
             match Device::new_cuda(0) {
                 Ok(device) => device,
                 Err(error) => {
-                    eprintln!("Failed to initialize CUDA: {error}. Falling back to CPU.");
+                    if !is_stopping(stop_rx) {
+                        eprintln!("Failed to initialize CUDA: {error}. Falling back to CPU.");
+                    }
                     Device::Cpu
                 }
             }
         } else {
             Device::Cpu
         };
+        if is_stopping(stop_rx) {
+            return Ok(None);
+        }
         device_flag.store(device.is_cuda(), Ordering::Relaxed);
-        let api = hf_hub::api::sync::Api::new()?;
-        let repo = api.repo(hf_hub::Repo::with_revision(
-            MODEL_ID.to_string(),
-            hf_hub::RepoType::Model,
-            MODEL_REVISION.to_string(),
-        ));
-        let config: siglip::Config = serde_json::from_slice(&fs::read(repo.get("config.json")?)?)?;
-        let tokenizer = load_tokenizer(repo.get("tokenizer.json")?)?;
-        let weights = repo.get("model.safetensors")?;
+        let ModelFiles {
+            config,
+            tokenizer,
+            weights,
+        } = files;
         let dtype = if device.is_cuda() {
             DType::F16
         } else {
             DType::F32
         };
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], dtype, &device)? };
-        let model = EmbeddingModel::new(&config, vb)?;
-        Ok(Self {
+        let tensors = unsafe { MmapedSafetensors::new(weights)? };
+        let vb = VarBuilder::from_backend(
+            Box::new(ModelWeights { tensors, stop_rx }),
+            dtype,
+            device.clone(),
+        );
+        let model = EmbeddingModel::new(&config, vb);
+        let model = if is_stopping(stop_rx) {
+            drop(model);
+            Ok(None)
+        } else {
+            model.map(Some)
+        };
+        if device.is_cuda() && !matches!(model, Ok(Some(_))) {
+            let _ = device.synchronize();
+        }
+        Ok(model?.map(|model| Self {
             model,
             tokenizer,
             device,
             image_size: config.vision_config.image_size,
-        })
+        }))
     }
 }
 
@@ -122,6 +201,9 @@ fn load_tokenizer(path: PathBuf) -> Result<Tokenizer> {
 /// Events emitted by the background SigLIP 2 worker.
 #[derive(Debug)]
 pub enum ClipEvent {
+    SourceChanged {
+        request: ImageRequest,
+    },
     ImageReady {
         request: ImageRequest,
         embedding: Vec<f32>,
@@ -147,6 +229,7 @@ pub enum ClipEvent {
 struct ImageJob {
     request: ImageRequest,
     image_path: PathBuf,
+    version: SourceVersion,
     thumbnail: EncodedThumbnail,
 }
 
@@ -156,44 +239,35 @@ struct TextJob {
 }
 
 /// Manages SigLIP 2 inference in a background thread and caching of embeddings.
-#[derive(Debug)]
 pub struct ClipEngine {
+    cache_base: Option<PathBuf>,
+    proxy: AppProxy,
+    output_color_space: OutputColorSpace,
+    workers: Option<ClipWorkers>,
+}
+
+struct ClipWorkers {
     job_tx: Sender<ImageJob>,
     text_tx: Sender<TextJob>,
     result_rx: Receiver<ClipEvent>,
     using_cuda: Arc<AtomicBool>,
+    threads: ClipWorkerThreads,
 }
 
-#[derive(Clone)]
-pub struct ClipRequestSender {
-    job_tx: Sender<ImageJob>,
+/// Inference must finish dropping its CUDA resources before the process exits.
+pub(crate) struct ClipWorkerThreads {
+    stop_tx: Option<Sender<()>>,
+    handles: Vec<JoinHandle<()>>,
 }
 
-impl ClipRequestSender {
-    pub fn queue_image(
-        &self,
-        request: ImageRequest,
-        image_path: PathBuf,
-        thumbnail: EncodedThumbnail,
-    ) -> Result<()> {
-        self.job_tx
-            .send(ImageJob {
-                request,
-                image_path,
-                thumbnail,
-            })
-            .map_err(|err| anyhow!("failed to queue clip image job: {err}"))
-    }
-}
-
-#[derive(Clone)]
 struct ClipWorkerContext {
     cache_base: Option<PathBuf>,
-    inference: Arc<OnceLock<std::result::Result<Inference, String>>>,
+    inference: Arc<OnceLock<Option<Inference>>>,
     output_color_space: OutputColorSpace,
     result_tx: Sender<ClipEvent>,
     device_flag: Arc<AtomicBool>,
     proxy: AppProxy,
+    stop_rx: Receiver<()>,
 }
 
 impl ClipEngine {
@@ -201,10 +275,94 @@ impl ClipEngine {
         cache_base: Option<PathBuf>,
         proxy: AppProxy,
         output_color_space: OutputColorSpace,
+    ) -> Self {
+        Self {
+            cache_base,
+            proxy,
+            output_color_space,
+            workers: None,
+        }
+    }
+
+    /// Opening search starts loading while the user types their query.
+    pub fn warm_up(&mut self) -> Result<()> {
+        if self.workers.is_none() {
+            self.workers = Some(ClipWorkers::start(
+                self.cache_base.clone(),
+                &self.proxy,
+                self.output_color_space,
+            )?);
+        }
+        Ok(())
+    }
+
+    pub fn queue_image(
+        &mut self,
+        request: ImageRequest,
+        image_path: PathBuf,
+        version: SourceVersion,
+        thumbnail: EncodedThumbnail,
+    ) -> Result<()> {
+        self.warm_up()?;
+        self.workers
+            .as_ref()
+            .unwrap()
+            .job_tx
+            .send(ImageJob {
+                request,
+                image_path,
+                version,
+                thumbnail,
+            })
+            .map_err(|_| anyhow!("SigLIP 2 workers stopped"))
+    }
+
+    pub fn request_text(&mut self, request_id: u64, query: String) -> Result<()> {
+        self.warm_up()?;
+        self.workers
+            .as_ref()
+            .unwrap()
+            .text_tx
+            .send(TextJob { request_id, query })
+            .map_err(|_| anyhow!("SigLIP 2 workers stopped"))
+    }
+
+    pub fn try_recv(&self) -> Result<ClipEvent, TryRecvError> {
+        self.workers
+            .as_ref()
+            .ok_or(TryRecvError::Empty)?
+            .result_rx
+            .try_recv()
+    }
+
+    pub fn device_kind(&self) -> Option<&'static str> {
+        self.workers.as_ref().map(|workers| {
+            if workers.using_cuda.load(Ordering::Relaxed) {
+                "GPU"
+            } else {
+                "CPU"
+            }
+        })
+    }
+
+    /// Signal cancellation now. Dropping the returned handle waits for the workers.
+    pub(crate) fn stop(&mut self) -> Option<ClipWorkerThreads> {
+        let mut workers = self.workers.take()?;
+        workers.threads.stop();
+        Some(workers.threads)
+    }
+}
+
+impl ClipWorkers {
+    fn start(
+        cache_base: Option<PathBuf>,
+        proxy: &AppProxy,
+        output_color_space: OutputColorSpace,
     ) -> Result<Self> {
         let (job_tx, job_rx) = unbounded::<ImageJob>();
         let (text_tx, text_rx) = unbounded::<TextJob>();
         let (result_tx, result_rx) = unbounded::<ClipEvent>();
+        let (stop_tx, stop_rx) = bounded::<()>(0);
         let inference = Arc::new(OnceLock::new());
         let want_cuda = cuda_is_available();
         let using_cuda = Arc::new(AtomicBool::new(false));
@@ -212,6 +370,17 @@ impl ClipEngine {
             1
         } else {
             num_cpus::get().clamp(1, 8)
+        };
+        // Drop also joins any workers started before a later thread spawn fails.
+        let mut workers = Self {
+            job_tx,
+            text_tx,
+            result_rx,
+            using_cuda: using_cuda.clone(),
+            threads: ClipWorkerThreads {
+                stop_tx: Some(stop_tx),
+                handles: Vec::with_capacity(worker_count),
+            },
         };
         for worker_idx in 0..worker_count {
             let worker_ctx = ClipWorkerContext {
@@ -221,58 +390,71 @@ impl ClipEngine {
                 result_tx: result_tx.clone(),
                 device_flag: using_cuda.clone(),
                 proxy: proxy.clone(),
+                stop_rx: stop_rx.clone(),
             };
             let worker_rx = job_rx.clone();
             let worker_text_rx = text_rx.clone();
-            thread::Builder::new()
+            let worker = thread::Builder::new()
                 .name(format!("clip-worker-{worker_idx}"))
                 .spawn(move || {
                     let proxy = worker_ctx.proxy.clone();
-                    if let Err(err) = run_worker(worker_ctx, worker_rx, worker_text_rx, want_cuda) {
-                        eprintln!("clip worker terminated: {err:#}");
-                    }
+                    let stop_rx = worker_ctx.stop_rx.clone();
+                    run_worker(worker_ctx, worker_rx, worker_text_rx, want_cuda);
                     // The last worker dropping its sender disconnects result_rx. Wake the UI
                     // so pending work becomes a visible failure even without further input.
-                    proxy.wakeup();
+                    if !is_stopping(&stop_rx) {
+                        proxy.wakeup();
+                    }
                 })
                 .context("failed to spawn clip worker thread")?;
+            workers.threads.handles.push(worker);
         }
-        drop(job_rx);
-        drop(text_rx);
         drop(result_tx);
-        Ok(Self {
-            job_tx,
-            text_tx,
-            result_rx,
-            using_cuda,
-        })
+        Ok(workers)
     }
+}
 
-    pub fn request_sender(&self) -> ClipRequestSender {
-        ClipRequestSender {
-            job_tx: self.job_tx.clone(),
+impl ClipWorkerThreads {
+    fn stop(&mut self) {
+        // Disconnecting a separate channel wakes every worker ahead of queued jobs.
+        drop(self.stop_tx.take());
+    }
+}
+
+impl Drop for ClipWorkerThreads {
+    fn drop(&mut self) {
+        self.stop();
+        for worker in self.handles.drain(..) {
+            let _ = worker.join();
         }
     }
+}
 
-    /// Requests a text embedding for the given query string.
-    pub fn request_text(&self, request_id: u64, query: String) -> Result<()> {
-        self.text_tx
-            .send(TextJob { request_id, query })
-            .map_err(|err| anyhow!("failed to queue clip text job: {err}"))
-    }
+fn is_stopping(stop_rx: &Receiver<()>) -> bool {
+    matches!(stop_rx.try_recv(), Err(TryRecvError::Disconnected))
+}
 
-    /// Attempts to retrieve the next event from the worker without blocking.
-    pub fn try_recv(&self) -> Result<ClipEvent, TryRecvError> {
-        self.result_rx.try_recv()
+fn load_inference(
+    use_cuda: bool,
+    device_flag: &AtomicBool,
+    stop_rx: &Receiver<()>,
+) -> Result<Option<Inference>> {
+    if is_stopping(stop_rx) {
+        return Ok(None);
     }
-
-    pub fn device_kind(&self) -> &'static str {
-        if self.using_cuda.load(Ordering::Relaxed) {
-            "GPU"
-        } else {
-            "CPU"
-        }
-    }
+    // The Hub's blocking download has no cancellation API. Keep network I/O on a
+    // separate thread so closing the app never has to wait for it to acquire model files.
+    let (tx, rx) = bounded(1);
+    thread::Builder::new()
+        .name("siglip-model-files".into())
+        .spawn(move || {
+            let _ = tx.send(ModelFiles::fetch());
+        })?;
+    let files = crossbeam_channel::select_biased! {
+        recv(stop_rx) -> _ => return Ok(None),
+        recv(rx) -> files => files.context("model files worker stopped")??,
+    };
+    Inference::load(files, use_cuda, device_flag, stop_rx)
 }
 
 fn run_worker(
@@ -280,7 +462,7 @@ fn run_worker(
     job_rx: Receiver<ImageJob>,
     text_rx: Receiver<TextJob>,
     use_cuda: bool,
-) -> Result<()> {
+) {
     let ClipWorkerContext {
         cache_base,
         inference,
@@ -288,14 +470,22 @@ fn run_worker(
         result_tx,
         device_flag,
         proxy,
+        stop_rx,
     } = ctx;
     // CPU workers share the weights instead of each allocating another 1.5 GB model.
-    let inference = inference
-        .get_or_init(|| {
-            Inference::load(use_cuda, &device_flag).map_err(|error| format!("{error:#}"))
+    let Some(inference) =
+        inference.get_or_init(|| match load_inference(use_cuda, &device_flag, &stop_rx) {
+            Ok(inference) => inference,
+            Err(error) => {
+                if !is_stopping(&stop_rx) {
+                    eprintln!("Failed to load SigLIP 2: {error:#}");
+                }
+                None
+            }
         })
-        .as_ref()
-        .map_err(|error| anyhow!(error.clone()))?;
+    else {
+        return;
+    };
     let model = &inference.model;
     let device = &inference.device;
     let image_ctx = ImageBatchContext {
@@ -306,6 +496,7 @@ fn run_worker(
         output_color_space,
         result_tx: &result_tx,
         proxy: &proxy,
+        stop_rx: &stop_rx,
     };
     let text_ctx = TextJobContext {
         model,
@@ -317,6 +508,7 @@ fn run_worker(
     loop {
         // Queries can run between image batches even while thousands of images await indexing.
         crossbeam_channel::select_biased! {
+            recv(stop_rx) -> _ => break,
             recv(text_rx) -> job => {
                 let Ok(job) = job else { break; };
                 handle_text_job(job.request_id, &job.query, &text_ctx);
@@ -335,7 +527,10 @@ fn run_worker(
             }
         }
     }
-    Ok(())
+    // CUDA work and object destruction complete before the process can tear down the driver.
+    if device.is_cuda() {
+        let _ = device.synchronize();
+    }
 }
 
 fn handle_text_job(request_id: u64, query: &str, ctx: &TextJobContext<'_>) {
@@ -364,31 +559,39 @@ fn handle_text_job(request_id: u64, query: &str, ctx: &TextJobContext<'_>) {
 }
 
 fn process_image_batch(batch: Vec<ImageJob>, ctx: &ImageBatchContext<'_>) {
-    let mut compute_indices = Vec::new();
-    let mut compute_paths = Vec::new();
+    let mut compute_jobs = Vec::new();
     let mut compute_tensors = Vec::new();
 
-    for ImageJob {
-        request,
-        image_path,
-        thumbnail: thumb,
-    } in batch
-    {
-        let decoded = match decode_thumbnail(&thumb) {
-            DecodeOutcome::Ready(image) => image,
-            DecodeOutcome::Regenerate(error) => {
-                send_result(
-                    ctx.result_tx,
-                    ctx.proxy,
-                    ClipEvent::ThumbnailError { request, error },
-                );
+    for job in batch {
+        if is_stopping(ctx.stop_rx) {
+            return;
+        }
+        if !ctx.source_is_current(&job) {
+            continue;
+        }
+        let request = job.request;
+        let decoded = match job.thumbnail.decode() {
+            Ok(image) => image,
+            Err(error) => {
+                if ctx.source_is_current(&job) {
+                    let error = error.to_string();
+                    let event = if job.thumbnail.cached {
+                        ClipEvent::ThumbnailError { request, error }
+                    } else {
+                        ClipEvent::ImageError { request, error }
+                    };
+                    send_result(ctx.result_tx, ctx.proxy, event);
+                }
                 continue;
             }
         };
-        match tensor_from_image(&decoded, ctx.clip_image_size, ctx.output_color_space) {
+        let tensor = tensor_from_image(&decoded, ctx.clip_image_size, ctx.output_color_space);
+        if !ctx.source_is_current(&job) {
+            continue;
+        }
+        match tensor {
             Ok(tensor) => {
-                compute_indices.push(request);
-                compute_paths.push(image_path);
+                compute_jobs.push(job);
                 compute_tensors.push(tensor);
             }
             Err(err) => {
@@ -404,50 +607,58 @@ fn process_image_batch(batch: Vec<ImageJob>, ctx: &ImageBatchContext<'_>) {
         }
     }
 
-    if compute_tensors.is_empty() {
+    if compute_tensors.is_empty() || is_stopping(ctx.stop_rx) {
         return;
     }
 
-    let tensor_refs: Vec<&Tensor> = compute_tensors.iter().collect();
-    let stacked = match Tensor::stack(&tensor_refs, 0) {
-        Ok(t) => t,
-        Err(err) => {
-            report_batch_error(&compute_indices, ctx.result_tx, ctx.proxy, err);
-            return;
-        }
-    };
-
-    let stacked = match stacked.to_device(ctx.device) {
-        Ok(t) => t,
-        Err(err) => {
-            report_batch_error(&compute_indices, ctx.result_tx, ctx.proxy, err);
-            return;
-        }
-    };
-
-    match image_embeddings(ctx.model, stacked) {
+    let embeddings = Tensor::stack(&compute_tensors, 0)
+        .and_then(|stacked| stacked.to_device(ctx.device))
+        .map_err(anyhow::Error::from)
+        .and_then(|stacked| image_embeddings(ctx.model, stacked));
+    if is_stopping(ctx.stop_rx) {
+        return;
+    }
+    match embeddings {
         Ok(embeddings) => {
-            for ((request, path), embedding) in compute_indices
-                .into_iter()
-                .zip(compute_paths)
-                .zip(embeddings)
-            {
-                if let Err(err) = cache_embedding(ctx.cache_base, &path, &embedding) {
+            for (job, embedding) in compute_jobs.into_iter().zip(embeddings) {
+                if !ctx.source_is_current(&job) {
+                    continue;
+                }
+                if let Err(err) =
+                    cache_embedding(ctx.cache_base, &job.image_path, job.version, &embedding)
+                {
                     eprintln!(
                         "Failed to cache SigLIP 2 embedding for {}: {err}",
-                        path.display()
+                        job.image_path.display()
                     );
                 }
                 // A disk-cache failure must not discard a successfully computed embedding.
-                send_result(
-                    ctx.result_tx,
-                    ctx.proxy,
-                    ClipEvent::ImageReady { request, embedding },
-                );
+                if ctx.source_is_current(&job) {
+                    send_result(
+                        ctx.result_tx,
+                        ctx.proxy,
+                        ClipEvent::ImageReady {
+                            request: job.request,
+                            embedding,
+                        },
+                    );
+                }
             }
         }
-        Err(err) => {
-            report_batch_error(&compute_indices, ctx.result_tx, ctx.proxy, err);
+        Err(error) => {
+            let error = format!("{error:#}");
+            for job in &compute_jobs {
+                if ctx.source_is_current(job) {
+                    send_result(
+                        ctx.result_tx,
+                        ctx.proxy,
+                        ClipEvent::ImageError {
+                            request: job.request,
+                            error: error.clone(),
+                        },
+                    );
+                }
+            }
         }
     }
 }
@@ -455,25 +666,6 @@ fn process_image_batch(batch: Vec<ImageJob>, ctx: &ImageBatchContext<'_>) {
 fn send_result(result_tx: &Sender<ClipEvent>, proxy: &AppProxy, event: ClipEvent) {
     if result_tx.send(event).is_ok() {
         proxy.wakeup();
-    }
-}
-
-fn report_batch_error(
-    indices: &[ImageRequest],
-    result_tx: &Sender<ClipEvent>,
-    proxy: &AppProxy,
-    err: impl fmt::Display,
-) {
-    let msg = format!("{}", err);
-    for &request in indices {
-        send_result(
-            result_tx,
-            proxy,
-            ClipEvent::ImageError {
-                request,
-                error: msg.clone(),
-            },
-        );
     }
 }
 
@@ -485,6 +677,23 @@ struct ImageBatchContext<'a> {
     output_color_space: OutputColorSpace,
     result_tx: &'a Sender<ClipEvent>,
     proxy: &'a AppProxy,
+    stop_rx: &'a Receiver<()>,
+}
+
+impl ImageBatchContext<'_> {
+    fn source_is_current(&self, job: &ImageJob) -> bool {
+        if job.version.matches(&job.image_path) {
+            return true;
+        }
+        send_result(
+            self.result_tx,
+            self.proxy,
+            ClipEvent::SourceChanged {
+                request: job.request,
+            },
+        );
+        false
+    }
 }
 
 struct TextJobContext<'a> {
@@ -555,50 +764,38 @@ fn image_embeddings(model: &EmbeddingModel, tensor: Tensor) -> Result<Vec<Vec<f3
     Ok(features.to_vec2::<f32>()?)
 }
 
-fn write_embedding(path: &Path, embedding: &[f32]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("clip");
-    let tmp_path = path.with_extension(format!("{ext}.tmp"));
-    {
-        let mut file = File::create(&tmp_path)?;
-        let len = embedding.len() as u32;
-        file.write_all(&len.to_le_bytes())?;
-        for value in embedding {
-            file.write_all(&value.to_le_bytes())?;
-        }
-        file.sync_all()?;
-    }
-    fs::rename(tmp_path, path)?;
-    Ok(())
+fn embedding_bytes(embedding: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(4 + 4 * embedding.len());
+    bytes.extend_from_slice(&(embedding.len() as u32).to_le_bytes());
+    bytes.extend(embedding.iter().flat_map(|value| value.to_le_bytes()));
+    bytes
 }
 
-fn cache_embedding(cache_base: Option<&Path>, image_path: &Path, embedding: &[f32]) -> Result<()> {
+fn cache_embedding(
+    cache_base: Option<&Path>,
+    image_path: &Path,
+    version: SourceVersion,
+    embedding: &[f32],
+) -> Result<()> {
     if let Some(base) = cache_base {
-        write_embedding(
+        version.write_cache(
+            image_path,
             &cache_file_path(base, image_path, EMBEDDING_CACHE_EXTENSION),
-            embedding,
+            &embedding_bytes(embedding),
         )?;
     }
     Ok(())
 }
 
-pub fn load_cached_embedding(cache_base: &Path, image_path: &Path) -> Result<Option<Vec<f32>>> {
+pub fn load_cached_embedding(
+    cache_base: &Path,
+    image_path: &Path,
+    version: SourceVersion,
+) -> Result<Option<Vec<f32>>> {
     let embed_path = cache_file_path(cache_base, image_path, EMBEDDING_CACHE_EXTENSION);
-    let embed_meta = match fs::metadata(&embed_path) {
-        Ok(meta) => meta,
-        Err(_) => return Ok(None),
+    let Some(mut file) = version.open_cache(&embed_path) else {
+        return Ok(None);
     };
-    let image_meta = fs::metadata(image_path).ok();
-    let image_mtime = image_meta.and_then(|m| m.modified().ok());
-    let embed_mtime = embed_meta.modified().ok();
-    if let (Some(img_time), Some(emb_time)) = (image_mtime, embed_mtime) {
-        if emb_time < img_time {
-            return Ok(None);
-        }
-    }
-    let mut file = File::open(&embed_path)?;
     let mut header = [0u8; 4];
     file.read_exact(&mut header)?;
     let len = u32::from_le_bytes(header) as usize;
@@ -631,7 +828,7 @@ pub fn cache_file_path(cache_base: &Path, image_path: &Path, extension: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn siglip_preprocessing_preserves_both_edges_and_normalizes_rgb() {
@@ -653,7 +850,15 @@ mod tests {
     #[ignore = "downloads SigLIP 2 weights; set SRIV_SEARCH_TEST_IMAGE to a cat photograph"]
     fn siglip2_inference_smoke() {
         let started = std::time::Instant::now();
-        let inference = Inference::load(cuda_is_available(), &AtomicBool::new(false)).unwrap();
+        let (_stop_tx, stop_rx) = bounded(0);
+        let inference = Inference::load(
+            ModelFiles::fetch().unwrap(),
+            cuda_is_available(),
+            &AtomicBool::new(false),
+            &stop_rx,
+        )
+        .unwrap()
+        .unwrap();
         eprintln!(
             "model loaded on {:?} in {:?}",
             inference.device,
@@ -763,6 +968,71 @@ mod tests {
     }
 
     #[test]
+    fn stopping_worker_skips_model_fetch() {
+        let (stop_tx, stop_rx) = bounded(0);
+        drop(stop_tx);
+        assert!(load_inference(false, &AtomicBool::new(false), &stop_rx)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn stopping_workers_signals_cancellation_before_waiting_for_them() {
+        let (stop_tx, stop_rx) = bounded(0);
+        let (resume_tx, resume_rx) = bounded(0);
+        let (finished_tx, finished_rx) = bounded(1);
+        let timeout = Duration::from_secs(2);
+        let worker = thread::spawn(move || {
+            assert!(stop_rx.recv().is_err());
+            resume_rx.recv_timeout(timeout).unwrap();
+            finished_tx.send(()).unwrap();
+        });
+        let mut threads = ClipWorkerThreads {
+            stop_tx: Some(stop_tx),
+            handles: vec![worker],
+        };
+        threads.stop();
+        resume_tx.send_timeout((), timeout).unwrap();
+        drop(threads);
+        assert_eq!(finished_rx.try_recv(), Ok(()));
+    }
+
+    #[test]
+    fn model_weight_loading_stops_between_tensors() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "sriv-test-weights-{}-{unique}.safetensors",
+            std::process::id()
+        ));
+        Tensor::new(&[1.0f32, 2.0], &Device::Cpu)
+            .unwrap()
+            .save_safetensors("weight", &path)
+            .unwrap();
+        let (stop_tx, stop_rx) = bounded(0);
+        let tensors = unsafe { MmapedSafetensors::new(&path) }.unwrap();
+        let vb = VarBuilder::from_backend(
+            Box::new(ModelWeights {
+                tensors,
+                stop_rx: &stop_rx,
+            }),
+            DType::F32,
+            Device::Cpu,
+        );
+        assert_eq!(
+            vb.get(2, "weight").unwrap().to_vec1::<f32>().unwrap(),
+            vec![1.0, 2.0]
+        );
+        drop(stop_tx);
+        assert!(vb.get(2, "weight").is_err());
+        assert!(vb.get_unchecked("weight").is_err());
+        drop(vb);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn private_embedding_skips_disk_cache() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -772,28 +1042,44 @@ mod tests {
             std::env::temp_dir().join(format!("sriv-private-clip-{}-{unique}", std::process::id()));
         let image_path = dir.join("image.png");
         let embedding = [0.1; EMBEDDING_DIM];
-        cache_embedding(None, &image_path, &embedding).unwrap();
-        assert!(!dir.exists());
+        fs::create_dir(&dir).unwrap();
+        fs::write(&image_path, b"source image").unwrap();
+        let version = SourceVersion::read(&image_path).unwrap();
 
         let cache_base = dir.join("cache");
-        cache_embedding(Some(&cache_base), &image_path, &embedding).unwrap();
+        cache_embedding(None, &image_path, version, &embedding).unwrap();
+        assert!(!cache_base.exists());
+        cache_embedding(Some(&cache_base), &image_path, version, &embedding).unwrap();
         assert_eq!(
-            load_cached_embedding(&cache_base, &image_path).unwrap(),
+            load_cached_embedding(&cache_base, &image_path, version).unwrap(),
             Some(embedding.to_vec())
         );
         // The original CLIP cache is never used, even if it is newer than the source.
         let legacy = dir.join("legacy.png");
-        write_embedding(&cache_file_path(&cache_base, &legacy, "clip"), &embedding).unwrap();
-        assert!(load_cached_embedding(&cache_base, &legacy)
+        fs::write(&legacy, b"another image").unwrap();
+        let legacy_version = SourceVersion::read(&legacy).unwrap();
+        legacy_version
+            .write_cache(
+                &legacy,
+                &cache_file_path(&cache_base, &legacy, "clip"),
+                &embedding_bytes(&embedding),
+            )
+            .unwrap();
+        assert!(load_cached_embedding(&cache_base, &legacy, legacy_version)
             .unwrap()
             .is_none());
-        let current = cache_file_path(&cache_base, &image_path, EMBEDDING_CACHE_EXTENSION);
-        write_embedding(&current, &[0.0; 512]).unwrap();
-        assert!(load_cached_embedding(&cache_base, &image_path)
+        cache_embedding(Some(&cache_base), &image_path, version, &[0.0; 512]).unwrap();
+        assert!(load_cached_embedding(&cache_base, &image_path, version)
             .unwrap()
             .is_none());
-        write_embedding(&current, &[f32::NAN; EMBEDDING_DIM]).unwrap();
-        assert!(load_cached_embedding(&cache_base, &image_path)
+        cache_embedding(
+            Some(&cache_base),
+            &image_path,
+            version,
+            &[f32::NAN; EMBEDDING_DIM],
+        )
+        .unwrap();
+        assert!(load_cached_embedding(&cache_base, &image_path, version)
             .unwrap()
             .is_none());
         fs::remove_dir_all(dir).unwrap();

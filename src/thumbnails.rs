@@ -5,7 +5,6 @@ use crossbeam_channel::{unbounded, Receiver, TryRecvError};
 use image::{DynamicImage, ImageDecoder, ImageEncoder};
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
-use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
@@ -19,7 +18,7 @@ const DECODED_CACHE_BYTES: usize = 128 * 1024 * 1024;
 pub struct EncodedThumbnail {
     pub bytes: Arc<[u8]>,
     pub size: [u32; 2],
-    pub cached_path: Option<Arc<PathBuf>>,
+    pub cached: bool,
 }
 
 impl EncodedThumbnail {
@@ -35,7 +34,7 @@ impl EncodedThumbnail {
         Ok(Self {
             bytes: bytes.into(),
             size: [width, height],
-            cached_path: None,
+            cached: false,
         })
     }
 
@@ -199,23 +198,10 @@ pub enum DecodeOutcome {
 pub(crate) fn decode_thumbnail(image: &EncodedThumbnail) -> DecodeOutcome {
     match image.decode() {
         Ok(image) => DecodeOutcome::Ready(image),
+        Err(error) if image.cached => DecodeOutcome::Regenerate(error.to_string()),
         Err(error) => {
-            // Corrupt disk entries are removed off the event loop, then regenerated.
-            if let Some(path) = &image.cached_path {
-                match std::fs::remove_file(path.as_ref()) {
-                    Ok(()) => DecodeOutcome::Regenerate(error.to_string()),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        DecodeOutcome::Regenerate(error.to_string())
-                    }
-                    Err(err) => {
-                        eprintln!("Failed to remove corrupt thumbnail: {error}; {err}");
-                        DecodeOutcome::Ready(crate::image_io::fallback_thumbnail())
-                    }
-                }
-            } else {
-                eprintln!("Failed to decode in-memory thumbnail: {error}");
-                DecodeOutcome::Ready(crate::image_io::fallback_thumbnail())
-            }
+            eprintln!("Failed to decode in-memory thumbnail: {error}");
+            DecodeOutcome::Ready(crate::image_io::fallback_thumbnail())
         }
     }
 }
@@ -396,27 +382,17 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_pixels_are_detected_during_decode_and_removed_for_regeneration() {
+    fn corrupt_cached_pixels_request_regeneration() {
         let mut bytes = thumbnail().bytes.to_vec();
         let idat = bytes.windows(4).position(|chunk| chunk == b"IDAT").unwrap();
         bytes[idat + 4] ^= 0xff;
         // Header validation deliberately leaves decompression to a viewport/indexing worker.
         let mut thumbnail = EncodedThumbnail::from_png(bytes).unwrap();
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "sriv-corrupt-thumbnail-{}-{unique}.png",
-            std::process::id()
-        ));
-        std::fs::write(&path, &thumbnail.bytes).unwrap();
-        thumbnail.cached_path = Some(Arc::new(path.clone()));
+        thumbnail.cached = true;
         assert!(matches!(
             decode_thumbnail(&thumbnail),
             DecodeOutcome::Regenerate(_)
         ));
-        assert!(!path.exists());
     }
 
     #[test]

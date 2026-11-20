@@ -3,6 +3,7 @@ use crate::geometry::{Rect, Vec2};
 use crate::input::Key;
 use crate::library::LibraryState;
 use crate::renderer::GpuTexture;
+use crate::source::{SourceOutcome, SourceRequest, SourceVersion};
 use crate::thumbnails::{EncodedThumbnail, ThumbnailDecoder, ThumbnailStore};
 use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender};
 use portable_pty::MasterPty;
@@ -10,13 +11,15 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use toml::Value as TomlValue;
 use vt100::Parser;
 
 mod loading;
 mod search;
-pub use loading::{EmbeddingState, FullImageCache, ImageRequest, ImageStates, SelectionPreload};
+pub use loading::{
+    EmbeddingState, FileReload, FullImageCache, ImageRequest, ImageStates, SelectionPreload,
+};
 pub use search::{SearchPhase, SearchState};
 
 #[derive(Debug)]
@@ -50,7 +53,7 @@ struct ThumbQueueInner {
 #[derive(Debug, Default)]
 struct ThumbQueueState {
     order: VecDeque<usize>,
-    members: HashMap<usize, u64>,
+    members: HashMap<usize, SourceRequest>,
     closed: bool,
 }
 
@@ -64,13 +67,13 @@ impl ThumbRequestQueue {
         }
     }
 
-    pub fn enqueue(&self, request: ImageRequest) {
+    pub fn enqueue(&self, request: SourceRequest) {
         self.enqueue_batch(std::iter::once(request));
     }
 
     pub fn enqueue_batch<I>(&self, indices: I)
     where
-        I: IntoIterator<Item = ImageRequest>,
+        I: IntoIterator<Item = SourceRequest>,
     {
         let mut state = self.inner.state.lock().unwrap();
         if state.closed {
@@ -78,12 +81,9 @@ impl ThumbRequestQueue {
         }
         let mut inserted = false;
         for request in indices {
-            if state
-                .members
-                .insert(request.index, request.generation)
-                .is_none()
-            {
-                state.order.push_back(request.index);
+            let index = request.request.index;
+            if state.members.insert(index, request).is_none() {
+                state.order.push_back(index);
                 inserted = true;
             }
         }
@@ -92,15 +92,11 @@ impl ThumbRequestQueue {
         }
     }
 
-    pub fn pop(&self) -> Option<ImageRequest> {
+    pub fn pop(&self) -> Option<SourceRequest> {
         let mut state = self.inner.state.lock().unwrap();
         loop {
             if let Some(idx) = state.order.pop_front() {
-                let generation = state.members.remove(&idx).unwrap();
-                return Some(ImageRequest {
-                    index: idx,
-                    generation,
-                });
+                return state.members.remove(&idx);
             }
             if state.closed {
                 return None;
@@ -133,6 +129,8 @@ impl ThumbRequestQueue {
     pub fn close(&self) {
         let mut state = self.inner.state.lock().unwrap();
         state.closed = true;
+        state.order.clear();
+        state.members.clear();
         self.inner.condvar.notify_all();
     }
 }
@@ -263,17 +261,9 @@ pub struct FullImageFrame {
 }
 
 #[derive(Debug)]
-pub enum FullImageMessage {
-    Loaded {
-        request: ImageRequest,
-        full_w: u32,
-        full_h: u32,
-        frames: Vec<FullImageFrame>,
-    },
-    Failed {
-        request: ImageRequest,
-        error: String,
-    },
+pub struct FullImageMessage {
+    pub request: ImageRequest,
+    pub outcome: SourceOutcome<(u32, u32, Vec<FullImageFrame>)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -392,8 +382,13 @@ impl TiledTexture {
 #[derive(Debug)]
 pub struct ThumbnailUpdate {
     pub request: ImageRequest,
+    pub outcome: SourceOutcome<ThumbnailData>,
+}
+
+#[derive(Debug)]
+pub struct ThumbnailData {
     pub image: EncodedThumbnail,
-    pub embedding: EmbeddingState,
+    pub cached_embedding: Option<Vec<f32>>,
 }
 
 #[derive(Debug)]
@@ -476,10 +471,11 @@ pub struct Model {
     pub thumb_has_xmp: Vec<bool>,
     pub thumb_rx: Receiver<ThumbnailUpdate>,
     pub thumb_queue: ThumbRequestQueue,
-    pub file_mod_times: Vec<Option<SystemTime>>,
+    pub file_versions: Vec<Option<SourceVersion>>,
+    pub file_reloads: HashMap<usize, FileReload>,
     pub image_states: ImageStates,
     pub file_watch_cursor: usize,
-    pub full_req_tx: CbSender<ImageRequest>,
+    pub full_req_tx: CbSender<SourceRequest>,
     pub full_resp_rx: CbReceiver<FullImageMessage>,
     pub full_images: FullImageCache,
     pub mode: Mode,
@@ -525,42 +521,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn thumbnail_queue_keeps_the_latest_generation_and_drains_on_close() {
+    fn thumbnail_queue_keeps_the_latest_generation_and_discards_work_on_close() {
         let queue = ThumbRequestQueue::new();
-        queue.enqueue_batch([
-            ImageRequest {
-                index: 0,
-                generation: 0,
-            },
-            ImageRequest {
-                index: 1,
-                generation: 0,
-            },
-        ]);
-        queue.enqueue(ImageRequest {
-            index: 0,
-            generation: 1,
-        });
+        let version = SourceVersion::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("Cargo.toml")
+                .as_path(),
+        )
+        .unwrap();
+        let request = |index, generation| SourceRequest {
+            request: ImageRequest { index, generation },
+            version,
+            read_cache: generation == 0,
+        };
+        queue.enqueue_batch([request(0, 0), request(1, 0), request(2, 0)]);
+        queue.enqueue(request(1, 1));
         queue.reprioritize(|index| -(index as f32));
+        assert_eq!(queue.pop(), Some(request(2, 0)));
+        assert_eq!(queue.pop(), Some(request(1, 1)));
         queue.close();
-        queue.enqueue(ImageRequest {
-            index: 2,
-            generation: 0,
-        });
-        assert_eq!(
-            queue.pop(),
-            Some(ImageRequest {
-                index: 1,
-                generation: 0
-            })
-        );
-        assert_eq!(
-            queue.pop(),
-            Some(ImageRequest {
-                index: 0,
-                generation: 1
-            })
-        );
+        queue.enqueue(request(3, 0));
         assert_eq!(queue.pop(), None);
     }
 

@@ -3,12 +3,13 @@ use crossbeam_channel::unbounded;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::mpsc::channel;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
@@ -18,7 +19,7 @@ use winit::keyboard::{ModifiersState, PhysicalKey};
 use winit::platform::wayland::WindowAttributesExtWayland;
 use winit::window::{Fullscreen, Window};
 
-use crate::clip::{self, ClipEngine, ClipEvent};
+use crate::clip::{self, ClipEngine, ClipEvent, ClipWorkerThreads};
 use crate::color::OutputColorSpace;
 use crate::geometry::{fit_image_zoom, image_rect, vec2, Rect, Vec2};
 use crate::grid::ThumbnailGrid;
@@ -26,11 +27,12 @@ use crate::image_io;
 use crate::input::Key;
 use crate::library::{LibraryState, LibraryUpdate};
 use crate::renderer::Renderer;
+use crate::source::{SourceOutcome, SourceRequest, SourceVersion};
 use crate::state::{
-    parse_bindings, parse_ui_font_path, CommandEvent, EmbeddingState, FullImageCache,
+    parse_bindings, parse_ui_font_path, CommandEvent, EmbeddingState, FileReload, FullImageCache,
     FullImageMessage, ImageRequest, ImageStates, Mode, Model, SearchPhase, SearchState,
-    SelectionPreload, TerminalState, ThumbRequestQueue, ThumbnailTexture, ThumbnailUpdate, Tile,
-    TiledFrame, TiledTexture,
+    SelectionPreload, TerminalState, ThumbRequestQueue, ThumbnailData, ThumbnailTexture,
+    ThumbnailUpdate, Tile, TiledFrame, TiledTexture,
 };
 use crate::thumbnails::{DecodeOutcome, ThumbnailDecoder, ThumbnailStore, THUMBNAIL_SIZE};
 use crate::ui;
@@ -45,6 +47,8 @@ const SELECTION_PRELOAD_DELAY: Duration = Duration::from_millis(200);
 const FILE_WATCH_BATCH: usize = 32;
 /// File polling is deliberately much slower than interactive updates.
 const FILE_WATCH_INTERVAL: Duration = Duration::from_secs(1);
+/// Require a second observation of a changed file before decoding it.
+const FILE_SETTLE_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug)]
 enum UserEvent {
@@ -145,7 +149,7 @@ pub(crate) struct App {
     keys: Keys,
     mouse: Mouse,
     rect: Rect,
-    exit_requested: Cell<bool>,
+    exit_requested: Cell<Option<ExitCode>>,
 }
 
 impl App {
@@ -162,7 +166,7 @@ impl App {
     }
 
     fn quit(&self) {
-        self.exit_requested.set(true);
+        self.exit_requested.set(Some(ExitCode::SUCCESS));
     }
 
     fn update_rect(&mut self) {
@@ -299,60 +303,42 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
     let (thumb_tx, thumb_rx) = channel::<ThumbnailUpdate>();
     let thumb_queue = ThumbRequestQueue::new();
     let num_workers = rayon::current_num_threads().clamp(1, 8);
-    let clip_engine = ClipEngine::new(cache_dir.clone(), worker_proxy.clone(), output_color_space)
-        .unwrap_or_else(|err| {
-            eprintln!("Failed to initialize SigLIP 2: {err}");
-            std::process::exit(1);
-        });
-    let clip_sender = clip_engine.request_sender();
+    let clip_engine = ClipEngine::new(cache_dir.clone(), worker_proxy.clone(), output_color_space);
     for _ in 0..num_workers {
         let paths = Arc::clone(&shared_paths);
         let cache_dir = cache_dir.clone();
         let tx = thumb_tx.clone();
         let thumb_queue = thumb_queue.clone();
-        let clip_sender = clip_sender.clone();
         let proxy = worker_proxy.clone();
         thread::spawn(move || {
-            while let Some(request) = thumb_queue.pop() {
+            while let Some(source) = thumb_queue.pop() {
+                let request = source.request;
                 let i = request.index;
                 let path = paths.read().unwrap().get(i).cloned();
                 if let Some(p) = path {
-                    let image = image_io::load_thumbnail(
-                        cache_dir.as_deref(),
-                        &p,
-                        thumb_size,
-                        output_color_space,
-                    );
-                    let clip_embedding = match cache_dir
-                        .as_deref()
-                        .map(|dir| clip::load_cached_embedding(dir, &p))
-                        .transpose()
-                    {
-                        Ok(value) => value.flatten(),
-                        Err(err) => {
-                            eprintln!(
-                                "Failed to load cached SigLIP 2 embedding for {}: {}",
-                                p.display(),
-                                err
-                            );
-                            None
-                        }
-                    };
-                    let embedding = if let Some(embedding) = clip_embedding {
-                        EmbeddingState::Ready(embedding)
-                    } else {
-                        match clip_sender.queue_image(request, p.clone(), image.clone()) {
-                            Ok(()) => EmbeddingState::Pending,
-                            Err(err) => EmbeddingState::Failed(format!(
-                                "Failed to queue SigLIP 2 embedding: {err}"
-                            )),
-                        }
-                    };
-                    let update = ThumbnailUpdate {
-                        request,
-                        image,
-                        embedding,
-                    };
+                    let outcome = source.load(&p, || {
+                        let image = image_io::load_thumbnail(
+                            cache_dir.as_deref(),
+                            &p,
+                            thumb_size,
+                            output_color_space,
+                            source.version,
+                            source.read_cache,
+                        )?;
+                        let cached_embedding = cache_dir
+                            .as_deref()
+                            .filter(|_| source.read_cache)
+                            .and_then(|dir| {
+                                clip::load_cached_embedding(dir, &p, source.version)
+                                    .ok()
+                                    .flatten()
+                            });
+                        Ok(ThumbnailData {
+                            image,
+                            cached_embedding,
+                        })
+                    });
+                    let update = ThumbnailUpdate { request, outcome };
                     match tx.send(update) {
                         Ok(()) => {
                             proxy.wakeup();
@@ -365,7 +351,7 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
     }
     // Initialize channels and state for full-resolution LRU cache.
     // Channel for requesting full-resolution images (by index)
-    let (full_req_tx, full_req_rx) = unbounded::<ImageRequest>();
+    let (full_req_tx, full_req_rx) = unbounded::<SourceRequest>();
     // Channel for receiving loaded full-resolution image tile data
     let (full_resp_tx, full_resp_rx) = unbounded::<FullImageMessage>();
     // Spawn a pool of loader threads for full images: load, crop, and convert to raw tile data off the main thread
@@ -377,51 +363,20 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
             let paths = Arc::clone(&shared_paths);
             let proxy = worker_proxy.clone();
             thread::spawn(move || {
-                while let Ok(request) = req_rx.recv() {
+                while let Ok(source) = req_rx.recv() {
+                    let request = source.request;
                     let idx = request.index;
                     let path = paths.read().unwrap().get(idx).cloned();
-                    if let Some(path) = path {
-                        match image_io::load_full_image_tiles(&path, output_color_space) {
-                            Ok((full_w, full_h, frames)) => {
-                                if resp_tx
-                                    .send(FullImageMessage::Loaded {
-                                        request,
-                                        full_w,
-                                        full_h,
-                                        frames,
-                                    })
-                                    .is_ok()
-                                {
-                                    proxy.wakeup();
-                                }
-                            }
-                            Err(err) => {
-                                if resp_tx
-                                    .send(FullImageMessage::Failed {
-                                        request,
-                                        error: format!(
-                                            "failed to open {}: {}",
-                                            path.display(),
-                                            err
-                                        ),
-                                    })
-                                    .is_ok()
-                                {
-                                    proxy.wakeup();
-                                }
-                            }
-                        }
-                    } else {
-                        if resp_tx
-                            .send(FullImageMessage::Failed {
-                                request,
-                                error: "image index out of range".to_string(),
-                            })
-                            .is_ok()
-                        {
-                            proxy.wakeup();
-                        }
+                    let outcome = match path {
+                        Some(path) => source.load(&path, || {
+                            image_io::load_full_image_tiles(&path, output_color_space)
+                        }),
+                        None => SourceOutcome::Failed("image index out of range".to_string()),
+                    };
+                    if resp_tx.send(FullImageMessage { request, outcome }).is_err() {
+                        break;
                     }
+                    proxy.wakeup();
                 }
             });
         }
@@ -458,7 +413,8 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
         thumb_has_xmp: Vec::new(),
         thumb_rx,
         thumb_queue: thumb_queue.clone(),
-        file_mod_times: Vec::new(),
+        file_versions: Vec::new(),
+        file_reloads: HashMap::new(),
         image_states: ImageStates::new(0),
         file_watch_cursor: 0,
         full_req_tx,
@@ -496,11 +452,19 @@ fn model(app: &App, output_color_space: OutputColorSpace) -> Model {
     }
 }
 
-pub(crate) fn run() -> Result<()> {
+pub(crate) fn run() -> Result<ExitCode> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = AppProxy::new(event_loop.create_proxy());
-    event_loop.run_app(&mut SrivApplication { state: None, proxy })?;
-    Ok(())
+    let mut app = SrivApplication {
+        state: None,
+        proxy,
+        exit_code: ExitCode::SUCCESS,
+        clip_threads: None,
+    };
+    event_loop.run_app(&mut app)?;
+    // Let the event loop close its window before we wait on active inference.
+    drop(app.clip_threads.take());
+    Ok(app.exit_code)
 }
 
 struct ApplicationState {
@@ -528,6 +492,15 @@ impl ApplicationState {
 
     fn next_scheduled_update(&self) -> Instant {
         let mut next = self.next_file_watch;
+        if let Some(ready_at) = self
+            .model
+            .file_reloads
+            .values()
+            .filter_map(|reload| reload.ready_at)
+            .min()
+        {
+            next = next.min(ready_at);
+        }
         if matches!(self.model.mode, Mode::Thumbnails) && !self.model.image_paths.is_empty() {
             if let Some(deadline) = self.model.selection_preload.deadline() {
                 next = next.min(deadline);
@@ -535,6 +508,7 @@ impl ApplicationState {
         }
         if matches!(self.model.mode, Mode::Single)
             && !self.model.full_images.contains_key(&self.model.current)
+            && !self.model.file_reloads.contains_key(&self.model.current)
         {
             if let Some(retry_at) = self.model.full_images.retry_at(self.model.current) {
                 next = next.min(retry_at);
@@ -552,20 +526,34 @@ impl ApplicationState {
         }
         next
     }
-
-    fn handle_exit_request(&self, event_loop: &ActiveEventLoop) {
-        if self.app.exit_requested.replace(false) {
-            event_loop.exit();
-        }
-    }
 }
 
 struct SrivApplication {
     state: Option<ApplicationState>,
     proxy: AppProxy,
+    exit_code: ExitCode,
+    clip_threads: Option<ClipWorkerThreads>,
+}
+
+impl SrivApplication {
+    fn release_window(&mut self) {
+        if let Some(mut state) = self.state.take() {
+            self.exit_code = state.app.exit_requested.get().unwrap_or(ExitCode::SUCCESS);
+            self.clip_threads = state.model.clip_engine.stop();
+        }
+    }
+
+    fn close(&mut self, event_loop: &ActiveEventLoop) {
+        self.release_window();
+        event_loop.exit();
+    }
 }
 
 impl ApplicationHandler<UserEvent> for SrivApplication {
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.release_window();
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
             return;
@@ -589,7 +577,7 @@ impl ApplicationHandler<UserEvent> for SrivApplication {
             keys: Keys::default(),
             mouse: Mouse::default(),
             rect: Rect::default(),
-            exit_requested: Cell::new(false),
+            exit_requested: Cell::new(None),
         };
         app.update_rect();
         let mut renderer = match pollster::block_on(Renderer::new(window, event_loop)) {
@@ -633,8 +621,11 @@ impl ApplicationHandler<UserEvent> for SrivApplication {
         if scheduled_update_due {
             state.update_and_redraw_if_changed(check_files);
         }
-        state.handle_exit_request(event_loop);
-        event_loop.set_control_flow(ControlFlow::WaitUntil(state.next_scheduled_update()));
+        if state.app.exit_requested.get().is_some() {
+            self.close(event_loop);
+        } else {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(state.next_scheduled_update()));
+        }
     }
 
     fn window_event(
@@ -650,7 +641,7 @@ impl ApplicationHandler<UserEvent> for SrivApplication {
             return;
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => self.close(event_loop),
             WindowEvent::Focused(focused) => {
                 state.app.keys.focus_changed(focused);
             }
@@ -740,7 +731,10 @@ impl ApplicationHandler<UserEvent> for SrivApplication {
                         }
                     }
                 }
-                state.handle_exit_request(event_loop);
+                if state.app.exit_requested.get().is_some() {
+                    self.close(event_loop);
+                    return;
+                }
                 // Keep input handling cheap. `update` can drain background queues and create GPU
                 // textures, so running it for every key press makes a burst of input wait behind
                 // unrelated image work. Redraw requests are coalesced by winit; background work
@@ -865,6 +859,11 @@ fn handle_search_key(app: &App, model: &mut Model, key: Key) -> bool {
         } else {
             model.search = Some(SearchState::new());
         }
+        if model.clip_error.is_none() {
+            if let Err(error) = model.clip_engine.warm_up() {
+                model.clip_error = Some(format!("Failed to start SigLIP 2: {error:#}"));
+            }
+        }
         return true;
     }
 
@@ -888,7 +887,9 @@ fn handle_search_key(app: &App, model: &mut Model, key: Key) -> bool {
                     model.next_search_request_id = model.next_search_request_id.wrapping_add(1);
                     let search = model.search.as_mut().unwrap();
                     search.submit(request_id);
-                    if let Err(err) = model.clip_engine.request_text(request_id, query) {
+                    if let Some(error) = &model.clip_error {
+                        search.fail(request_id, error.clone());
+                    } else if let Err(err) = model.clip_engine.request_text(request_id, query) {
                         search.fail(request_id, format!("Failed to queue search: {err}"));
                     }
                 } else if let Some(search) = model.search.as_mut() {
@@ -1306,6 +1307,7 @@ fn update(app: &App, model: &mut Model, renderer: &Renderer, check_files: bool) 
     if check_files && detect_file_changes(app, model) {
         redraw_needed = true;
     }
+    redraw_needed |= reload_changed_files(model);
 
     while let Ok(update) = model.thumb_rx.try_recv() {
         handle_thumbnail_update(app, model, update);
@@ -1331,13 +1333,17 @@ fn update(app: &App, model: &mut Model, renderer: &Renderer, check_files: bool) 
             Ok(event) => {
                 redraw_needed = true;
                 match event {
+                    ClipEvent::SourceChanged { request } => {
+                        handle_source_changed(model, request);
+                    }
                     ClipEvent::ImageReady { request, embedding } => {
                         if model.image_states.image_ready(request, embedding) {
                             update_search_with_image_embedding(app, model, request.index);
                         }
                     }
                     ClipEvent::ImageError { request, error } => {
-                        if model.image_states.image_failed(request, error.clone()) {
+                        if model.image_states.image_failed(request, error) {
+                            let error = model.image_states.error(request.index).unwrap();
                             eprintln!(
                                 "Failed to compute SigLIP 2 embedding for {}: {error}",
                                 model.image_paths[request.index].display()
@@ -1368,13 +1374,7 @@ fn update(app: &App, model: &mut Model, renderer: &Renderer, check_files: bool) 
                 if model.clip_error.is_none() {
                     let error = "SigLIP 2 unavailable: all workers stopped; see stderr for details"
                         .to_string();
-                    model.image_states.worker_stopped(&error);
-                    if let Some(search) = &mut model.search {
-                        if let SearchPhase::Pending { request_id } = search.phase {
-                            search.fail(request_id, error.clone());
-                        }
-                    }
-                    model.clip_error = Some(error);
+                    fail_clip_workers(model, error);
                     redraw_needed = true;
                 }
                 break;
@@ -1441,17 +1441,13 @@ fn update(app: &App, model: &mut Model, renderer: &Renderer, check_files: bool) 
     }
     // Process loaded full-resolution tile data
     while let Ok(message) = model.full_resp_rx.try_recv() {
+        let FullImageMessage { request, outcome } = message;
+        if !accept_full_result(model, request) {
+            continue;
+        }
         redraw_needed = true;
-        match message {
-            FullImageMessage::Loaded {
-                request,
-                full_w,
-                full_h,
-                frames,
-            } => {
-                if !accept_full_result(model, request) {
-                    continue;
-                }
+        match outcome {
+            SourceOutcome::Ready((full_w, full_h, frames)) => {
                 let idx = request.index;
                 // Store raw pixel data for lazy texture creation
                 let prepared_frames = frames
@@ -1485,20 +1481,11 @@ fn update(app: &App, model: &mut Model, renderer: &Renderer, check_files: bool) 
                     apply_fit(app, model);
                 }
             }
-            FullImageMessage::Failed { request, error } => {
-                if !accept_full_result(model, request) {
-                    continue;
-                }
-                let idx = request.index;
-                model
-                    .full_images
-                    .failed(request, error.clone(), Instant::now());
-                let path_info = model
-                    .image_paths
-                    .get(idx)
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| format!("image index {idx}"));
-                eprintln!("failed to load full image {path_info}: {error}");
+            SourceOutcome::Failed(error) => {
+                model.full_images.failed(request, error, Instant::now());
+            }
+            SourceOutcome::Changed => {
+                handle_source_changed(model, request);
             }
         }
     }
@@ -1562,12 +1549,18 @@ fn receive_library_updates(app: &App, model: &mut Model) -> bool {
                 model.image_states.add_images(images.len());
                 for image in images {
                     model.image_paths.push(image.path);
-                    model.file_mod_times.push(image.modified);
+                    model.file_versions.push(image.version);
                     model.thumb_has_xmp.push(false);
                 }
-                model.thumb_queue.enqueue_batch(
-                    (start..model.image_paths.len()).map(|index| model.image_states.request(index)),
-                );
+                let mut requests = Vec::new();
+                for index in start..model.image_paths.len() {
+                    if let Some(request) = source_request(model, index) {
+                        requests.push(request);
+                    } else {
+                        begin_file_reload(model, index, None, Instant::now() + FILE_SETTLE_DELAY);
+                    }
+                }
+                model.thumb_queue.enqueue_batch(requests);
                 if start == 0 {
                     model.selection_preload =
                         SelectionPreload::after(Instant::now(), SELECTION_PRELOAD_DELAY);
@@ -1577,7 +1570,8 @@ fn receive_library_updates(app: &App, model: &mut Model) -> bool {
             LibraryUpdate::Finished => {
                 if model.image_paths.is_empty() {
                     eprintln!("No image files found in arguments.");
-                    std::process::exit(1);
+                    app.exit_requested.set(Some(ExitCode::FAILURE));
+                    return changed;
                 }
                 if model.image_paths.len() == 1 && matches!(model.mode, Mode::Thumbnails) {
                     model.mode = Mode::Single;
@@ -1596,13 +1590,16 @@ fn accept_full_result(model: &Model, request: ImageRequest) -> bool {
 
 /// Touch an already loaded texture in the LRU, or queue it for background loading.
 fn request_full_texture(model: &mut Model, idx: usize) {
-    if idx >= model.image_paths.len() {
+    if model.file_reloads.contains_key(&idx) {
         return;
     }
+    let Some(source) = source_request(model, idx) else {
+        return;
+    };
     let now = Instant::now();
-    let request = model.image_states.request(idx);
+    let request = source.request;
     if model.full_images.request(request, now) {
-        if let Err(err) = model.full_req_tx.send(request) {
+        if let Err(err) = model.full_req_tx.send(source) {
             model.full_images.failed(request, err.to_string(), now);
             eprintln!("failed to request full image load for index {idx}: {err}");
         }
@@ -1656,11 +1653,11 @@ fn update_thumbnail_requests(
         grid.viewport_priority(a)
             .total_cmp(&grid.viewport_priority(b))
     });
-    let jobs = model.thumb_data.decode_jobs(
-        decode_order
-            .into_iter()
-            .filter(|idx| !model.thumb_visible.contains_key(idx)),
-    );
+    let jobs = model
+        .thumb_data
+        .decode_jobs(decode_order.into_iter().filter(|idx| {
+            !model.thumb_visible.contains_key(idx) && !model.file_reloads.contains_key(idx)
+        }));
     model.thumbnail_decoder.request(jobs);
 
     for idx in visible {
@@ -1685,26 +1682,124 @@ fn update_thumbnail_requests(
 }
 
 fn handle_thumbnail_update(app: &App, model: &mut Model, update: ThumbnailUpdate) {
-    let ThumbnailUpdate {
-        request,
-        image,
-        embedding,
-    } = update;
-    if !model
-        .image_states
-        .thumbnail_ready(request, embedding, model.clip_error.as_deref())
-    {
+    let ThumbnailUpdate { request, outcome } = update;
+    if !model.image_states.is_current(request) {
         return;
     }
     let index = request.index;
-    if let Some(error) = model.image_states.error(index) {
-        eprintln!(
-            "SigLIP 2 embedding unavailable for {}: {error}",
-            model.image_paths[index].display()
-        );
+    let ThumbnailData {
+        image,
+        cached_embedding,
+    } = match outcome {
+        SourceOutcome::Ready(data) => data,
+        SourceOutcome::Changed => {
+            handle_source_changed(model, request);
+            return;
+        }
+        SourceOutcome::Failed(error) => {
+            let now = Instant::now();
+            if !model.file_reloads.contains_key(&index) {
+                begin_file_reload(model, index, model.file_versions[index], now);
+            }
+            if !model.file_reloads.get_mut(&index).unwrap().retry(now) {
+                fail_file_reload(model, index, error);
+            }
+            return;
+        }
+    };
+    if model.file_reloads.remove(&index).is_some() {
+        model.full_images.invalidate(index);
+        if matches!(model.mode, Mode::Thumbnails) && index == model.current {
+            model.selection_preload =
+                SelectionPreload::after(Instant::now(), SELECTION_PRELOAD_DELAY);
+        }
     }
+    let embedding = if let Some(embedding) = cached_embedding {
+        EmbeddingState::Ready(embedding)
+    } else if let Some(error) = &model.clip_error {
+        EmbeddingState::Failed(error.clone())
+    } else {
+        let result = model.clip_engine.queue_image(
+            request,
+            model.image_paths[index].clone(),
+            model.file_versions[index].unwrap(),
+            image.clone(),
+        );
+        match result {
+            Ok(()) => EmbeddingState::Pending,
+            Err(error) => {
+                let error = format!("SigLIP 2 unavailable: {error:#}");
+                fail_clip_workers(model, error.clone());
+                EmbeddingState::Failed(error)
+            }
+        }
+    };
+    model
+        .image_states
+        .thumbnail_ready(request, embedding, model.clip_error.as_deref());
+    model.thumb_visible.remove(&index);
     model.thumb_data.insert(request, image);
     update_search_with_image_embedding(app, model, index);
+}
+
+fn fail_clip_workers(model: &mut Model, error: String) {
+    model.image_states.worker_stopped(&error);
+    if let Some(search) = &mut model.search {
+        if let SearchPhase::Pending { request_id } = search.phase {
+            search.fail(request_id, error.clone());
+        }
+    }
+    model.clip_error = Some(error);
+}
+
+fn source_request(model: &Model, index: usize) -> Option<SourceRequest> {
+    let version = model.file_versions.get(index).copied().flatten()?;
+    let request = model.image_states.request(index);
+    Some(SourceRequest {
+        request,
+        version,
+        read_cache: request.generation == 0,
+    })
+}
+
+fn reload_changed_files(model: &mut Model) -> bool {
+    let now = Instant::now();
+    let due: Vec<_> = model
+        .file_reloads
+        .iter()
+        .filter_map(|(&index, reload)| {
+            reload
+                .ready_at
+                .filter(|&ready_at| ready_at <= now)
+                .map(|_| index)
+        })
+        .collect();
+    for &index in &due {
+        if check_image_modification(model, index) {
+            continue;
+        }
+        if let Some(source) = source_request(model, index) {
+            model.file_reloads.get_mut(&index).unwrap().ready_at = None;
+            model.thumb_queue.enqueue(source);
+        } else {
+            fail_file_reload(model, index, "image file is unavailable".to_string());
+        }
+    }
+    !due.is_empty()
+}
+
+fn fail_file_reload(model: &mut Model, index: usize, error: String) {
+    model.file_reloads.remove(&index);
+    model.thumb_data.remove(index);
+    model.thumb_visible.remove(&index);
+    model.full_images.unavailable(index, error.clone());
+    model
+        .image_states
+        .image_failed(model.image_states.request(index), error.clone());
+    eprintln!(
+        "Failed to load {}: {error}",
+        model.image_paths[index].display()
+    );
 }
 
 fn detect_file_changes(app: &App, model: &mut Model) -> bool {
@@ -1714,6 +1809,7 @@ fn detect_file_changes(app: &App, model: &mut Model) -> bool {
     }
     let mut candidates: HashSet<usize> = HashSet::new();
     candidates.insert(model.current);
+    candidates.extend(model.file_reloads.keys().copied());
     if matches!(model.mode, Mode::Thumbnails) {
         for idx in ThumbnailGrid::new(model, app.rect(), app.scale_factor()).visible_indices() {
             candidates.insert(idx);
@@ -1733,51 +1829,41 @@ fn detect_file_changes(app: &App, model: &mut Model) -> bool {
 }
 
 fn check_image_modification(model: &mut Model, idx: usize) -> bool {
-    if idx >= model.image_paths.len() {
+    let version = SourceVersion::read(&model.image_paths[idx]);
+    if model.file_versions[idx] == version {
         return false;
     }
-    let path = &model.image_paths[idx];
-    let old_mod = model.file_mod_times[idx];
-    let new_mod = current_mod_time(path);
-    let changed = match (old_mod, new_mod) {
-        (Some(old), Some(new)) => match new.duration_since(old) {
-            Ok(diff) => diff > Duration::ZERO,
-            Err(_) => true,
-        },
-        (None, None) => false,
-        _ => true,
-    };
-    model.file_mod_times[idx] = new_mod;
-    if changed {
-        handle_image_modified(model, idx);
-    }
-    changed
+    begin_file_reload(model, idx, version, Instant::now() + FILE_SETTLE_DELAY);
+    true
 }
 
 fn regenerate_thumbnail(model: &mut Model, idx: usize) {
     model.thumb_data.remove(idx);
-    let request = model.image_states.invalidate(idx);
+    model.thumb_visible.remove(&idx);
+    let version = SourceVersion::read(&model.image_paths[idx]);
+    begin_file_reload(model, idx, version, Instant::now() + FILE_SETTLE_DELAY);
+}
+
+fn handle_source_changed(model: &mut Model, request: ImageRequest) {
+    if model.image_states.is_current(request) {
+        let idx = request.index;
+        let version = SourceVersion::read(&model.image_paths[idx]);
+        begin_file_reload(model, idx, version, Instant::now() + FILE_SETTLE_DELAY);
+    }
+}
+
+fn begin_file_reload(
+    model: &mut Model,
+    idx: usize,
+    version: Option<SourceVersion>,
+    ready_at: Instant,
+) {
+    model.file_versions[idx] = version;
+    model.file_reloads.insert(idx, FileReload::new(ready_at));
+    model.image_states.invalidate(idx);
     if let Some(search) = &mut model.search {
         search.invalidate_image(idx);
     }
-    model.thumb_visible.remove(&idx);
-    model.thumb_queue.enqueue(request);
-}
-
-fn handle_image_modified(model: &mut Model, idx: usize) {
-    regenerate_thumbnail(model, idx);
-    model.full_images.invalidate(idx);
-    if matches!(model.mode, Mode::Single) && idx == model.current {
-        request_full_texture(model, idx);
-    }
-
-    if matches!(model.mode, Mode::Thumbnails) && idx == model.current {
-        model.selection_preload = SelectionPreload::after(Instant::now(), SELECTION_PRELOAD_DELAY);
-    }
-}
-
-fn current_mod_time(path: &Path) -> Option<SystemTime> {
-    fs::metadata(path).and_then(|meta| meta.modified()).ok()
 }
 
 /// Apply fit-to-window for current single-image view
